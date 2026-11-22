@@ -66,21 +66,17 @@ through the platform file calls.
 
 ## FFmpeg for video
 
-Video input loads FFmpeg's shared libraries at run time (libavformat, libavcodec, libavutil and libswscale of release 6, 7, 8 or 9; nothing
-is linked or shipped). Linux: the distribution's runtime packages (`libavformat62` and its siblings on Ubuntu 26.04, `libavformat60`
-on 24.04), found by the system loader. Windows: a shared FFmpeg build (`avformat-62.dll` for 8, `avformat-63.dll` for 9, and the rest, from gyan.dev or BtbN) beside
-`basalt.exe` or in a `PATH` directory; the current directory is never searched. Without them video is off and the server says why.
-GPU decoding needs an FFmpeg build with NVDEC (the distribution packages and the gyan.dev and BtbN builds have it); without it
-frames decode on the CPU.
+Hy4-flash reads no video, so the engine needs no FFmpeg. Upstream's video setup:
+[upstream](https://github.com/jesdga95/basalt/blob/a11e19f6/docs/platforms.md#ffmpeg-for-video).
 
 ## Windows limitations
 
 - Portable host registrations stay within the visible adapters' DXGI non-local allowances, leaving driver headroom.
   Whole-expert slices retain their own device aliases; the unregistered tail is locked in the working set.
-  Qwen and DeepSeek's resident RAM tiers share CUDA host VMM when supported, with ordinary registration as the fallback.
+  The resident RAM expert tier uses CUDA host VMM when supported, with ordinary registration as the fallback.
   Allocation-backed pins stay in RAM across SLEEP/WAKE; the expert caches can still return their VRAM.
 - Large pages need "Lock pages in memory" (Administrators). Without it the engine uses 4 KiB pages and says so at start.
-- No shared arena files and no cgroup limits. `--ple-io direct` reads through the file cache.
+- No shared arena files and no cgroup limits.
 - `basalt serve` runs the Python server as a child.
 - A display-attached GPU can hit the driver's timeout (TDR). Raise `TdrDelay` under `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`.
 - A card that drives the desktop has VRAM that moves between starts, so greedy output can differ run to run. Pin `expert-cache` and raise
@@ -99,7 +95,7 @@ ctest --test-dir build -L cpu -j 8 --output-on-failure
 
 The executables land in `bin/` whatever the generator is (a Visual Studio generator would otherwise put them in `bin/Release`, away from `data/`).
 
-`-DBASALT_MODELS=qwen4exp`, `deepseek41`, `qwen35` or `hy4flash` builds one model ([building](building.md#building-only-some-models)); the option works the same here.
+`hy4flash` is the only model, so `-DBASALT_MODELS` is not needed ([building](building.md#building-only-some-models)); the option works the same here.
 
 If tests fail to create fixtures, point `TEMP` and `TMP` into the build tree. CUDA 13.2+ headers need `/Zc:preprocessor`; the CMakeLists
 passes it to nvcc's host compiler.

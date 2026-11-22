@@ -12,8 +12,8 @@ default, then the engine's. `/props` reports what is in effect. An out-of-range 
 | `repetition_penalty` | > 0 | Multiplicative penalty on tokens in the window. `1` is off. |
 | `presence_penalty`, `frequency_penalty` | number | Flat, and count-based, penalties. `0` is off. |
 | `penalty_last_n` | 0..4096 | Window for the penalties (default 64). |
-| `seed` | integer | Fixes the draw for a reproducible sampled reply on Qwen3.8-27B; on Flash-Next the same seeded request repeats run to run for the same session history (the same requests in the same order, one at a time; see [adaptive tier](adaptive.md)). Without one, a request with `top_k` 1 to 64 on a model with a block drafter (Qwen3.8-27B) draws its drafts and keeps them by speculative sampling ([precision](../precision/qwen38-27b.md#sampling-with-drafts)): the same distribution, more drafts kept, but the text then depends on the windows the draft policy picks. |
-| `relaxed_drafting` | [0, 1] or `false` | This request's relaxed-drafting threshold. `false` or `0` forces exact sampling. |
+| `seed` | integer | Fixes the draw. Output still depends on which experts are resident, so the same seeded request can give different text after a different history ([precision](../precision/hy4-flash.md#experts-and-placement)). |
+| `relaxed_drafting` | [0, 1] or `false` | Checked and accepted; Hy4-flash's drafting does not read it (relaxed drafting was upstream Flash-Next's). |
 
 Also read: `max_tokens` / `max_completion_tokens` (`0` or `-1` = the rest of the context), `stop`, `logit_bias`, `reasoning_effort`,
 `enable_thinking`, `reasoning_budget_tokens` (`0` = no thinking budget). Anthropic's `thinking.budget_tokens` is the same budget.
@@ -21,7 +21,7 @@ Also read: `max_tokens` / `max_completion_tokens` (`0` or `-1` = the rest of the
 llama.cpp clients also work: `POST /tokenize` (`content`, `parse_special`) and `/detokenize` (`tokens`) use the model's tokenizer, `/props` reports `chat_template_caps` for the model (tool calls, parallel calls, reasoning effort,
 system role, preserve reasoning), `chat_template_kwargs.preserve_reasoning` keeps earlier turns' thinking in the prompt, and
 `reasoning_budget` is read on the chat endpoint: `0` is thinking off, `-1` is no cap at the highest effort, and N > 0 is an N-token
-budget at the level it names (up to 2048 low, up to 8192 medium, else high; DeepSeek renders medium as high, 75 of 100; Hy4-flash renders low and medium as high). When fields disagree, off from any of them wins, then
+budget at the level it names (up to 2048 low, up to 8192 medium, else high; Hy4-flash renders low and medium as high). When fields disagree, off from any of them wins, then
 `chat_template_kwargs.reasoning_effort`, then `reasoning_effort`, then the level a `reasoning_budget` implies, and last the entry's
 `reasoning-effort` (unset: the template's default). For the token
 cap, `reasoning_budget_tokens` wins over `thinking_budget_tokens`, then `reasoning_budget`, then `thinking.budget_tokens`.

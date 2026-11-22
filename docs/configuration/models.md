@@ -1,6 +1,6 @@
 # Models and the router
 
-Several models share one server. A request's `model` field picks one, and one is loaded at a time. A swap ends one engine process
+Several packs share one server (this fork runs Hy4-flash only, so the entries are Hy4-flash packs). A request's `model` field picks one, and one is loaded at a time. A swap ends one engine process
 and starts the next.
 
 ```json
@@ -8,9 +8,8 @@ and starts the next.
   "version": 2,
   "engine": { "conversation-cache-disk-mib": 32768, "idle-sleep": 300, "vram-reserve-mib": 500 },
   "models": [
-    { "alias": "Flash-Next", "model": "flash-next.basalt", "gpu": "auto", "kv": "int8", "max-context": 262144, "parallel": 4,
-      "slot-full-context": true, "vision": "dynamic" },
-    { "alias": "DeepSeek", "model": "deepseek.basalt", "gpu": "auto", "max-context": 1048576, "vision": "dynamic" }
+    { "alias": "Hy4-flash", "model": "Hy4-flash-NVFP4.basalt", "gpu": "auto", "max-context": 262144, "vision": "dynamic" },
+    { "alias": "Hy4-flash-test", "model": "Hy4-flash-Q4_K_M-test.basalt", "gpu": "auto", "kv": "fp8", "max-context": 1048576 }
   ],
   "server": { "host": "127.0.0.1", "port": 8080 }
 }
@@ -36,7 +35,7 @@ Each entry is checked before anything loads, by the engine's own rules:
 | Value the model refuses (`max-context` past its maximum) | stops the start | stops the start |
 | Unknown name | stops the start | stops the start |
 
-`kv` takes each model's own values (`fp8` or `fp16` for DeepSeek); another value stops the start. Two aliases that are the same, or two entries sharing a cache
+`kv` takes `fp16` or `fp8`; another value stops the start. Two aliases that are the same, or two entries sharing a cache
 directory, stop the start too.
 
 ## Requests and turns
@@ -63,4 +62,4 @@ Clients wait through a swap; they do not get a 503 for it. A streamed response s
 | Metrics | per model (`GET /metrics?model=NAME`) |
 
 `POST /v1/load` with `{"model": NAME}` swaps ahead of a request. `/health` and `/metrics` show the swap's progress. The console prints
-`[server] swap: Flash-Next -> DeepSeek, 2 waiting`.
+`[server] swap: Hy4-flash -> Hy4-flash-test, 2 waiting`.

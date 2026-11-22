@@ -7,31 +7,19 @@ Start with `bin/basalt serve --config basalt_config.json`. Model paths are relat
 ```json
 {
   "version": 2,
-  "models": [{ "model": "model.basalt", "gpu": "0", "max-context": 262144, "kv": "int8" }],
-  "engine": { "resident-experts": true, "vram-reserve-mib": 700 },
+  "models": [{ "model": "Hy4-flash-NVFP4.basalt", "gpu": "0", "max-context": 262144, "vision": "dynamic" }],
+  "engine": { "vram-reserve-mib": 700 },
   "server": { "host": "127.0.0.1", "port": 8080 }
 }
 ```
 
 ## A GPU and a smaller second card (peer expert tier)
 
-Like the first, with `"gpu": "0,1"` and `"vision": 1`, which runs the image encoder on the second card too.
+Like the first, with `"gpu": "0,1"`: the second card holds experts of its own ([GPUs](gpus.md)).
 
-## Inkling 2 Mini on one card
+## Long context
 
-The whole model sits on the card; the context takes what the weights leave ([guide](../models/inkling2.md#memory)).
+Like the first, with `"max-context": 1048576` and `"kv": "fp8"`, which halves the sparse layers' cache
+([guide](../models/hy4-flash.md#memory)).
 
-```json
-{
-  "version": 2,
-  "models": [{ "model": "Inkling-2-Mini-NVFP4-DQ8.basalt", "gpu": "0", "max-context": 262144, "vision": "dynamic" }],
-  "server": { "host": "127.0.0.1", "port": 8080 }
-}
-```
-
-## A low-VRAM card
-
-Like the first, with `"max-context": 65536`, `"kv": "q4_0"` and `"vram-reserve-mib": 1024`.
-
-Several models: [models and the router](models.md). `"relaxed-drafting": 0.5` in an entry trades exactness under sampling for speed
-([precision](../precision/qwen38-flash-next.md#relaxed-drafting)).
+Several packs: [models and the router](models.md).

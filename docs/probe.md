@@ -24,7 +24,8 @@ The token budget is part of "cold": the tiers keep adapting, so a longer request
 
 ## Suggested values
 
-Printed only when a value beats the built-in default by more than the measured noise:
+Printed only when a value beats the built-in default by more than the measured noise. The adaptive tier, `--prefill-cpu-share`
+and `--expert-profile-save` were upstream Flash-Next's engine flags; Hy4-flash takes none of them, so only `--pool-workers` applies:
 
 - **`--pool-workers N`**: the fewest workers within 2% of the fastest measured CPU expert time.
 - **`--adapt-every`, `--adapt-swaps`, `--adapt-decay`**: tried from the start placement (`PROBE adapt`) with a prose-then-struct switch.

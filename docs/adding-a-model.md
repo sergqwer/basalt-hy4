@@ -21,7 +21,7 @@ The router then needs one config entry. Nothing in the server names a model.
 
 ## Fixtures, flags and loading
 
-- Benchmark token ids go in `data/bench/<arch>`. `--quality` needs a BF16 reference.
+- Benchmark token ids go in `data/bench/<arch>` (`data/bench/hy4flash`). `--quality` needs a BF16 reference.
 - Flags: `parse_flag` and `finish_flags`. A flag a model lacks is the normal unknown-argument error. Token id flags default to the pack's tokens.
 - The start (`ModelAdapter::start`) runs in three steps. The model's `plan` decides and allocates everything, in the order its
   sizing depends on (weights, then what is sized from the memory left: caches, tiers, prompt-split stages), and queues every
@@ -39,11 +39,14 @@ The router then needs one config entry. Nothing in the server names a model.
   a prompt split's stages take the shared `core::PromptStage` and its start lines (`basalt/core/prompt_stage.hpp`).
 - Conversations: `save_cells` and `restore_cells` give the RAM and disk tiers what they need.
 - `--parallel` slots in one pass through the weights: derive the session from `model::BatchSession`, write its hooks and run
-  the batch check, see [batched decoding](design/batching.md#adding-batching-to-a-model).
-- A model with its own fast path derives from `serve::Runtime` and `serve::Request`; see `src/models/qwen4exp/`.
-- A dense model of GDN and gated attention layers (the Qwen3.5 family) needs only its pack read into `dense::Geometry` and
-  `dense::Weights` (`include/basalt/dense/model.hpp`): the shared dense stack runs the layers, the drafters (MTP layer or DFlash
-  2 block drafter), images and video, and gives the session engine its sessions. See `src/models/qwen35/`.
-- A Qwen chat model takes the shared pre-tokenizer, tool form and token names (`basalt/program/qwen_forms.hpp`) and the
-  shared Qwen dialect (`serve/models/qwen.py`).
+  the batch check, see [batched decoding](design/batching.md#adding-batching-to-a-model). Hy4-flash's session does
+  (`src/models/hy4flash/session.cpp`).
+- A model with its own fast path derives from `serve::Runtime` and `serve::Request`; upstream's Flash-Next did
+  ([`src/models/qwen4exp/`](https://github.com/jesdga95/basalt/tree/a11e19f6/src/models/qwen4exp)). Hy4-flash offers only sessions.
+- The shared dense stack for GDN and gated attention layers (`dense::Geometry`, `dense::Weights`) was removed with
+  Qwen3.8-27B; upstream: [`include/basalt/dense/model.hpp`](https://github.com/jesdga95/basalt/blob/a11e19f6/include/basalt/dense/model.hpp),
+  [`src/models/qwen35/`](https://github.com/jesdga95/basalt/tree/a11e19f6/src/models/qwen35).
+- Hy4-flash's own pieces, as a worked example: the adapter `src/models/hy4flash/adapter.cpp`, the session
+  `src/models/hy4flash/session.cpp`, the pre-tokenizer `src/models/hy4flash/pretok_hy4.cpp`, the kernels
+  `src/models/hy4flash/kernels/`, and the dialect `serve/models/hy4flash.py`.
 - Kernels: shared kernels stay in `src/kernels/`. Every new kernel gets a parity test and a microbench line.

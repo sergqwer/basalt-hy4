@@ -18,7 +18,7 @@ deterministic and runs once in the converter; `convert.py --verify` repeats it a
 
 | Tensors | Stored as | From the BF16 checkpoint |
 | --- | --- | --- |
-| Routed experts (layers 1 to 41) | NVFP4 (E2M1, a UE4M3 scale per 16 values, an FP32 scale per matrix) | tensor scale amax / (6 x 448); per 16 values the UE4M3 scale with the least squared error among half to four times amax / 6 (the 27B pack's rounding) |
+| Routed experts (layers 1 to 41) | NVFP4 (E2M1, a UE4M3 scale per 16 values, an FP32 scale per matrix) | tensor scale amax / (6 x 448); per 16 values the UE4M3 scale with the least squared error among half to four times amax / 6 |
 | Attention, latent, shared-expert, dense-FFN, Engram and indexer projections; token embedding | Q8_0 | ggml's reference rounding, byte for byte AngelSlim's Q8_0 tensors |
 | Output head | BF16 | as stored; the engine rounds it to Q8_0 as it loads (ggml's reference rounding) |
 | Norms, hyper-connections, router, biases | F32 | as stored |

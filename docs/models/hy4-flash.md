@@ -1,7 +1,7 @@
 # Hy4-flash
 
-Tencent's Hy4-flash (`tencent/Hy4-flash`). Runs with the same command as any model: `basalt serve PACK`. What it supports next
-to the others: [models](index.md). Rounding and quality: [precision](../precision/hy4-flash.md).
+Tencent's Hy4-flash (`tencent/Hy4-flash`). Runs with the same command as any model: `basalt serve PACK`. What it supports:
+[models](index.md). Rounding and quality: [precision](../precision/hy4-flash.md).
 
 ## Pack
 
@@ -36,7 +36,7 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 
 ## Memory
 
-- **Experts:** the shared expert tier, placed as DeepSeek's ([memory](deepseek41.md#memory)): the main card holds copies of
+- **Experts:** the shared expert tier, placed as upstream DeepSeek's ([memory](https://github.com/jesdga95/basalt/blob/a11e19f6/docs/models/deepseek41.md#memory)): the main card holds copies of
   the most routed experts, each second card holds experts of its own, and system RAM holds the rest (the routed experts are
   77.8 GiB), computed there by the CPU. The start line `expert homes of 512 per layer: ...` gives the split. The start places
   experts by the shipped routing profile `data/profiles/hy4flash-42x512.prof`, so the first request after a start finds the
@@ -45,7 +45,7 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 - **Copies give way by use:** an expert that earns a main card slot takes the one whose expert was looked up least lately (every
   lookup counts, up to 15; the counts halve every 256 tokens and start again with each prompt), the one used longest ago among
   equals. An expert that recurs every few tokens keeps its copy through runs of experts that come once, and the experts of an
-  earlier topic do not hold the card through the next one. DeepSeek's slots give way by age alone.
+  earlier topic do not hold the card through the next one. Upstream DeepSeek's slots gave way by age alone.
 - **Cards:** the main card holds the dense weights (6.76 GiB with the Q8_0 head), the caches and the drafter (0.87 GiB). Up to three more cards
   (`--gpu 0,1,2,3`) each hold the experts of one block of layers; later cards idle.
 - **Waits:** while a decode layer's expert sum waits for the CPU's and the second card's rows, the main card's memory is idle
@@ -62,13 +62,13 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
   | `--kv fp16` | 14.6 KB | 1.8 GiB | 3.6 GiB | 14.3 GiB |
   | `--kv fp8` | 8.6 KB | 1.1 GiB | 2.1 GiB | 8.4 GiB |
 
-- **Elastic caches:** as Flash-Next's. With `--max-context` above 32,768 a session backs its first 32,768 positions at start;
+- **Elastic caches:** with `--max-context` above 32,768 a session backs its first 32,768 positions at start;
   the start is refused only when those need more than half the memory the weights leave. A prompt or a generation that needs
   more positions takes them from the expert tier (its spare slots first, then the slots it lends), and a later prompt that needs
   fewer gives them back. A prompt whose positions would leave the tier below a prompt chunk's needs is refused with an error and
   the engine serves the next request. The start line `elastic KV: ...` and `/v1/status` (`context.elastic_kv_ceiling`) give the
   positions that fit.
-- **VRAM:** `--vram-reserve-mib` and `POST /v1/vram` set what stays free, as for DeepSeek.
+- **VRAM:** `--vram-reserve-mib` and `POST /v1/vram` set what stays free.
 
 ## Long prompts
 
@@ -85,7 +85,7 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 ## Drafting
 
 On when the pack has the DFly2 drafter. One block pass drafts up to 5 tokens and states each one's chance of acceptance, and the
-draft policy picks the window by expected tokens per millisecond, as for DeepSeek
+draft policy picks the window by expected tokens per millisecond
 (`include/basalt/spec/draft_policy.hpp`). The heads run one draft at a time, each draft's chance before its pass over the
 vocabulary's rows, and stop at the first draft no window could hold. `--spec N` caps the window (default 6: the last accepted
 token plus the whole block); `--spec 0` turns it off.

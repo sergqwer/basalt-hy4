@@ -21,7 +21,7 @@ pays no indirect call. `Flow::next` returns to command dispatch; `Flow::error` e
 | A model that offers only sessions | `session_engine.cpp` |
 | The console's figures once the server sends `STATS` (XSLOT, XMAP, INFO cards=) | `console_stats.hpp`, `commands.cpp` |
 
-A model with its own serving derives from both classes in its own folder; see `src/models/qwen4exp/serve/`.
+A model with its own serving derives from both classes in its own folder; upstream's Flash-Next did ([`src/models/qwen4exp/serve/`](https://github.com/jesdga95/basalt/tree/a11e19f6/src/models/qwen4exp/serve)). Hy4-flash offers only sessions (`session_engine.cpp`).
 
 The protocol text and error paths are shared contracts with the Python server and the benchmark client. A structural
 change preserves those contracts and is checked against a frozen engine with fixed expert placement, including batch

@@ -17,7 +17,7 @@ own conversation differs:
 
 ## The interface
 
-The interface exists today (`include/basalt/model/adapter.hpp`); the dense stack (Qwen3.8-27B) implements it and the shared
+The interface exists today (`include/basalt/model/adapter.hpp`); Hy4-flash implements it and the shared
 serve engine (`src/program/serve/session_engine.cpp`) drives it. Every model batches through it: one batching path, no
 model-specific runtime or mode.
 
@@ -97,47 +97,14 @@ times the slots plus the shared scratch once, so more slots cost only their cach
 ## Models on the driver
 
 The goal is no separate batching paths: every model batches through the shared driver and the shared engine, for
-consistency. Qwen3.8-27B, Inkling 2 Mini, Hy4-flash and DeepSeek-V4.1-Flash are on it; Qwen3.8-Flash-Next moves last.
-
-- **Qwen3.8-27B** (the dense stack, `src/dense`) is on the driver. A window holds up to 16 rows (`kBatch`); its kernels read
-  their own segment tables (the attention's `GqaSeg` per segment, GDN's `BatchTable` through `dec_gdn_rec_seg_split`), which
-  carry each segment's cache and recurrent-state addresses beside its rows. `batch_reserve` settles a session (the last
-  window's GDN commit on its side stream; the driver readies every session before it waits on any, so the commits run side by
-  side) and prepares its draw; `batch_stage` packs the rows' tokens, rope positions (each session's offset) and the segment
-  table (`stage_batch`); `batch_forward` is the layer walk and the head over every row, each segment's logits and block-drafter
-  or MTP rows into its session (`batch_body`); `batch_take` its bookkeeping, `batch_draw` its sampler. The window scratch is the
-  model's, shared by every session. A layer split runs its two cards' graphs itself (`batch_captured` false: `forward_batch`
-  keeps each card's in its model's `BatchShared`). The block drafter's batched pass (`draft_batch`) stays the model's.
-- **Qwen3.8-Flash-Next** (`src/models/qwen4exp`) has its own runtime (`serve::Runtime`) and verifier: `Verifier::stage_batch`
-  takes per-row slot ids and lengths over its elastic KV arena. It is the most tuned path in the engine and already batches
-  slots x drafts in one pass. It moves onto the shared driver last, behind a hard gate: no speed loss at any slot count,
-  plain or drafted, ABBA against main, or it does not land. Until then new models copy the shared interface, not its
-  runtime.
+consistency. Hy4-flash is on it. Upstream's other models (Qwen3.8-27B, Inkling 2 Mini, DeepSeek-V4.1-Flash on the driver,
+Qwen3.8-Flash-Next with its own runtime) were removed; their retrofits: [upstream](https://github.com/jesdga95/basalt/blob/a11e19f6/docs/design/batching.md#retrofits).
 
 ## Retrofits
 
-How each model below went onto the driver: its state, the kernels that read it, its cap and what its sessions share.
+How a model went onto the driver: its state, the kernels that read it, its cap and what its sessions share.
 
-### Inkling 2 Mini (first)
-
-- **State:** per visit (48 layer applications, the loop's core three times) a `VisitCache`: K/V (a window ring on sliding
-  layers, a cell per position on full ones) and four convolution rings (key and value inputs, attention output, experts'
-  sum), all indexed by position. The block-attention mixes, loop controllers and messages live inside one forward: no state.
-  The DSpark drafter's context is per session.
-- **Kernels that read state:** the attention's preparation (key and value convolutions, cache and ring writes), the attention
-  itself, `post_attn` (the attention output's convolution), `moe_finish` (the experts' sum's convolution), and `mix_norm`'s
-  L2 read-ahead of older cells. Each takes a segment table (`Segments` in its args: per segment its first row and its caches);
-  without one (n = 0) the call is one conversation's, as today.
-- **The fused small-window attention** (1 to 3 rows, one cluster kernel) stays solo-only; a batch takes the prepare, split
-  and combine kernels, which give the same bits.
-- **Cap:** 8 rows, the products' column limit (`kDecodeRows`).
-- **On the driver:** `batch_stage` stages every row's token and position, `batch_forward` runs the visits with each
-  segment's caches, then the head over every row into the shared batch logits, and commits each session's drafter context
-  from its rows of the shared tap; `batch_take` copies a segment's head rows into its session's logits; `batch_draw` samples
-  with the session's own sampler into its pinned picks.
-- **Shared:** the forward's row buffers and expert scratch, the prompt path (its chunk buffers) and the drafter's tap.
-
-### Hy4-flash (second)
+### Hy4-flash
 
 - **State:** MLA latent rows per sparse layer and the indexer's pooled keys (one per 4 positions), sliding-window rings, the
   indexer's rows of the last positions, the Engram history (the conversation's own tokens), the DFly2 drafter's tap, the
@@ -157,44 +124,19 @@ How each model below went onto the driver: its state, the kernels that read it, 
 - **Experts:** one tier shared by every session. Most decode time goes to experts on the bus and in RAM, so the MoE caveat
   below decides whether more rows pay.
 
-### DeepSeek-V4.1-Flash
-
-- **State:** the window ring, the compressed KV rows and index keys of the kv-source layers, and the compressor's partial-group
-  state (`st_kv`, `st_sc`): order-dependent, so a segment's rows update its own state in order, like a recurrence. Engram as
-  Hy4.
-- **Kernels:** the compressor and the indexer take segments the way GDN does (`dec_gdn_rec_seg`: each segment from its own
-  state); the window and compressed attention take per-segment caches.
-- **On the driver:** the session derives `BatchSession`, `batch_rows` 8 (a decode window's `kMaxT`), `batch_captured` false
-  (the host places experts layer by layer, so the forward runs directly every window). Per segment: the attention through
-  that session's own ops (caches, ring, compressor state: the same call as its solo window of that many rows), the Engram
-  reads and projection, the DSpark feature rows. Every row: the mixes, norms, router, shared and routed experts and the
-  head. `draft_batch` runs each session's DSpark block in turn (one shared drafter) and holds its drafts for `draft_end`.
-- **Experts:** mostly in RAM and in the file on most machines. On two cards batching is slower than the windows in turn
-  were (the MoE caveat below): a batch's rows reach a wider union of RAM experts, and the 8-row cap trims each slot's
-  drafts. That is a limit of the hardware, accepted for one batching path. Two cards (400 W RTX 5090 + 180 W RTX 5060 Ti),
-  drafted, tiers unfrozen, 256 tokens a slot, aggregate tok/s, ABBA (main: windows in turn):
-
-| Slots | Main, in turn (A1 / A2) | Batched (B1 / B2) | Change |
-| --- | --- | --- | --- |
-| 1 | 89.3 / 87.0 | 87.0 / 92.8 | none: one slot runs its solo window, the same code |
-| 2 | 85.0 / 82.7 | 85.4 / 80.4 | -1.1% |
-| 4 | 71.5 / 70.0 | 63.8 / 62.1 | -11.0% |
-| 8 | 76.9 / 77.2 | 54.6 / 51.1 | -31.4% |
-
 ## The MoE caveat
 
 Rows from different conversations route independently. With k of E experts a row, R independent rows touch about
-`E (1 - (1 - k / E)^R)` distinct experts a layer: Inkling (8 of 128) 8 at one row, 15.5 at 2, 29 at 4, 51 at 8. Draft rows of
+`E (1 - (1 - k / E)^R)` distinct experts a layer: Hy4-flash (16 of 512) 16 at one row, 31.5 at 2, 61 at 4, 115 at 8. Draft rows of
 one conversation overlap more than rows of different conversations, so 4 slots x 1 row reads more experts than 1 slot x 4
 rows.
 
 - **Experts on the card:** a window's cost is mostly fixed (launches, dense weights, attention); the union grows the expert
-  reads only. Inkling's decode is far from the card's bandwidth at one row, so a batch is close to free.
-- **Experts in RAM (Hy4, DeepSeek):** a RAM expert costs a bus copy or a CPU product per distinct expert touched, and the CPU
+  reads only.
+- **Experts in RAM (Hy4-flash):** a RAM expert costs a bus copy or a CPU product per distinct expert touched, and the CPU
   cost grows with its rows. The union grows those directly, so a batch costs close to linear in its slots where most routed
-  pairs land in RAM. Such a model still batches every round, through the same path: on DeepSeek with two cards four
-  slots batched took CPU lookups from 13.3% to 17.6% of routed pairs and tier drops from 5.0K to 38.8K a run, and runs
-  slower than its windows in turn did (the table under DeepSeek-V4.1-Flash).
+  pairs land in RAM. Such a model still batches every round, through the same path: on upstream's DeepSeek with two cards
+  four slots batched ran slower than its windows in turn did ([upstream](https://github.com/jesdga95/basalt/blob/a11e19f6/docs/design/batching.md#deepseek-v41-flash)).
 
 ## Lossless identity
 
