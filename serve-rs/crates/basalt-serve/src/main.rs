@@ -151,7 +151,7 @@ fn strerror(e: &std::io::Error) -> String {
 
 /// What one configured model's file and flags imply (check_model).
 fn check_model(a: &mut Args, file_engine: &[String], cli_engine: &mut Vec<String>, used_argv: &[String],
-               known: Option<&BTreeSet<String>>) -> Map<String, Value> {
+               known: Option<&BTreeSet<String>>) -> (Map<String, Value>, Option<Vec<(String, Vec<u8>)>>) {
     let mut cfg = Map::new();
     let mut lines: Vec<String> = Vec::new();
     let gpu_v = a.get("gpu").clone();
@@ -265,14 +265,7 @@ fn check_model(a: &mut Args, file_engine: &[String], cli_engine: &mut Vec<String
             cfg.insert("model_name".into(), json!(name));
         }
     }
-    if let Some(t) = tokenizer {
-        let mut tm = Map::new();
-        for (k, v) in t {
-            tm.insert(k, Value::Array(v.into_iter().map(Value::from).collect()));
-        }
-        cfg.insert("__tokenizer".into(), Value::Object(tm));
-    }
-    cfg
+    (cfg, tokenizer)
 }
 
 fn drop_sidecar_vision(cfg: &mut Map<String, Value>) {
@@ -307,23 +300,15 @@ fn engine_echo(engine: Arc<ProcessEngine>) -> impl Fn(&str, u64) + Send + Sync {
     }
 }
 
-fn tokenizer_of(files: &Map<String, Value>) -> Option<Vec<(String, Vec<u8>)>> {
-    let mut out = Vec::new();
-    for (k, v) in files {
-        let Value::Array(a) = v else { return None };
-        out.push((k.clone(), a.iter().map(|x| x.as_u64().unwrap_or(0) as u8).collect()));
-    }
-    Some(out)
-}
-
 fn file_of<'a>(files: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a Vec<u8>> {
     files.iter().find(|(k, _)| k == name).map(|(_, v)| v)
 }
 
 /// The Service of one checked model, unloaded.
-fn build_model(a: &Args, cfg: &mut Map<String, Value>, logs: &Arc<LogBuffer>, multi: bool, known: Option<&BTreeSet<String>>,
+fn build_model(a: &Args, cfg: &mut Map<String, Value>, files: Option<Vec<(String, Vec<u8>)>>, logs: &Arc<LogBuffer>, multi: bool, known: Option<&BTreeSet<String>>,
                root: &Path) -> Arc<Service> {
-    let files: Vec<(String, Vec<u8>)> = match cfg.get("__tokenizer").and_then(|v| v.as_object()).and_then(tokenizer_of) {
+    // cfg["tokenizer"] in server.py; kept beside cfg here, as bytes
+    let files: Vec<(String, Vec<u8>)> = match files {
         Some(f) => f,
         None => {
             let tdir = PathBuf::from(a.s("tokenizer").unwrap_or_default());
@@ -550,9 +535,11 @@ fn main() {
     }
     let known = a0.st("engine_bin").and_then(|b| config::engine_flags_of(&b));
     let mut cfgs: Vec<Map<String, Value>> = Vec::new();
+    let mut toks: Vec<Option<Vec<(String, Vec<u8>)>>> = Vec::new();
     for (m, used, file_engine, cli_engine) in settings.iter_mut() {
-        let c = check_model(m, file_engine, cli_engine, used, known.as_ref());
+        let (c, t) = check_model(m, file_engine, cli_engine, used, known.as_ref());
         cfgs.push(c);
+        toks.push(t);
     }
     let a = settings[0].0.clone();
     let hosts = a.list("image_url_host");
@@ -591,8 +578,8 @@ fn main() {
         c.insert("name_width".into(), json!(width));
     }
     let root = config::root();
-    let services: Vec<Arc<Service>> = settings.iter().zip(cfgs.iter_mut())
-        .map(|(m, cfg)| build_model(&m.0, cfg, &logs, multi, known.as_ref(), &root)).collect();
+    let services: Vec<Arc<Service>> = settings.iter().zip(cfgs.iter_mut()).zip(toks)
+        .map(|((m, cfg), t)| build_model(&m.0, cfg, t, &logs, multi, known.as_ref(), &root)).collect();
     check_models(&services);
     let router = Router::new(services.clone());
     let svc = router.front.clone();

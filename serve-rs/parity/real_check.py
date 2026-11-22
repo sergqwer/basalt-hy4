@@ -88,10 +88,10 @@ def engine_pids(proc: Proc):
     return [p.pid for p in proc.tree() if p.name().lower() == "basalt.exe"]
 
 
-def one(name, argv, port, log):
+def one(name, argv, port, log, env_extra=None):
     base = f"http://127.0.0.1:{port}"
     t0 = time.monotonic()
-    proc = Proc(argv, dict(**__import__("os").environ), str(ROOT))
+    proc = Proc(argv, {**__import__("os").environ, **(env_extra or {})}, str(ROOT))
     out = {"side": name, "argv": argv}
     try:
         if not proc.wait_ready(120):
@@ -143,7 +143,9 @@ def main():
     ap.add_argument("--engine-bin", default=str(ROOT / "bin" / "basalt.exe"))
     ap.add_argument("--alias", default="Hy4-flash NVFP4")
     ap.add_argument("--out", default=str(HERE / "real_check.jsonl"))
+    ap.add_argument("--record", help="record each side's engine stdin into DIR/<side>.stdin through relay.cmd")
     a = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")
     free0 = psutil.virtual_memory().available / GIB
     vram = int(subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
                               capture_output=True, text=True).stdout.split()[0])
@@ -151,19 +153,42 @@ def main():
     if free0 < 95 or vram >= 2048:
         print("preconditions not met", flush=True)
         return 3
-    common = ["--model", a.pack, "--engine-bin", a.engine_bin, "--alias", a.alias]
+    bin_ = str(HERE / "relay.cmd") if a.record else a.engine_bin
+    common = ["--model", a.pack, "--engine-bin", bin_, "--alias", a.alias]
+
+    def env(side):
+        if not a.record:
+            return {}
+        Path(a.record).mkdir(parents=True, exist_ok=True)
+        f = Path(a.record) / f"{side}.stdin"
+        f.unlink(missing_ok=True)
+        return {"RELAY_ENGINE": a.engine_bin, "RELAY_RECORD": str(f)}
     res = []
     with open(a.out, "w", encoding="utf-8") as log:
-        res.append(one("python", [PY, "-m", "serve.server", *common, "--port", "18850"], 18850, log))
+        res.append(one("python", [PY, "-m", "serve.server", *common, "--port", "18850"], 18850, log, env("python")))
         print(json.dumps({k: res[-1].get(k) for k in ("load_s", "mem_loaded", "mem_after", "stop", "engines_left", "error")}),
               flush=True)
         if not wait_ram(free0 - 4):
             print(f"RAM not back: {psutil.virtual_memory().available / GIB:.1f} GiB", flush=True)
-        res.append(one("rust", [RS, *common, "--port", "18851"], 18851, log))
+        res.append(one("rust", [RS, *common, "--port", "18851"], 18851, log, env("rust")))
+        print(json.dumps({k: res[-1].get(k) for k in ("load_s", "mem_loaded", "mem_after", "stop", "engines_left", "error")}),
+              flush=True)
+        if not wait_ram(free0 - 4):
+            print(f"RAM not back: {psutil.virtual_memory().available / GIB:.1f} GiB", flush=True)
+        res.append(one("python2", [PY, "-m", "serve.server", *common, "--port", "18852"], 18852, log, env("python2")))
         print(json.dumps({k: res[-1].get(k) for k in ("load_s", "mem_loaded", "mem_after", "stop", "engines_left", "error")}),
               flush=True)
     wait_ram(free0 - 4)
-    pa, ra = res[0].get("answers") or [], res[1].get("answers") or []
+    pa, ra, p2 = res[0].get("answers") or [], res[1].get("answers") or [], res[2].get("answers") or []
+    strip0 = lambda x: {k: v for k, v in x.items() if k != "wall_s"}  # noqa: E731
+    for i, (p, q) in enumerate(zip(pa, p2)):
+        print(f"python vs python, request {i}: {'IDENTICAL' if strip0(p) == strip0(q) else 'DIFFERENT'}", flush=True)
+    if a.record:
+        d = Path(a.record)
+        for x, y in (("python", "rust"), ("python", "python2")):
+            bx, by = (d / f"{x}.stdin").read_bytes(), (d / f"{y}.stdin").read_bytes()
+            print(f"engine stdin {x} vs {y}: {'IDENTICAL' if bx == by else 'DIFFERENT'} ({len(bx)} / {len(by)} bytes)",
+                  flush=True)
     strip = lambda x: {k: v for k, v in x.items() if k != "wall_s"}  # noqa: E731
     for i, (p, r) in enumerate(zip(pa, ra)):
         same = strip(p) == strip(r)
