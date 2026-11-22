@@ -948,7 +948,7 @@ impl<'a> Ctx<'a> {
         let bias = logit_bias::checked(req, &*svc.engine)?;
         let grammar = svc.grammar_for(tools.as_ref(), req.get("tool_choice"), req.get("tools"), req.get("response_format"))?;
         req.insert(GRAMMAR_KEY.into(), grammar.unwrap_or(Value::Null));
-        let max_new = py_int_or_zero(req.get("max_completion_tokens")).or_else(|| py_int_or_zero(req.get("max_tokens"))).unwrap_or(0);
+        let max_new = int_of_first(&[req.get("max_completion_tokens"), req.get("max_tokens")])?;
         svc.reasoning_budget(req)?;
         serve_text::text::stop_strings(req).map_err(ApiError::value)?;
         let (ids, thinking, max_new) = svc.prepare(&messages, tools.as_ref(), &kw, max_new, force.as_deref(), Some(self.image_access()))?;
@@ -1010,7 +1010,7 @@ impl<'a> Ctx<'a> {
         use serve_api::api::{anthropic, logprobs, structured};
         let (messages, tools, kw) = serve_api::frontend::anthropic_to_messages(req, svc.anthropic_think_unasked())?;
         let (tools, force) = serve_api::frontend::forced_call(req.get("tool_choice"), tools, &|n| svc.forced_opening(n))?;
-        let max_new = py_int_or_zero(req.get("max_tokens")).unwrap_or(0);
+        let max_new = int_of_first(&[req.get("max_tokens")])?;
         let response_format = structured::anthropic_format(req)?;
         if let Err(e) = svc.require_grammar(response_format.as_ref()) {
             if e.is_value() {
@@ -1180,7 +1180,10 @@ impl<'a> Ctx<'a> {
         let (tools, force) = serve_api::frontend::forced_call(req.get("tool_choice"), tools, &|n| svc.forced_opening(n))
             .map_err(|e| ApiError::Responses(ResponsesError::new(e.message(), Some("tool_choice"), None)))?;
         let kw = rs::template_kwargs(&req)?;
-        let tf = rs::text_format(&req)?;
+        // handler.py wraps text_format's own ResponsesError (a ValueError) the same way: param "text.format"
+        let tf = rs::text_format(&req).map_err(|e| {
+            ApiError::Responses(ResponsesError::new(e.message().replace("response_format", "text.format"), Some("text.format"), None))
+        })?;
         serve_api::api::structured::check_format(tf.as_ref())
             .map_err(|e| ApiError::Responses(ResponsesError::new(e.message().replace("response_format", "text.format"), Some("text.format"), None)))?;
         if let Err(e) = svc.require_grammar(tf.as_ref()) {
@@ -1312,18 +1315,39 @@ fn parse_hex(text: &str) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
-/// int(x or 0) for a JSON value (max_tokens and friends); None when x is falsy
+/// `int(a or b or ... or 0)` over JSON values, as handler.py reads max_tokens: ValueError's text for a bad string or
+/// NaN, a TypeError (an unhandled exception in Python: Internal) for a list or an object.
+fn int_of_first(vals: &[Option<&Value>]) -> R<i64> {
+    let v = vals.iter().flatten().find(|v| pyjson::truthy(v)).copied();
+    let Some(v) = v else { return Ok(0) };
+    match v {
+        Value::Bool(b) => Ok(*b as i64),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => Ok(i),
+            None => {
+                let x = n.as_f64().unwrap_or(0.0);
+                if x.is_nan() {
+                    Err(Fail::Api(ApiError::value("cannot convert float NaN to integer")))
+                } else if x.is_infinite() {
+                    Err(Fail::Api(ApiError::Internal("OverflowError: cannot convert float infinity to integer".into())))
+                } else {
+                    Ok(x.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+                }
+            }
+        },
+        Value::String(s) => py_int(s).ok_or_else(|| Fail::Api(ApiError::value(format!(
+            "invalid literal for int() with base 10: {}", pyjson::py_str_repr(s))))),
+        other => Err(Fail::Api(ApiError::Internal(format!(
+            "TypeError: int() argument must be a string, a bytes-like object or a real number, not '{}'",
+            pyjson::type_name(other))))),
+    }
+}
+
+/// `req.get(key) or 0` for max_output_tokens (prepare compares it with 0)
 fn py_int_or_zero(v: Option<&Value>) -> Option<i64> {
     match v {
-        None | Some(Value::Null) => None,
-        Some(Value::Bool(false)) => None,
-        Some(Value::Bool(true)) => Some(1),
-        Some(Value::Number(n)) => {
-            let x = n.as_f64().unwrap_or(0.0);
-            if x == 0.0 { None } else { Some(n.as_i64().unwrap_or(x.trunc() as i64)) }
-        }
-        Some(Value::String(s)) if s.is_empty() => None,
-        Some(Value::String(s)) => py_int(s),
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|x| x.trunc() as i64)),
+        Some(Value::Bool(b)) => Some(*b as i64),
         _ => None,
     }
 }

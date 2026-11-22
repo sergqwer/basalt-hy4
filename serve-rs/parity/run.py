@@ -99,6 +99,8 @@ NORMALIZERS = [
                        "tg=N -> tg=<num> on a line that ends end=cancelled (how far a cancelled run got is timing)"),
     ("close-after-complete", "connection end eof/reset -> closed-after-complete once a response with a matching "
                              "Content-Length has fully arrived (FIN vs RST over unread request bytes is a race)"),
+    ("traceback", "handle_error output: the Python traceback body is dropped (the exception line stays), and the "
+                  "client port in 'processing of request from (host, port)' -> <peer>"),
     ("port", "the side's own port number (the harness put it there) -> <port>, in stdout/stderr and bodies"),
 ]
 
@@ -589,12 +591,29 @@ def run_side(prefix: str, case: dict, env_extra: dict) -> dict:
         release_port(port)
 
 
+PEER_RE = re.compile(r"(processing of request from \('[^']*', )\d+\)")
+
+
 def out_lines(raw: bytes, norm: Norm) -> list[str]:
     """Output split into lines (CR LF and LF alike: the line ending is not compared), each normalized."""
     lines = raw.decode("utf-8", "replace").split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    return [norm.line(x.rstrip("\r")) for x in lines]
+    out, in_tb = [], False
+    for x in (x.rstrip("\r") for x in lines):
+        # socketserver.handle_error: Python prints the traceback, the Rust port only its last line (the exception)
+        if x == "Traceback (most recent call last):":
+            in_tb = True
+            norm.hit("traceback")
+            continue
+        if in_tb and (x.startswith("  ") or not x.strip()):
+            continue
+        in_tb = False
+        x2 = PEER_RE.sub(r"\1<peer>)", x)
+        if x2 != x:
+            norm.hit("traceback")
+        out.append(norm.line(x2))
+    return out
 
 
 def normalize_side(raw: dict, case: dict) -> tuple[dict, Norm]:
