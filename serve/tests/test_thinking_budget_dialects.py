@@ -12,8 +12,6 @@ from pathlib import Path
 from serve.engine.mock import MockEngine
 from serve.frontend import ChatTemplate
 from serve.handler import serve
-from serve.models import deepseek41 as ds
-from serve.models import deepseek41_encoding as enc
 from serve.models.qwen import Qwen
 from serve.service import Service
 from serve.util.text import ByteTokenizer
@@ -25,11 +23,6 @@ TOOLS = [{"type": "function", "function": {"name": "search", "description": "sea
                                            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
 
 
-class DeepseekTokenizer(ByteTokenizer):
-    SPECIALS = ByteTokenizer.SPECIALS + [enc.bos_token, enc.eos_token, enc.USER_SP_TOKEN, enc.ASSISTANT_SP_TOKEN,
-                                         enc.SYSTEM_SP_TOKEN]
-
-
 class QwenCase:
     dialect = Qwen()
     tok = ByteTokenizer()
@@ -38,17 +31,6 @@ class QwenCase:
     close = "</think>\n\n"          # the model's own end of it
     end = "<|im_end|>"
     call = "<tool_call>\n<function=search>\n<parameter=q>\n2+2\n</parameter>\n</function>\n</tool_call>"
-
-
-class DeepseekCase:
-    dialect = ds.DeepSeek41()
-    tok = DeepseekTokenizer()
-    template = ds.DeepseekTemplate()
-    opener = enc.thinking_start_token
-    close = enc.thinking_end_token
-    end = enc.eos_token
-    call = (f'{ds.CALLS_GAP}{ds.CALLS_START}\n{ds.INVOKE_START} name="search">\n'
-            f'{ds.PARAM_START} name="q" string="true">2+2{ds.PARAM_END}\n{ds.INVOKE_END}\n{ds.CALLS_END}')
 
 
 class ScriptEngine(MockEngine):
@@ -131,10 +113,6 @@ class Budget:
 
 class QwenBudget(Budget, unittest.TestCase):
     case = QwenCase
-
-
-class DeepseekBudget(Budget, unittest.TestCase):
-    case = DeepseekCase
 
 
 if __name__ == "__main__":

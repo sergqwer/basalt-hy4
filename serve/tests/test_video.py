@@ -17,7 +17,7 @@ from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
 from serve.engine.vision import VideoRows, video_rows
 from serve.frontend import ChatTemplate, anthropic_to_messages, media_of, openai_to_messages
-from serve.models.deepseek41 import DeepSeek41
+from serve.models.hy4flash import Hy4Flash
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
@@ -153,7 +153,7 @@ class Refusals(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _, svc = service(FakeVision(d))
             self.refused(service(None)[1], user(VIDEO), "without image input")
-            self.refused(service(FakeVision(d), DeepSeek41())[1], user(VIDEO), "reads no video")
+            self.refused(service(FakeVision(d), Hy4Flash())[1], user(VIDEO), "reads no video")
             self.refused(service(FakeVision(d, state="off no FFmpeg libraries found (tried libavformat.so.62)"))[1],
                          user(VIDEO), "cannot read video: no FFmpeg libraries found")
             self.refused(svc, [{"role": "system", "content": [VIDEO]}, {"role": "user", "content": "hi"}], "system prompt")

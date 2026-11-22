@@ -177,9 +177,9 @@ class GGUFWriter:
 def _selfcheck() -> int:
     rng = np.random.default_rng(7)
     w = GGUFWriter()
-    w.add("general.architecture", "qwen4exp")
-    w.add("qwen4exp.block_count", 8, "u32")
-    w.add("qwen4exp.test.array", [1, 2, 3, 4], "array:i32")
+    w.add("general.architecture", "hy4flash")
+    w.add("hy4flash.block_count", 8, "u32")
+    w.add("hy4flash.test.array", [1, 2, 3, 4], "array:i32")
     w.add("general.name", "tiny")
 
     A = rng.standard_normal((16, 64)).astype(np.float32)
@@ -194,9 +194,9 @@ def _selfcheck() -> int:
     g = GGUFFile(p)
     ok = True
     print(f"  version {g.version}  tensors {len(g.tensors)}  metadata {len(g.metadata)}")
-    if g.metadata.get("general.architecture") != "qwen4exp": print("  FAIL arch"); ok = False
-    if g.metadata.get("qwen4exp.block_count") != 8:         print("  FAIL u32"); ok = False
-    if g.metadata.get("qwen4exp.test.array") != [1, 2, 3, 4]: print("  FAIL array"); ok = False
+    if g.metadata.get("general.architecture") != "hy4flash": print("  FAIL arch"); ok = False
+    if g.metadata.get("hy4flash.block_count") != 8:         print("  FAIL u32"); ok = False
+    if g.metadata.get("hy4flash.test.array") != [1, 2, 3, 4]: print("  FAIL array"); ok = False
 
     by = {t.name: t for t in g.tensors}
     t = by.get("blk.0.ffn_gate_exps.weight")

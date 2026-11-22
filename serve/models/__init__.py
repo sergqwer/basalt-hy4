@@ -63,17 +63,12 @@ class Dialect:
 
 
 def dialect_for(arch: str | None) -> Dialect:
-    """The dialect of a model file's architecture; None (no file: the mock engine) is the plain chat-template one."""
-    if arch == "deepseek41":
-        from serve.models.deepseek41 import DeepSeek41
-        return DeepSeek41()
+    """The dialect of a model file's architecture; None (no file: the mock engine) is the plain chat-template one, the
+    Qwen form the serve tests are written against (no model of that family is built any more)."""
     if arch in ("hy4flash", "hy_v4_flash"):
         from serve.models.hy4flash import Hy4Flash
         return Hy4Flash()
-    if arch == "inkling2":
-        from serve.models.inkling2 import Inkling2
-        return Inkling2()
-    if arch in ("qwen4exp", "qwen35", None):
+    if arch is None:
         from serve.models.qwen import Qwen
         return Qwen()
     raise ValueError(f"no dialect for architecture {arch!r}")

@@ -12,21 +12,15 @@
 #include "basalt/program/tokenizer.hpp"
 #include "unicode_flags.hpp"
 
-// The Qwen pre-tokenizer is shared (the tokenizer library); the others belong to the models this build contains.
-#ifdef BASALT_MODEL_DEEPSEEK41
-#include "models/deepseek41/adapter.hpp"
-#endif
+// The synthetic cases split with the qwen35 rule (tests/program/pretok_qwen35.cpp); a pack's parity with Hy4's.
+#include "models/hy4flash/adapter.hpp"
 namespace basalt::program::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
 
 using basalt::program::Tokenizer;
 
 namespace {
 using PreTok = void (*)(const char*, size_t, std::vector<size_t>&);
-#ifdef BASALT_MODEL_DEEPSEEK41
-constexpr PreTok kJoyai = basalt::models::deepseek41::pretok_joyai;
-#else
-constexpr PreTok kJoyai = nullptr;
-#endif
+constexpr PreTok kHy4 = basalt::models::hy4flash::pretok_hy4;
 constexpr PreTok kQwen35 = basalt::program::tokenizer::pretok_qwen35;
 }  // namespace
 
@@ -122,11 +116,7 @@ int parity(const std::string& dir, const std::string& golden) {
     std::string err;
     const auto t0 = std::chrono::steady_clock::now();
     // the rule the pack names
-    const PreTok pre = read_all(dir + "/tokenizer.json").find("\"pre\": \"joyai-llm\"") != std::string::npos ? kJoyai : kQwen35;
-    if (pre == nullptr) {
-        std::fprintf(stderr, "the pre-tokenizer of this pack belongs to a model this build left out\n");
-        return 1;
-    }
+    const PreTok pre = read_all(dir + "/tokenizer.json").find("\"pre\": \"hy_v4\"") != std::string::npos ? kHy4 : kQwen35;
     t.set_pretokenize(pre);
     if (!t.load(read_all(dir + "/vocab.json"), read_all(dir + "/merges.txt"), read_all(dir + "/token_type.json"), err)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());

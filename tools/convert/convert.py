@@ -53,23 +53,6 @@ From an NVFP4 checkpoint (--sections-from with --checkpoint)
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
   The drafter and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
-From NVIDIA's DeepSeek-V4.1 NVFP4 checkpoint (a deepseek41 BASE; tools/convert/checkpoint_deepseek41.py)
-  --checkpoint DIR   config.json, model.safetensors.index.json and the shards. The routed experts are repacked as above
-                     (w1 gate, w3 up, w2 down); the FP8 projections become Q8_0 of their exact values (BF16 where BASE
-                     reads BF16); the MXFP4 Engram rows are kept. Tokenizer, metadata, vision and drafter are BASE's
-  --stream-shards    the shards may arrive while the conversion runs, in file order (another process downloads them), and
-                     each is deleted once its tensors are written: the disk holds the pack and a shard or two
-
-From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoint_qwen35.py)
-  --checkpoint DIR   an NVFP4 checkpoint of a Qwen3.5-family dense model, NVIDIA Model Optimizer's
-                     (nvidia/Qwen3.8-27B-NVFP4) or compressed-tensors' (QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4): NVFP4
-                     projections keep their codes and scales, FP8 ones their E4M3 codes, NVFP4 GDN a / b become BF16 of
-                     their values, a BF16 head becomes FP8 E4M3 rows, the drafter's BF16 projections Q8_0, the vision
-                     tower an mmproj GGUF; tokenizer and metadata from the checkpoint's files. Everything comes from DIR.
-  --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
-  --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
-                     to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
-
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
   Every Q8_0 dense projection whose rows are whole 256-value blocks (GDN qkv/z/out, attention q/k/v/o, the shared
@@ -611,13 +594,9 @@ def from_checkpoint(a) -> None:
     import checkpoint as C
     out, src = Path(a.out), Path(a.sections_from)
     if src.is_file() and json.loads(ModelFile(str(src)).read("meta")).get("arch") == "deepseek41":
-        if a.dense_q8_0 or a.mtp_dense:
-            die("a deepseek41 BASE takes no --dense-q8-0 or --mtp-dense")
-        import checkpoint_deepseek41 as D
-        D.build(a, Job, fingerprint, source_record)
-        return
+        die("the deepseek41 checkpoint converter was removed with that model (NOTES-strip.md)")
     if a.stream_shards:
-        die("--stream-shards takes a deepseek41 BASE")
+        die("--stream-shards took a deepseek41 BASE, removed with that model (NOTES-strip.md)")
     partial = Path(str(out) + ".partial")
     if out.exists() and not a.force:
         die(f"{out} exists (use --force to overwrite)")
@@ -921,15 +900,8 @@ def main():
             ap.error(f"missing input: {a.drafter}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
-        if checkpoint_model_type(Path(a.checkpoint)) == "inkling2_loop":
-            if a.drafter or a.head:
-                ap.error("--drafter and --head go with a qwen35 checkpoint; Inkling 2 carries its drafter")
-            import checkpoint_inkling2 as I
-            I.build(a, Job, fingerprint, die)
-            return
-        import checkpoint_qwen35 as Q
-        Q.build(a, Job, fingerprint, die)
-        return
+        # the dense qwen35 and the inkling2 checkpoint converters were removed with those models (NOTES-strip.md)
+        die("--checkpoint without --sections-from converted a qwen35 or inkling2 checkpoint, removed in this fork")
     if a.dense_q8_0 or a.stream_shards:
         ap.error("--dense-q8-0 and --stream-shards need --checkpoint and --sections-from")
     if not a.gguf:

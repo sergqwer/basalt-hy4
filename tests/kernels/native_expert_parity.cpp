@@ -12,7 +12,7 @@
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
 #include "basalt/artifact/gguf_reader.hpp"
-#include "basalt/models/qwen4exp/decode/native_head.hpp"
+
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
@@ -1151,11 +1151,11 @@ int check_q6k_embd(cudaStream_t s) {
 }
 
 // The Q8_0 token embedding at the model's geometry (2560 x 248,320) in mapped host memory with its first
-// NativeEmbed::kHotRows rows also in VRAM: iq_embed_rows with the hot copy against the same gather without it and
+// 8192 rows (the removed Qwen engine's hot rows) also in VRAM: iq_embed_rows with the hot copy against the same gather without it and
 // against ggml's dequantize_row_q8_0, bit for bit, on ids across the boundary; then the per-call time of each.
 int check_q8_embd_hot(cudaStream_t s) {
     constexpr int kQ80 = 8;
-    const int64_t H = 2560, V = 248320, NHOT = basalt::core::NativeEmbed::kHotRows, NT = 512;
+    const int64_t H = 2560, V = 248320, NHOT = 8192, NT = 512;
     const size_t rb = basalt::kernels::iq_row_bytes(kQ80, H);
     if (rb != (size_t) (H / 32) * 34) { std::printf("q8_0 embedding: row bytes wrong\n"); return 1; }
     void* host = nullptr;

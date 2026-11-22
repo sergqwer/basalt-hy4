@@ -1,12 +1,15 @@
-// src/program/tokenizer/pretok_qwen35.cpp - the qwen35 pre-tokenizer: the text split into the pieces BPE merges.
+// tests/program/pretok_qwen35.cpp - the qwen35 pre-tokenizer: the text split into the pieces BPE merges. The engine no
+// longer runs it (Hy4 has its own, src/models/hy4flash/pretok_hy4.cpp); the BPE tests keep it as a reference rule.
 //
 // The splitting rules are those of llama.cpp's unicode_regex_split_custom_qwen35 (src/unicode.cpp at commit f5027fb21,
 // MIT licence, written by Kabir Potdar for llama.cpp pull request 22110; see THIRD_PARTY_LICENSES). They implement
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 // by hand, without backtracking. Here the code points are decoded once, with their flags, and the pieces come back as
 // byte offsets into the UTF-8 text.
-#include "basalt/program/qwen_forms.hpp"
 #include "unicode_flags.hpp"
+
+#include <cstddef>
+#include <vector>
 
 namespace basalt::program::tokenizer {
 

@@ -13,7 +13,7 @@
 // and glibc, so they are checked against the reference instead of a frozen bit pattern.  The fixture uses only the raw
 // generator output, so it is the same on every standard library.
 // `--print` prints the hashes, `--bench` one in-cache thread's rate per format and token count.
-#include "basalt/models/qwen4exp/geometry.hpp"
+#include "flash_next_geometry.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"

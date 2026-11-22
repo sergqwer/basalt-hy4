@@ -53,7 +53,7 @@ template <class F> std::vector<std::string> write_model(const fs::path& dir, F m
     std::vector<std::string> paths;
     for (int i = 0; i < 4; ++i) {
         std::vector<fixture::Kv> kv;
-        if (i == 0) kv.push_back(fixture::str("general.architecture", "qwen4exp"));
+        if (i == 0) kv.push_back(fixture::str("general.architecture", "hy4flash"));
         for (const auto& k : fixture::split_keys((uint64_t) i, 4, total)) kv.push_back(k);
         std::vector<Tensor> ts;
         if (i == 1) ts = {{"output.weight", {64, 4}, Q8_0, 1}, {"token_embd.weight", {64, 4}, Q8_0, 2},

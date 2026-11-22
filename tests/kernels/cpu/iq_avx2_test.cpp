@@ -15,7 +15,7 @@
 // may change, the bits may not), on a fixture made from the raw generator output only, so it is the same on every
 // standard library. The AVX-512 quantizer must match to the bit and its Q2_0 rows to rounding, where the CPU has them. A token's rows must not depend on how many tokens share the call. `--print` prints the hashes,
 // `--bench` one row range per format on each build.
-#include "basalt/models/qwen4exp/geometry.hpp"
+#include "flash_next_geometry.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"

@@ -1,5 +1,5 @@
-// tests/model/adapter_registry_test.cpp - the adapter registry: lookup by architecture, the replaced guard and DeepSeek
-// geometry from `deepseek41.*` metadata. Host only: no model and no runtime are linked.
+// tests/model/adapter_registry_test.cpp - the adapter registry: lookup by architecture, the replaced guard and Hy4
+// geometry from `hy_v4_flash.*` metadata. Host only: no model and no runtime are linked.
 #include "../core/gguf_fixture.hpp"
 #include "basalt/model/adapter.hpp"
 #include "meta_adapters.hpp"
@@ -18,7 +18,7 @@ void check(bool ok, const char* what) {
 int main() {
     using namespace basalt;
     test::register_meta_adapters();
-    check(model::find_adapter("qwen4exp") && model::find_adapter("deepseek41"), "both adapters registered");
+    check(model::find_adapter("hy4flash") != nullptr, "the hy4flash adapter is registered");
     check(model::find_adapter("llama") == nullptr, "an unknown architecture has no adapter");
 
     const auto dir = std::filesystem::temp_directory_path() / "basalt_adapter_registry_test";
@@ -29,24 +29,25 @@ int main() {
     check(model::check_architecture(GgufFile((dir / "other.gguf").string())).find("no model adapter") != std::string::npos,
           "an unregistered architecture is refused by name");
 
-    write(dir / "qwen.gguf", {str("general.architecture", "qwen4exp")}, {});
-    check(model::check_architecture(GgufFile((dir / "qwen.gguf").string())).find("block_count") != std::string::npos,
-          "qwen4exp without its keys is refused");
+    write(dir / "bare.gguf", {str("general.architecture", "hy4flash")}, {});
+    check(model::check_architecture(GgufFile((dir / "bare.gguf").string())).find("block_count") != std::string::npos,
+          "hy4flash without its keys is refused");
 
-    const std::vector<Kv> ds = {str("general.architecture", "deepseek41"), u32("deepseek41.block_count", 43),
-                                u32("deepseek41.embedding_length", 5120), u32("deepseek41.expert_count", 384),
-                                u32("deepseek41.expert_used_count", 6),
-                                u32("deepseek41.expert_feed_forward_length", 2048)};
-    write(dir / "ds.gguf", ds, {});
-    const GgufFile g((dir / "ds.gguf").string());
-    check(model::check_architecture(g).empty(), "deepseek41 with its keys validates");
+    const std::vector<Kv> hy = {str("general.architecture", "hy4flash"), u32("hy_v4_flash.block_count", 43),
+                                u32("hy_v4_flash.nextn_predict_layers", 1), u32("hy_v4_flash.embedding_length", 4096),
+                                u32("hy_v4_flash.expert_count", 512), u32("hy_v4_flash.expert_used_count", 8),
+                                u32("hy_v4_flash.expert_feed_forward_length", 1536),
+                                u32("hy_v4_flash.attention.kv_lora_rank", 512), u32("hy_v4_flash.expert_latent_length", 1024)};
+    write(dir / "hy.gguf", hy, {});
+    const GgufFile g((dir / "hy.gguf").string());
+    check(model::check_architecture(g).empty(), "hy4flash with its keys validates");
     std::string err;
     const model::ModelAdapter* a = model::adapter_for(g, err);
-    check(a != nullptr && std::string(a->arch()) == "deepseek41", "adapter_for picks deepseek41");
+    check(a != nullptr && std::string(a->arch()) == "hy4flash", "adapter_for picks hy4flash");
     if (a) {
         const model::ModelDesc d = a->describe(g);
-        check(d.n_layers == 43 && d.n_embd == 5120 && d.n_expert == 384 && d.n_expert_used == 6 && d.n_ff_exp == 2048,
-              "describe() reads the geometry from the metadata");
+        check(d.n_layers == 42 && d.n_embd == 4096 && d.n_expert == 512 && d.n_expert_used == 8 && d.n_ff_exp == 1536,
+              "describe() reads the geometry from the metadata (the MTP layer left out)");
     }
     std::filesystem::remove_all(dir);
     return failures ? 1 : 0;

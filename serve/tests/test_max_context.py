@@ -1,4 +1,4 @@
-"""The DeepSeek context follows the same settings as every model: --max-context on the command line or in the config
+"""The context follows the same settings as every model: --max-context on the command line or in the config
 file reaches the engine unchanged, an absent flag leaves the engine to pick the model's own maximum, and the server
 plans with the context the engine reports at READY."""
 from __future__ import annotations

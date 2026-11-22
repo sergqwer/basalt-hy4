@@ -44,7 +44,7 @@ if [[ -n "${hits}" ]]; then
 fi
 
 # 4. CMake: shared libraries do not link a model library
-hits=$(grep -nE 'target_link_libraries\((core|engine|kernels|kernels_cpu|prefill|spec|model|platform|artifact)[[:space:]].*model_(qwen4exp|deepseek41)' CMakeLists.txt || true)
+hits=$(grep -nE 'target_link_libraries\((core|engine|kernels|kernels_cpu|prefill|spec|model|platform|artifact)[[:space:]].*model_hy4flash' CMakeLists.txt || true)
 if [[ -n "${hits}" ]]; then
   echo "model layering: a shared library links a model library:" >&2
   echo "${hits}" >&2
@@ -52,7 +52,7 @@ if [[ -n "${hits}" ]]; then
 fi
 
 # 5. a model's host code lives in its own namespace
-hits=$(grep -rnE 'namespace basalt::program' --include='*.[ch]pp' src/models/qwen4exp include/basalt/models/qwen4exp \
+hits=$(grep -rnE 'namespace basalt::program' --include='*.[ch]pp' src/models/hy4flash include/basalt/models/hy4flash \
          | grep -v 'shared_names.hpp' || true)
 if [[ -n "${hits}" ]]; then
   echo "model layering: a model's code opens a shared namespace:" >&2

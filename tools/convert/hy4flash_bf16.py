@@ -30,7 +30,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import checkpoint as C  # noqa: E402
-import checkpoint_qwen35 as Q  # noqa: E402
+import fp4_round as Q  # noqa: E402
 import model_sections as S  # noqa: E402
 from arch.hy4flash import ENGRAM_SECTION, ENGRAM_TENSOR, F8_E4M3_RAW, Hy4Flash  # noqa: E402
 from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile, ModelWriter, Stream  # noqa: E402
