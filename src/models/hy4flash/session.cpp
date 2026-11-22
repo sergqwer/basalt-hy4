@@ -13,6 +13,7 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_tier.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -115,6 +116,14 @@ struct Bufs {
 // The forward scratch every session of a model shares (docs/design/batching.md, "Per-slot state and shared scratch"): the row
 // buffers of a decode window, the experts' staging and the products' workspaces. The engine runs one call at a time and each call
 // syncs its stream before it returns, so one set serves every session; only a conversation's own state is per session.
+class Session;
+// The sessions alive, for the watchdog (core/progress.hpp): what their GPU waits on, and the release of those waits before the
+// engine ends - a kernel still spinning on a host word keeps the process (and its pinned RAM) from going away.
+std::mutex g_live_mu;
+std::vector<Session*> g_live;
+void diag_sessions(std::FILE* f);
+void release_sessions(std::FILE* f);
+
 struct Scratch {
     Bufs dec;
     std::vector<void*> dev, pinned;
@@ -138,8 +147,17 @@ struct Scratch {
 
 class Session final : public model::BatchSession {
 public:
-    explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
+    explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {
+        std::lock_guard<std::mutex> g(g_live_mu);
+        g_live.push_back(this);
+        basalt::core::diag_verify_fn().store(&diag_sessions);
+        basalt::core::release_gpu_fn().store(&release_sessions);
+    }
     ~Session() override {
+        {
+            std::lock_guard<std::mutex> g(g_live_mu);
+            g_live.erase(std::remove(g_live.begin(), g_live.end(), this), g_live.end());
+        }
         settle_early();
         big_.release();
         platform::free_aligned(cpu_act_);
@@ -537,6 +555,42 @@ public:
     }
 
     void end_prompt() override { release_prompt(); }
+
+    // ---- the watchdog (core/progress.hpp), from its own thread while this one may be stuck: plain reads of mapped words
+    void diag(std::FILE* f) const {
+        const volatile uint32_t* w = h_words_;
+        if (w == nullptr) return;
+        const cudaError_t q = stream_ ? cudaStreamQuery(stream_) : cudaSuccess;
+        std::fprintf(f, "  hy4flash session: router ids word %u (host waits for %u), weighted-sum word %u (last issued %u, joiner %s); "
+                        "its stream %s; layers served %llu\n",
+                     w[0], seq_want_, w[1], word_issued_.load(std::memory_order_relaxed),
+                     jdone_.load(std::memory_order_acquire) ? "idle" : "busy",
+                     q == cudaSuccess ? "idle" : q == cudaErrorNotReady ? "busy" : cudaGetErrorString(q),
+                     (unsigned long long) basalt::core::progress().ticks.load());
+    }
+    // Every word up to the last one issued, in turn: a weighted sum's wait (wait_word_mark) wants its own word exactly, and
+    // the waits queued behind it the later ones. Then whether the stream drained.
+    void release(std::FILE* f) {
+        volatile uint32_t* w = h_words_;
+        if (w == nullptr) return;
+        const uint32_t last = word_issued_.load(std::memory_order_relaxed), had = w[1];
+        int n = 0;
+        for (uint32_t v = had + 1; (int32_t) (last - v) >= 0 && n < 4096; ++v, ++n) {
+            std::atomic_thread_fence(std::memory_order_release);
+            w[1] = v;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        bool drained = stream_ == nullptr;
+        for (int i = 0; i < 200 && !drained; ++i) {   // up to 2 s
+            const cudaError_t q = cudaStreamQuery(stream_);
+            drained = q != cudaErrorNotReady;
+            if (!drained) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (n > 0 || !drained)
+            std::fprintf(f, "  hy4flash session: released the weighted-sum words %u..%u; its stream %s\n", had + 1, last,
+                         drained ? "drained" : "still busy (the CUDA teardown is skipped)");
+        if (!drained) basalt::core::gpu_left_running().store(true);
+    }
 
     // The decode tier hits of the turn so far: the first kEarlyTokens tokens after a prompt and the rest, logged when the next
     // prompt starts (a turn that starts cold shows a low first share).
@@ -2539,7 +2593,10 @@ private:
             pd.reading = pd.reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
-        if (pd.cpu || pd.reading || on_peer) pd.word = ++join_seq_;   // the weighted sum waits for the host's rows
+        if (pd.cpu || pd.reading || on_peer) {   // the weighted sum waits for the host's rows
+            pd.word = ++join_seq_;
+            word_issued_.store(pd.word, std::memory_order_relaxed);
+        }
         // a promotion only queues its copies (they go out at a later pump), so it is decided now and the copies start behind
         // this layer's sum; experts still being read from the file are decided once they landed
         if (pd.cpu && !pd.reading) tier_->promote(tl, lk);
@@ -2721,6 +2778,7 @@ private:
         ring_join();
         ring_layer_[0] = ring_layer_[1] = -1;
         for (int l = 0; l < g_.n_layers; ++l) {
+            basalt::core::progress_tick();   // a layer issued: the watchdog tells a slow window from a stopped one
             ring_ahead(l, R);
             if (!engram(l, pos0, R, tokens, err)) return false;
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
@@ -2976,6 +3034,7 @@ private:
     int32_t *h_ids_ = nullptr, *d_ids_ = nullptr;
     uint32_t *h_words_ = nullptr, *d_words_ = nullptr;   // mapped: [0] the ids' sequence word, [1] the word a weighted sum waits for
     uint32_t seq_want_ = 0, join_seq_ = 0;
+    std::atomic<uint32_t> word_issued_{0};   // join_seq_ for the watchdog's thread
     // the L2 read-ahead during a MoE layer's wait (read_ahead): its stream, the event it starts behind, the mark it stops at
     // (device: the last word the weighted sum's wait saw) and each layer's ranges
     cudaStream_t ra_st_ = nullptr;
@@ -3033,6 +3092,16 @@ private:
     std::atomic<double> t_ring_ms_{0};
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
+
+void diag_sessions(std::FILE* f) {
+    std::lock_guard<std::mutex> g(g_live_mu);
+    for (const Session* s : g_live) s->diag(f);
+}
+void release_sessions(std::FILE* f) {
+    std::lock_guard<std::mutex> g(g_live_mu);
+    for (Session* s : g_live) s->release(f);
+    std::fflush(f);
+}
 
 }  // namespace
 

@@ -14,6 +14,9 @@ template <class B>
 Flow Request::decode_loop(B& b) {
     constexpr bool kSpec = B::kSpeculates;
     if (const Flow flow = b.decode_begin(); flow != Flow::proceed) return flow;
+    // the watchdog's stage from here on: the prompt is read (a stall report that still named the prompt read hid that
+    // the reply had been decoding for minutes)
+    basalt::core::progress_at("generating the reply, from position", fold_p0);
     p = fold_p0;
     x = (int32_t) ids[(size_t) fold_p0];
     b.seed_tiers();
