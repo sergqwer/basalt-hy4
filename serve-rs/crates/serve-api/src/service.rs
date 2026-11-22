@@ -102,6 +102,8 @@ pub struct Settings {
     pub answer_room: AnswerRoom,
     pub reasoning_effort: Option<Value>,
     pub thinking_loop_tokens: i64,
+    /// --stop-token-text: a stop id where no turn ends is written as its text
+    pub stop_token_text: bool,
     pub anthropic_think_unasked: bool,
     pub start_tries: Option<u32>,
     pub gpu_indices: Vec<u32>,
@@ -127,6 +129,7 @@ impl Default for Settings {
             answer_room: AnswerRoom::Auto,
             reasoning_effort: None,
             thinking_loop_tokens: 256,
+            stop_token_text: true,
             anthropic_think_unasked: true,
             start_tries: None,
             gpu_indices: vec![0],

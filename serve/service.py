@@ -14,7 +14,7 @@ from typing import Iterator
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
 from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
+from serve.frontend import EXAMPLE_TURN, ChatTemplate, Event, TextPlace, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
@@ -45,6 +45,12 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                       "conclusion without unnecessary elaboration.",
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
                          "elaboration."}
+# Stop token as text: a model asked to write its end-of-turn token from memory writes the token's special id, not its
+# text, and the reply ended there (Strata, Qwen at temperature 0: after "`", after an opening quote, after a space,
+# inside a tool call's argument, closing a turn it wrote out as an example: 16 of 16 such requests). Where no turn
+# ends (frontend.TextPlace.literal_context, a parser's in_value) the id is written as the token's text and the reply
+# goes on; at most this many times per reply. --no-stop-token-text turns it off.
+STOP_TEXT_MAX = 64
 # the Qwen dialect's closer of thinking; other dialects carry their own
 REASONING_CLOSE = "\n</think>\n\n"
 # Automatic answer room: thinking leaves the answer max(512, cap // 4) tokens, at most half the cap; a cap below
@@ -159,6 +165,29 @@ class Service:
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
+        self.stop_token_text = True                      # a stop id where no turn ends is its text (--stop-token-text)
+        start = tokenizer.encode(self.dialect.turn_start, parse_special=True) if self.dialect.turn_start else []
+        self.turn_start_id = start[0] if len(start) == 1 else None
+
+    def stop_as_text(self, t, parser, detok, place, room, literals, examples):
+        """Stop id `t` came where no turn ends -> (the ids of the token's text, where it was), to write in its place;
+        None: `t` ends the reply, as always. `room`: the output tokens left in place of `t` (the text and at least one
+        more token must fit); `examples`: turn starts the model wrote in its thinking or a code block, still open."""
+        if not self.stop_token_text or literals >= STOP_TEXT_MAX or detok.pending():
+            return None
+        if parser.state == "call":
+            why = "in a tool call's argument" if parser.in_value() else None
+        elif parser.buf.strip():
+            why = None                                  # a held tag: the place is not known yet
+        else:
+            why = place.with_held(parser.state, parser.buf).literal_context(parser.state, examples > 0,
+                                                                            space=self.dialect.trims_messages)
+        if why is None:
+            return None
+        ids = self.tok.encode(self.tok.decode([t]))     # without parse_special: the text's ordinary pieces
+        if not ids or len(ids) + 1 > room or any(i in self.stop_ids for i in ids):
+            return None
+        return ids, why
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1285,8 +1314,17 @@ class Service:
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
+        place = TextPlace()                             # stop token as text: where the reply's text has got to
+
         def cut(evs):
-            """The events with the answer text cut at a stop string."""
+            """The events with the answer text cut at a stop string (the place follows the model's text, before a
+            stop string holds any of it back)."""
+            for ev in evs:
+                if ev.kind in ("reasoning", "content"):
+                    place.feed(ev.kind, ev.text or "")
+            return cut_stops(evs)
+
+        def cut_stops(evs):
             if stops is None:
                 return evs
             out = []
@@ -1402,6 +1440,28 @@ class Service:
                     closed_early = False                # the thinking was already closed once
                     pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
+                    literals, relit = 0, False          # stop ids written as text (STOP_TEXT_MAX); this pass ended on one
+                    owed = None                         # the text's last piece, which the model writes itself
+                    examples = 0                        # turn starts written in the thinking or a code block, still open
+
+                    def written(ids):
+                        """Stop token as text: ids the server writes into the reply as output - the parser, the stream
+                        and the count see them as the model's."""
+                        nonlocal n, tail, thinking_n
+                        for x in ids:
+                            n += 1
+                            raw_ids.append(x)
+                            thinking_n += parser.state == "reasoning"
+                            piece = detok.push(x)
+                            tail = (tail + piece)[-2:]
+                            state0 = parser.state
+                            evs = cut(parser.feed(piece))
+                            if lp_channels is not None:       # written by the server: no entry of its own
+                                for item in lp_channels.token(None, state0, parser.state, evs):
+                                    yield "logprobs", item
+                            self._note(n, evs, st, rate)
+                            for ev in evs:
+                                yield "event", ev
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -1455,6 +1515,32 @@ class Service:
                                     continue
                                 n += 1
                                 if t in self.stop_ids:
+                                    if owed:            # it ends right after the text it began: the last piece first
+                                        n -= 1
+                                        yield from written(owed)
+                                        seg.extend(owed)
+                                        n += 1
+                                        owed = None
+                                    got = self.stop_as_text(t, parser, detok, place, max_new - n + 1, literals, examples)
+                                    if got is not None:
+                                        # the token's text in place of its id, and the reply goes on from there (the
+                                        # next pass's prompt ends with that text). Its last piece is left to the model,
+                                        # which can write the closing quote, backtick or comma with it
+                                        lit, why = got
+                                        lit, owed = (lit[:-1], lit[-1:]) if len(lit) > 1 else (lit, None)
+                                        literals += 1
+                                        examples -= why == EXAMPLE_TURN
+                                        print(f"[server] the model wrote {self.tok.decode([t])}'s id {why}: kept as its "
+                                              "text and the reply goes on (--no-stop-token-text turns this off)",
+                                              flush=True)
+                                        n -= 1
+                                        yield from written(lit)
+                                        seg.extend(lit)
+                                        if stops is not None and stops.hit is not None:
+                                            finish = "stop"     # the client's stop string was that text
+                                        else:
+                                            relit = True
+                                        break
                                     if (parser.state == "reasoning" and not closed_early and not parser.buf
                                             and not detok.pending()):
                                         n -= 1              # the end token is not part of the reply
@@ -1463,6 +1549,10 @@ class Service:
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
+                                owed = None             # the model wrote the text's last piece (or went on without it)
+                                if (t == self.turn_start_id and not parser.buf.strip()
+                                        and place.with_held(parser.state, parser.buf).example_place(parser.state)):
+                                    examples += 1       # a turn of the chat format written out as an example
                                 raw_ids.append(t)
                                 seg.append(t)
                                 if parser.state == "reasoning":
@@ -1582,7 +1672,7 @@ class Service:
                                 wrap = asked = True
                             else:                       # a split tag or character, or the thinking ended meanwhile
                                 resumed = True
-                        if not (wrap or opens or ended_thinking or resumed) or cancel.is_set():
+                        if not (wrap or opens or ended_thinking or resumed or relit) or cancel.is_set():
                             break
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
                         # one, so the engine keeps its prefix
@@ -1606,7 +1696,8 @@ class Service:
                                 print(f"[server] thinking repeated one token {run_n} times, ending it", flush=True)
                             else:
                                 print(f"[server] thinking budget reached ({thought} tokens), wrapping up", flush=True)
-                        elif resumed:
+                        elif resumed or relit:          # relit: the token's text is already written
+                            relit = False
                             extra = []
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts

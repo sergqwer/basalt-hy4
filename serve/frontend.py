@@ -693,6 +693,89 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     return _late_system_to_user(messages), tools, kwargs
 
 
+
+# ------------------------------------------------------------------------------------------------ stop token as text
+# A model asked to write its own end-of-turn token from memory writes the token's special id, not its text, and the
+# reply used to end right there (an agent explaining the token, a grep for it, a tool call holding it). Where no turn
+# can end, the server writes the token's text in place of the id and the reply goes on (Service.run,
+# --stop-token-text). These say where the reply's text leaves the next token.
+OPENING_QUOTES = "“‘«„「『"
+EXAMPLE_TURN = "in a turn of the chat format written out as an example"
+FENCES = ("```", "~~~")
+
+
+def opens_quote(line: str) -> bool:
+    """The current line ends with a quotation mark that opens a quote: a typographic opening mark always; `"` and `'`
+    at the start of the line or after a space, a bracket, `=`, `:` or `,` (a closing one, or an apostrophe, follows
+    a word)."""
+    if not line:
+        return False
+    c = line[-1]
+    if c in OPENING_QUOTES:
+        return True
+    if c in "\"'":
+        return len(line) == 1 or line[-2] in " \t([{=:,"
+    return False
+
+
+class TextPlace:
+    """The reply's text so far as the stop-token check sees it: the open code fence and the current line, of the
+    thinking and of the answer apart (fed with the events that go out)."""
+
+    def __init__(self):
+        self.fence = {"reasoning": "", "content": ""}
+        self.line = {"reasoning": "", "content": ""}
+
+    def feed(self, kind: str, text: str) -> None:
+        if kind not in self.line or not text:
+            return
+        parts = text.split("\n")
+        for k, part in enumerate(parts):
+            if k == len(parts) - 1:
+                self.line[kind] += part
+                break
+            line, self.line[kind] = self.line[kind] + part, ""
+            s = line.lstrip()
+            if self.fence[kind]:
+                if s.startswith(self.fence[kind] * 3):
+                    self.fence[kind] = ""
+            elif s[:3] in FENCES and (s[0] * 3) not in s[3:]:
+                self.fence[kind] = s[0]
+
+    def with_held(self, kind: str, held: str) -> "TextPlace":
+        """This place with the parser's held text (newlines it keeps back before a possible call) gone out too."""
+        out = TextPlace()
+        out.fence, out.line = dict(self.fence), dict(self.line)
+        out.feed(kind, held)
+        return out
+
+    def fenced(self, kind: str) -> bool:
+        """Inside a code block (a fence's own line is not inside it)."""
+        return bool(self.fence.get(kind)) and self.line[kind].lstrip()[:3] not in FENCES
+
+    def example_place(self, kind: str) -> bool:
+        """A turn of the chat format written here is an example of it: in the thinking, or in a code block."""
+        return kind == "reasoning" or (kind == "content" and self.fenced(kind))
+
+    def literal_context(self, kind: str, example: bool, space: bool = True) -> str | None:
+        """Where the text leaves the next token when no turn ends there, or None: right after the backtick that opens
+        inline code or after an opening quotation mark, right after a space or tab (the template trims every
+        message, so the model never saw an end of turn after whitespace), or (`example`: a turn start the model wrote
+        at an example place is open) inside that example."""
+        if kind not in self.line:
+            return None
+        line = self.line[kind]
+        if example and self.example_place(kind):
+            return EXAMPLE_TURN
+        if line.lstrip()[:3] not in FENCES and line.endswith("`") and line.count("`") % 2 == 1:
+            return "after the backtick that opens inline code"
+        if opens_quote(line):
+            return "after an opening quotation mark"
+        if space and line.endswith((" ", "\t")):
+            return "after a space"
+        return None
+
+
 # ------------------------------------------------------------------------------------------------ output parser
 @dataclass
 class ToolCall:
@@ -782,6 +865,34 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
         at = text.find(PARAM_END, at + 1)
     # An unclosed quoted function must not hide the enclosing call at end of output.
     return fallback if final else (-2 if fallback >= 0 else -1)
+
+
+def value_open(body: str) -> bool:
+    """A call body in the template's form (`<function=NAME>` and its parameters) ends inside a parameter's value: an
+    opened `<parameter=NAME>` whose `</parameter>` has not come (param_end's walk, as call_end's)."""
+    s = body.lstrip()
+    pos = len(body) - len(s)
+    if not s.startswith(FUNC_START):
+        return False
+    gt = body.find(">", pos)
+    if gt < 0:
+        return False
+    pos = gt + 1
+    while True:
+        rest = body[pos:]
+        s = rest.lstrip()
+        pos += len(rest) - len(s)
+        if not s.startswith(PARAM_START):
+            return False
+        gt = body.find(">", pos)
+        if gt < 0:
+            return False
+        end = param_end(body[gt + 1:], name=body[pos:gt].split("=", 1)[1].strip())
+        if end == -1:
+            return True
+        if end < 0:                                  # a closer whose follower has not come: the value is written
+            return False
+        pos = gt + 1 + end + len(PARAM_END)
 
 
 def call_end(text: str, final: bool = False) -> int:
@@ -1275,6 +1386,10 @@ class OutputParser:
                 out.append(Event("tool_call", call=call))
                 self._reset_scan()
                 self.state, self.lead = "content", True
+
+    def in_value(self) -> bool:
+        """The text so far ends inside a tool call's argument value (stop token as text)."""
+        return self.state == "call" and value_open(self.buf)
 
     def finish(self) -> list[Event]:
         """End of generation: flush what is held (an unterminated call becomes content; an announced one is left

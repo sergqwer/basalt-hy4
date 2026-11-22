@@ -1,0 +1,40 @@
+{
+ "name": "tool_arg_chat_stream",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "run",
+     "description": "Run a command",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   }
+  ],
+  "stream": true
+ },
+ "script": [
+  "Thinking.</think>\n\n<tool_call>\n<function=run>\n<parameter=command>\ngrep -rn '<|im_end|>",
+  ">' .\n</parameter>\n</function>\n</tool_call>"
+ ],
+ "stream": true
+}

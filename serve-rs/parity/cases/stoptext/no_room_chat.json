@@ -1,0 +1,22 @@
+{
+ "name": "no_room_chat",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "max_tokens": 15,
+  "chat_template_kwargs": {
+   "enable_thinking": false
+  }
+ },
+ "script": [
+  "Stop on `<|im_end|>",
+  ">` here."
+ ]
+}

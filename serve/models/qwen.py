@@ -10,6 +10,8 @@ from serve.util.text import IM_END
 class Qwen(Dialect):
     name = "qwen"
     stop_texts = (IM_END, "<|endoftext|>")
+    turn_start = "<|im_start|>"
+    trims_messages = True
     reasoning_close = "\n</think>\n\n"
     effort_turn = "<|im_start|>system\n{}<|im_end|>\n"
     video_pad = "<|video_pad|>"

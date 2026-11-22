@@ -207,6 +207,11 @@ opt("image_no_vision_resp", [], path="/v1/responses", body={"model": "basalt", "
 opt("image_no_vision_msg", [], path="/v1/messages", body={"model": "basalt", "max_tokens": 5, "messages": [{"role": "user", "content": [
     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}]}]})
 
+# the cut call ends on the stop id inside a value, where it would be written as its text (--stop-token-text; those
+# cases are cases/stoptext/*): this one keeps the cut
+for name in ("chat_cut_tool", "chat_cut_tool_stream"):
+    CASES[name]["server_args"] = ["--no-stop-token-text"]
+
 for name, c in CASES.items():
     (HERE / f"{name}.json").write_text(json.dumps(c, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 print(len(CASES), "cases")

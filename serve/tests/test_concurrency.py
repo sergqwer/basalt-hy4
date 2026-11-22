@@ -223,7 +223,7 @@ class SlotRows(Slots):
             t.join(20)
 
     def test_a_slot_reads_before_it_decodes(self):
-        self.start({"go": "word " * 5}, delay=0.2)
+        self.start({"go": "word " * 4 + "word"}, delay=0.2)   # no trailing space: a stop id there would be text
         ts, _ = self.run_all([lambda: self.chat("go slowly")])
         reading = self.busy_rows(1, "one slot busy")[0]
         self.assertEqual((reading["state"], reading["generated"]), ("prefill", 0))

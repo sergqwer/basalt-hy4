@@ -1,0 +1,21 @@
+{
+ "name": "client_stop_chat",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "stop": [
+   "<|im_end"
+  ]
+ },
+ "script": [
+  "Thinking.</think>\n\nStop on `<|im_end|>",
+  ">` here."
+ ]
+}

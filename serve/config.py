@@ -606,6 +606,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Claude Code's system prompt: local (the default) drops its Claude-only parts (identity, "
                          "Anthropic's security policy, model ids, pronoun rule) and shortens its memory how-to, the "
                          "same text every turn; as_sent passes it as sent")
+    ap.add_argument("--stop-token-text", action=argparse.BooleanOptionalAction, default=True,
+                    help="a stop token the model writes where no turn can end (inside a tool call's argument, after an "
+                         "opening backtick or quote, after a space, closing a turn written out as an example) is "
+                         "written as its text and the reply goes on (on by default); --no-stop-token-text ends the "
+                         "reply there")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded; load on first request; a sidecar image encoder is dropped, --vision dynamic stays")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")

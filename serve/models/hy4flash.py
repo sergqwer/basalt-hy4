@@ -198,6 +198,10 @@ class Hy4Parser:
             if not more:
                 return out
 
+    def in_value(self) -> bool:
+        """The text so far ends inside a tool call's argument value (stop token as text)."""
+        return self.state == "call" and self.sub == "value"
+
     def finish(self) -> list[Event]:
         """End of generation: flush what is held. A call cut off mid-way is closed without a "tool_call"; text
         that was only the start of a marker is text."""
@@ -236,6 +240,7 @@ class Hy4Flash(Dialect):
     def _tokens(self) -> None:
         t = self.tags
         self.stop_texts = (t.end,)
+        self.turn_start = t.start
         self.reasoning_close = t.think_end
         self.image_pad, self.image_start = t.image_pad, t.image_start
 

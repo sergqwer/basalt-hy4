@@ -1,0 +1,20 @@
+{
+ "name": "backtick_chat_stream",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "stream": true
+ },
+ "script": [
+  "Thinking.</think>\n\nStop on `<|im_end|>",
+  ">` here."
+ ],
+ "stream": true
+}

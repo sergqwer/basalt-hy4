@@ -1,0 +1,17 @@
+{
+ "name": "real_end_chat",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ "script": [
+  "Thinking.</think>\n\nThe answer is 4.<|im_end|>never seen"
+ ]
+}

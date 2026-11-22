@@ -788,6 +788,7 @@ class UnfinishedToolCall(unittest.TestCase):
         """(finish reason, the call's arguments) from OpenAI and Anthropic, whole and streamed, for the model's `script`."""
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        svc.stop_token_text = False         # CUT ends on the stop id inside a value, where it would be its text
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         tools = {"openai": [{"type": "function", "function": {"name": "write", "parameters": {
@@ -3113,6 +3114,8 @@ class ThinkingBudget(unittest.TestCase):
     def test_a_turn_ended_while_thinking_is_closed_and_answered(self):
         from serve.service import REASONING_CLOSE
         self.engine.end_in_thought = True
+        self.svc.stop_token_text = False    # THOUGHT ends with a space, where the stop id would be its text
+        self.addCleanup(setattr, self.svc, "stop_token_text", True)
         code, b = self.openai()
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]

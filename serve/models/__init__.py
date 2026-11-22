@@ -8,6 +8,8 @@ from __future__ import annotations
 class Dialect:
     name = ""
     stop_texts: tuple[str, ...] = ()        # texts that end the model's turn
+    turn_start = ""                         # the special token a turn of the chat format starts with
+    trims_messages = False                  # the template trims every message: no turn ever ends after whitespace
     reasoning_close = ""                    # closes thinking the model left open, or that reached its budget or repeats one token
     forced_call_ends_reply = False          # a named tool_choice ends the reply after its one call
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening

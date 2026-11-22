@@ -1581,6 +1581,143 @@ pub fn hold_back(text: &str, tags: &[&str]) -> usize {
     best
 }
 
+
+// ------------------------------------------------------------------------------------------------ stop token as text
+// serve/frontend.py TextPlace: where the reply's text leaves the next token (Service.run, --stop-token-text).
+const OPENING_QUOTES: &str = "\u{201c}\u{2018}\u{00ab}\u{201e}\u{300c}\u{300e}";
+pub const EXAMPLE_TURN: &str = "in a turn of the chat format written out as an example";
+
+fn opens_fence(s: &str) -> bool {
+    s.starts_with("```") || s.starts_with("~~~")
+}
+
+/// opens_quote: the current line ends with a quotation mark that opens a quote.
+pub fn opens_quote(line: &str) -> bool {
+    let mut it = line.chars().rev();
+    let Some(c) = it.next() else { return false };
+    if OPENING_QUOTES.contains(c) {
+        return true;
+    }
+    if c == '"' || c == '\'' {
+        return match it.next() {
+            None => true,
+            Some(p) => " \t([{=:,".contains(p),
+        };
+    }
+    false
+}
+
+/// TextPlace: the open code fence and the current line of the thinking (0) and of the answer (1).
+#[derive(Default, Clone)]
+pub struct TextPlace {
+    fence: [Option<char>; 2],
+    line: [String; 2],
+}
+
+fn place_slot(kind: &str) -> Option<usize> {
+    match kind {
+        "reasoning" => Some(0),
+        "content" => Some(1),
+        _ => None,
+    }
+}
+
+impl TextPlace {
+    pub fn feed(&mut self, kind: &str, text: &str) {
+        let Some(k) = place_slot(kind) else { return };
+        if text.is_empty() {
+            return;
+        }
+        let parts: Vec<&str> = text.split('\n').collect();
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                self.line[k].push_str(part);
+                break;
+            }
+            let line = std::mem::take(&mut self.line[k]) + part;
+            let s = py::lstrip(&line);
+            if let Some(f) = self.fence[k] {
+                if s.starts_with(&f.to_string().repeat(3)) {
+                    self.fence[k] = None;
+                }
+            } else if opens_fence(s) {
+                let c = s.chars().next().unwrap();
+                if !s[3..].contains(&c.to_string().repeat(3)) {
+                    self.fence[k] = Some(c);
+                }
+            }
+        }
+    }
+
+    /// with_held: this place with the parser's held text (newlines kept back before a possible call) gone out too.
+    pub fn with_held(&self, kind: &str, held: &str) -> TextPlace {
+        let mut p = self.clone();
+        p.feed(kind, held);
+        p
+    }
+
+    fn fenced(&self, k: usize) -> bool {
+        self.fence[k].is_some() && !opens_fence(py::lstrip(&self.line[k]))
+    }
+
+    pub fn example_place(&self, kind: &str) -> bool {
+        match place_slot(kind) {
+            Some(0) => true,
+            Some(k) => self.fenced(k),
+            None => false,
+        }
+    }
+
+    /// `space`: the template trims every message, so a turn never ends after whitespace (Qwen's; Hy4's does not)
+    pub fn literal_context(&self, kind: &str, example: bool, space: bool) -> Option<&'static str> {
+        let k = place_slot(kind)?;
+        let line = &self.line[k];
+        if example && self.example_place(kind) {
+            return Some(EXAMPLE_TURN);
+        }
+        if !opens_fence(py::lstrip(line)) && line.ends_with('`') && line.matches('`').count() % 2 == 1 {
+            return Some("after the backtick that opens inline code");
+        }
+        if opens_quote(line) {
+            return Some("after an opening quotation mark");
+        }
+        if space && (line.ends_with(' ') || line.ends_with('\t')) {
+            return Some("after a space");
+        }
+        None
+    }
+}
+
+/// value_open: a call body in the template's form ends inside a parameter's value (param_end's walk).
+pub fn value_open(body: &str) -> bool {
+    let s = py::lstrip(body);
+    let mut pos = body.len() - s.len();
+    if !s.starts_with(FUNC_START) {
+        return false;
+    }
+    let Some(gt) = body[pos..].find('>') else { return false };
+    pos += gt + 1;
+    loop {
+        let rest = &body[pos..];
+        let s = py::lstrip(rest);
+        pos += rest.len() - s.len();
+        if !s.starts_with(PARAM_START) {
+            return false;
+        }
+        let Some(gt) = body[pos..].find('>').map(|g| g + pos) else { return false };
+        let head = &body[pos..gt];
+        let name = head.split_once('=').map(|(_, n)| py::strip(n)).unwrap_or("");
+        let end = param_end(&body[gt + 1..], false, Some(name));
+        if end == -1 {
+            return true;
+        }
+        if end < 0 {
+            return false;
+        }
+        pos = gt + 1 + end as usize + PARAM_END.len();
+    }
+}
+
 /// What Service.run needs of a dialect's output parser.
 pub trait OutputParse: Send {
     fn feed(&mut self, delta: &str) -> AResult<Vec<Event>>;
@@ -1588,6 +1725,8 @@ pub trait OutputParse: Send {
     /// "reasoning", "content" or "call"
     fn state(&self) -> &'static str;
     fn buf(&self) -> &str;
+    /// the text so far ends inside a tool call's argument value (stop token as text)
+    fn in_value(&self) -> bool;
 }
 
 /// OutputParser: the Qwen form's incremental parser.
@@ -2016,5 +2155,9 @@ impl OutputParse for OutputParser {
 
     fn buf(&self) -> &str {
         &self.buf
+    }
+
+    fn in_value(&self) -> bool {
+        self.state == "call" && value_open(&self.buf)
     }
 }

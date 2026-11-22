@@ -1,0 +1,19 @@
+{
+ "name": "two_literals_chat",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ "script": [
+  "Thinking.</think>\n\nUse `<|im_end|>",
+  ">` or `<|im_end|>",
+  ">`."
+ ]
+}

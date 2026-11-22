@@ -1,0 +1,38 @@
+{
+ "name": "tool_arg_msg_stream",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 200,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "tools": [
+   {
+    "name": "run",
+    "description": "Run a command",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "command": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "command"
+     ]
+    }
+   }
+  ],
+  "stream": true
+ },
+ "script": [
+  "Thinking.</think>\n\n<tool_call>\n<function=run>\n<parameter=command>\ngrep -rn '<|im_end|>",
+  ">' .\n</parameter>\n</function>\n</tool_call>"
+ ],
+ "stream": true
+}

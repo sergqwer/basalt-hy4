@@ -206,6 +206,19 @@ impl Dialect {
         }
     }
 
+    /// the template trims every message: no turn ever ends after whitespace
+    pub fn trims_messages(&self) -> bool {
+        matches!(self.family, Family::Qwen)
+    }
+
+    /// the special token a turn of the chat format starts with
+    pub fn turn_start(&self) -> String {
+        match &self.family {
+            Family::Qwen => "<|im_start|>".into(),
+            Family::Hy4(t) => t.start.clone(),
+        }
+    }
+
     pub fn tags(&self) -> Option<&Hy4Tags> {
         match &self.family {
             Family::Hy4(t) => Some(t),
@@ -593,5 +606,9 @@ impl OutputParse for Hy4Parser {
 
     fn buf(&self) -> &str {
         &self.buf
+    }
+
+    fn in_value(&self) -> bool {
+        self.state == "call" && self.sub == "value"
     }
 }

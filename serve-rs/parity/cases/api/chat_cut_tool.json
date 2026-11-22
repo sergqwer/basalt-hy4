@@ -36,5 +36,8 @@
  },
  "script": [
   "x</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nKy"
+ ],
+ "server_args": [
+  "--no-stop-token-text"
  ]
 }

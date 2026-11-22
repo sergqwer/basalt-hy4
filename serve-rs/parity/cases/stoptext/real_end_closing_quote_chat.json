@@ -1,0 +1,17 @@
+{
+ "name": "real_end_closing_quote_chat",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ "script": [
+  "Thinking.</think>\n\nHe said \"yes\"<|im_end|>never seen"
+ ]
+}

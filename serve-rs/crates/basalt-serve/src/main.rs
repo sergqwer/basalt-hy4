@@ -457,6 +457,7 @@ fn build_model(a: &Args, cfg: &mut Map<String, Value>, files: Option<Vec<(String
     svc.set_answer_room(a.get("answer_room"));
     svc.set_reasoning_effort(a.st("reasoning_effort").map(Value::from));
     svc.set_thinking_loop_tokens(a.i("thinking_loop_tokens").unwrap_or(256));
+    svc.set_stop_token_text(a.b("stop_token_text"));
     svc.set_gpu_indices(serve_api::vision::gpus_in_play(cfg));
     if multi {
         svc.set_start_tries(Some(SWAP_START_TRIES));

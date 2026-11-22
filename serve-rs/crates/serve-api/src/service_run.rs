@@ -2,7 +2,7 @@
 
 use crate::api::logprobs::{self, Channels};
 use crate::error::ApiError;
-use crate::frontend::{Event, OutputParse};
+use crate::frontend::{Event, OutputParse, TextPlace, EXAMPLE_TURN};
 use crate::py::{self, Obj};
 use crate::service::*;
 use serde_json::{json, Value};
@@ -106,7 +106,16 @@ struct Run {
     par: bool,
     which: Which2,
     wait_key: u64,
+    /// stop token as text: where the reply's text has got to, stop ids written as text, the text's last piece the
+    /// model writes itself, turn starts written as examples (still open)
+    place: TextPlace,
+    literals: i64,
+    owed: Option<Vec<u32>>,
+    examples: i64,
 }
+
+/// serve/service.py STOP_TEXT_MAX: stop ids written as text per reply, at most
+const STOP_TEXT_MAX: i64 = 64;
 
 #[derive(Clone, Copy)]
 enum Which2 {
@@ -185,7 +194,65 @@ impl Run {
 
     fn feed(&mut self, piece: &str) -> Result<Vec<Event>, EngineErr> {
         let evs = self.parser.feed(piece).map_err(api_err)?;
+        for ev in &evs {
+            if ev.kind == "reasoning" || ev.kind == "content" {
+                self.place.feed(ev.kind, &ev.text);
+            }
+        }
         Ok(self.cut(evs))
+    }
+
+    /// stop_as_text: stop id `t` came where no turn ends -> (the ids of the token's text, where it was); None: it
+    /// ends the reply. `room`: the output tokens left in place of `t`.
+    fn stop_as_text(&self, t: u32, room: i64) -> Option<(Vec<u32>, &'static str)> {
+        let svc = &self.svc;
+        if !svc.cfg.read().unwrap().stop_token_text || self.literals >= STOP_TEXT_MAX || self.detok.pending() {
+            return None;
+        }
+        let state = self.parser.state();
+        let why = if state == "call" {
+            if self.parser.in_value() { Some("in a tool call's argument") } else { None }
+        } else if !py::strip(self.parser.buf()).is_empty() {
+            None
+        } else {
+            self.place.with_held(state, self.parser.buf()).literal_context(
+                state,
+                self.examples > 0,
+                svc.dialect.trims_messages(),
+            )
+        }?;
+        let text = svc.tok.decode(&[t]).unwrap_or_default();
+        let ids = svc.tok.encode(&text, false, &[]);
+        if ids.is_empty() || ids.len() as i64 + 1 > room || ids.iter().any(|i| svc.stop_ids.contains(i)) {
+            return None;
+        }
+        Some((ids, why))
+    }
+
+    /// written: ids the server writes into the reply as output (stop token as text); the parser, the stream and
+    /// the count see them as the model's.
+    fn written(&mut self, ids: &[u32], y: &Yielder<RunItem>) -> Result<(), Stop> {
+        for &x in ids {
+            self.n += 1;
+            self.raw_ids.push(x);
+            self.thinking_n += (self.parser.state() == "reasoning") as i64;
+            let piece = self.detok.push(x);
+            self.tail = py::tail(&format!("{}{}", self.tail, piece), 2).to_string();
+            let state0 = self.parser.state();
+            let evs = self.feed(&piece)?;
+            if self.lp.is_some() {
+                let state1 = self.parser.state();
+                let items = self.lp.as_mut().unwrap().token(None, state0, state1, &evs);
+                for item in items {
+                    y.yield_(RunItem::Logprobs(item))?;
+                }
+            }
+            self.svc.note(self.n, &evs, self.which_main(), self.wait_key_opt());
+            for ev in evs {
+                y.yield_(RunItem::Event(ev))?;
+            }
+        }
+        Ok(())
     }
 
     fn body(&mut self, y: &Yielder<RunItem>) -> Result<(), Stop> {
@@ -339,6 +406,8 @@ impl Run {
             y.yield_(RunItem::Event(ev))?;
         }
         let loop_tokens = svc.cfg.read().unwrap().thinking_loop_tokens;
+        let start_ids = svc.tok.encode(&svc.dialect.turn_start(), true, &[]);
+        let turn_start_id = if start_ids.len() == 1 { Some(start_ids[0]) } else { None };
         loop {
             let soft = if soft_stops { Some(Flag::new()) } else { None };
             if self.thinking && !self.budget_ready && !is_text {
@@ -364,6 +433,7 @@ impl Run {
             let mut seg: Vec<u32> = Vec::new();
             let (mut wrap, mut leaving, mut looped, mut asked, mut drained, mut resumed, mut ended_thinking, mut opens) =
                 (false, false, false, false, false, false, false, false);
+            let mut relit = false; // this pass ended on a stop id written as text
             let mut err: Option<Stop> = None;
             let mut last_out = mono();
             'pass: loop {
@@ -427,6 +497,48 @@ impl Run {
                 };
                 self.n += 1;
                 if svc.stop_ids.contains(&t.id) {
+                    if let Some(owed) = self.owed.take() {
+                        // it ends right after the text it began: the text's last piece first
+                        self.n -= 1;
+                        if let Err(e) = self.written(&owed, y) {
+                            leaving = matches!(e, Stop::Closed);
+                            err = Some(e);
+                            break 'pass;
+                        }
+                        seg.extend(&owed);
+                        self.n += 1;
+                    }
+                    if let Some((lit, why)) = self.stop_as_text(t.id, self.max_new - self.n + 1) {
+                        // the token's text in place of its id, and the reply goes on from there; its last piece is
+                        // left to the model, which can write the closing quote, backtick or comma with it
+                        let (lit, owed) = if lit.len() > 1 {
+                            (lit[..lit.len() - 1].to_vec(), Some(lit[lit.len() - 1..].to_vec()))
+                        } else {
+                            (lit, None)
+                        };
+                        self.owed = owed;
+                        self.literals += 1;
+                        if why == EXAMPLE_TURN {
+                            self.examples -= 1;
+                        }
+                        out(&format!(
+                            "[server] the model wrote {}'s id {why}: kept as its text and the reply goes on (--no-stop-token-text turns this off)",
+                            svc.tok.decode(&[t.id]).unwrap_or_default()
+                        ));
+                        self.n -= 1;
+                        if let Err(e) = self.written(&lit, y) {
+                            leaving = matches!(e, Stop::Closed);
+                            err = Some(e);
+                            break 'pass;
+                        }
+                        seg.extend(&lit);
+                        if self.stops.as_ref().map(|s| s.hit.is_some()).unwrap_or(false) {
+                            self.finish = "stop";
+                        } else {
+                            relit = true;
+                        }
+                        break 'pass;
+                    }
                     if self.parser.state() == "reasoning" && !closed_early && self.clean() {
                         self.n -= 1;
                         ended_thinking = true;
@@ -435,6 +547,13 @@ impl Run {
                     self.finish = "stop";
                     self.raw_ids.push(t.id);
                     break 'pass;
+                }
+                self.owed = None;
+                if Some(t.id) == turn_start_id && py::strip(self.parser.buf()).is_empty() {
+                    let state = self.parser.state();
+                    if self.place.with_held(state, self.parser.buf()).example_place(state) {
+                        self.examples += 1;
+                    }
                 }
                 self.raw_ids.push(t.id);
                 seg.push(t.id);
@@ -618,7 +737,7 @@ impl Run {
                     resumed = true;
                 }
             }
-            if !(wrap || opens || ended_thinking || resumed) || self.cancel.is_set() {
+            if !(wrap || opens || ended_thinking || resumed || relit) || self.cancel.is_set() {
                 break;
             }
             let extra: Vec<u32>;
@@ -646,7 +765,7 @@ impl Run {
                 } else {
                     out(&format!("[server] thinking budget reached ({thought} tokens), wrapping up"));
                 }
-            } else if resumed {
+            } else if resumed || relit {
                 extra = vec![];
             } else {
                 let trailing = self.tail.len() - self.tail.trim_end_matches('\n').len();
@@ -977,6 +1096,10 @@ impl Service {
                 par,
                 which: Which2::Main,
                 wait_key,
+                place: TextPlace::default(),
+                literals: 0,
+                owed: None,
+                examples: 0,
             };
             run.body(y)
         })

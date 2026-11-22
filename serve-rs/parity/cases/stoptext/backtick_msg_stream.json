@@ -1,0 +1,21 @@
+{
+ "name": "backtick_msg_stream",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 200,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "stream": true
+ },
+ "script": [
+  "Thinking.</think>\n\nStop on `<|im_end|>",
+  ">` here."
+ ],
+ "stream": true
+}
