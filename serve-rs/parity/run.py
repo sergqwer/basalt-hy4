@@ -70,7 +70,7 @@ if os.name == "nt":
 # Normalization rules: the ONLY differences forgiven. Each has a name (printed with --verbose when it fired).
 # --------------------------------------------------------------------------------------------------------------------
 ID_RE = re.compile(r"(?<![0-9A-Za-z])(chatcmpl|msg|resp|call|toolu|fc|rs|ctc|item)([-_])([0-9A-Za-z]{8,})")
-TIME_KEYS = {"created", "created_at"}                               # epoch seconds
+TIME_KEYS = {"created", "created_at", "time"}                       # epoch seconds (time: /status request history)
 TIME_SUFFIX = "_at"                                                  # last_request_at and the like: epoch seconds
 NUM_KEYS = {"tokens_per_s", "tokens_per_s_mean", "elapsed_s", "uptime_s", "started", "since", "at", "waited_s",
             "thread"}
@@ -90,11 +90,11 @@ NORMALIZERS = [
     ("content-length", "Content-Length value -> <len> when a body rule fired (body compared normalized; "
                        "presence compared; each side's value checked against its own body)"),
     ("id", "ids (chatcmpl|msg|resp|call|toolu|fc|rs|ctc|item)[-_]<8+ alnum> -> prefix<sep><idN>, consistent per side"),
-    ("time-key", "numbers under keys created/created_at and any key ending _at -> <time>"),
+    ("time-key", "numbers under keys created/created_at/time and any key ending _at -> <time>"),
     ("num-key", "numbers under keys ending _ms/_s/_per_s and " + "/".join(sorted(NUM_KEYS)) + " -> <num>"),
     ("subtree", "numbers anywhere under timings/telemetry/machine (any body) and hardware/hardware_static/history/gpu(s)/"
                 "cpu/ram/disk (/metrics) -> <num>; under /metrics history, lists -> <list>"),
-    ("log-time", "/api/logs line field t -> <time>"),
+    ("log-time", "/api/logs line field t -> <time>; its msg gets the console-timing rule"),
     ("console-timing", "server output only: N.Nt/s -> <num>t/s, ttft=N.Ns -> ttft=<num>s, pp=A/Bc N.Ns -> pp=A/Bc <num>s, "
                        "tg=N -> tg=<num> on a line that ends end=cancelled (how far a cancelled run got is timing)"),
     ("close-after-complete", "connection end eof/reset -> closed-after-complete once a response with a matching "
@@ -153,6 +153,8 @@ class Norm:
                 return "<list>"
             return [self.json(x, key, metrics, under, in_history, in_logs) for x in v]
         if isinstance(v, str):
+            if in_logs and key == "msg":
+                return self.line(v)                  # a console line, served back by /api/logs
             return self.text(v)
         if isinstance(v, bool) or v is None:
             return v

@@ -154,8 +154,10 @@ fn check_model(a: &mut Args, file_engine: &[String], cli_engine: &mut Vec<String
                known: Option<&BTreeSet<String>>) -> Map<String, Value> {
     let mut cfg = Map::new();
     let mut lines: Vec<String> = Vec::new();
-    if serve_api::vision::check_gpu(a.get("gpu")).is_err() {
-        fail(&format!("--gpu {}: expected numbers like 0 or 0,1, or auto", serve_api::vision::gpu_text(a.get("gpu"))));
+    let gpu_v = a.get("gpu").clone();
+    let gpu_o = if gpu_v.is_null() { None } else { Some(&gpu_v) };
+    if serve_api::vision::check_gpu(gpu_o).is_err() {
+        fail(&format!("--gpu {}: expected numbers like 0 or 0,1, or auto", serve_api::vision::gpu_text(gpu_o)));
     }
     let mock = a.b("mock_engine");
     if !mock && !(a.st("model").is_some() && a.st("engine_bin").is_some()) {
@@ -178,7 +180,19 @@ fn check_model(a: &mut Args, file_engine: &[String], cli_engine: &mut Vec<String
         let words: Vec<String> = file_engine.iter().chain(cli_engine.iter()).cloned().collect();
         let spec = serve_engine::modelfile::ModelSpec { path: model.clone(), alias: a.st("alias"), gpu: a.get("gpu").clone(),
                                                         vision, engine_words: words.clone() };
-        match serve_engine::modelfile::model_config(&spec, &engine_bin, &|arch| serve_api::models::dialect_for(arch).in_engine_vision()) {
+        let arch_err: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+        let in_engine = |arch: Option<&str>| match serve_api::models::dialect_for(arch) {
+            Ok(d) => d.in_engine_vision,
+            Err(e) => {
+                arch_err.borrow_mut().get_or_insert(e.message());
+                false
+            }
+        };
+        let got = serve_engine::modelfile::model_config(&spec, &engine_bin, &in_engine);
+        if let Some(e) = arch_err.borrow().clone() {
+            fail(&format!("{model}: {e}"));
+        }
+        match got {
             Ok(mc) => {
                 for (k, v) in mc.cfg {
                     cfg.insert(k, v);
@@ -188,7 +202,7 @@ fn check_model(a: &mut Args, file_engine: &[String], cli_engine: &mut Vec<String
             Err(e) => fail(&format!("{model}: {e}")),
         }
         if !mock {
-            let plan = match serve_api::vision::model_plan(&engine_bin, &model, spec.gpu.clone(), &words) {
+            let plan = match serve_api::vision::model_plan(&engine_bin, &model, if spec.gpu.is_null() { None } else { Some(&spec.gpu) }, &words) {
                 Ok(p) => p,
                 Err(e) => fail(&format!("{model}: {e}")),
             };
@@ -323,7 +337,9 @@ fn build_model(a: &Args, cfg: &mut Map<String, Value>, logs: &Arc<LogBuffer>, mu
         fail(&format!("tokenizer missing: {}/vocab.json", a.s("tokenizer").unwrap_or_default()));
     }
     let tok: Arc<dyn Tokenizer> = if file_of(&files, "vocab.json").is_some() {
-        match serve_text::BpeTokenizer::from_files(&files) {
+        let need = |n: &str| file_of(&files, n).map(|v| v.as_slice()).unwrap_or(b"");
+        match serve_text::BpeTokenizer::from_files(need("vocab.json"), need("merges.txt"), need("token_type.json"),
+                                                   file_of(&files, "tokenizer.json").map(|v| v.as_slice())) {
             Ok(t) => Arc::new(t),
             Err(e) => fail(&e),
         }
@@ -354,7 +370,7 @@ fn build_model(a: &Args, cfg: &mut Map<String, Value>, logs: &Arc<LogBuffer>, mu
         let mut shown: Vec<String> = cfg.get("items").and_then(|v| v.as_array()).map(|v| v.iter().map(serve_text::pyjson::py_str).collect::<Vec<_>>()).unwrap_or_default()
             .into_iter().filter(|x| !shared.contains(x)).collect();
         shown.extend(config::sampling_items(&sampling_defaults));
-        if let Some(vi) = serve_api::vision::vision_item(cfg.get("vision"), cfg) {
+        if let Some(vi) = serve_api::vision::vision_item(cfg.get("vision").and_then(|v| v.as_object()), cfg) {
             shown.push(vi);
         }
         let name = cfg.get("model_name").map(serve_text::pyjson::py_str).unwrap_or_default();
@@ -367,11 +383,20 @@ fn build_model(a: &Args, cfg: &mut Map<String, Value>, logs: &Arc<LogBuffer>, mu
         }
         if let Some(v) = cfg.get("vision").filter(|v| serve_text::pyjson::truthy(v)).cloned() {
             let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or("");
-            vision = Some(if mode == "dynamic" {
-                serve_api::vision::VisionAny::engine(&v)
+            vision = Some(Arc::new(if mode == "dynamic" {
+                serve_api::vision::Vision::engine_vision()
             } else {
-                serve_api::vision::VisionAny::sidecar(&v, cfg.get("log").and_then(|l| l.as_str()), serve_api::vision::vision_env(&env, mode), !multi)
-            });
+                let vc = serve_api::vision::VisionCfg {
+                    vision_bin: v.get("vision_bin").map(serve_text::pyjson::py_str).unwrap_or_default(),
+                    model: v.get("model").map(serve_text::pyjson::py_str).unwrap_or_default(),
+                    gpu: v.get("gpu").map(serve_text::pyjson::truthy).unwrap_or(false),
+                };
+                let log = cfg.get("log").and_then(|l| l.as_str()).map(PathBuf::from);
+                match serve_api::vision::Vision::sidecar(&vc, log, Some(serve_api::vision::vision_env(&env, mode)), !multi) {
+                    Ok(v) => v,
+                    Err(e) => fail(&e),
+                }
+            }));
         }
         if a.b("lazy") && !multi {
             stdout::out(&tagged("model", "unloaded, the first request loads it"));
@@ -393,7 +418,7 @@ fn build_model(a: &Args, cfg: &mut Map<String, Value>, logs: &Arc<LogBuffer>, mu
         let log = cfg.get("log").and_then(|l| l.as_str()).map(|s| s.to_string());
         let mut all_args = eargs.clone();
         all_args.extend(gwords);
-        let pe = match ProcessEngine::new(&bin, all_args, None, log.clone(), env, true) {
+        let pe = match ProcessEngine::new(&bin, all_args, None, log.clone(), Some(env), true) {
             Ok(e) => Arc::new(e),
             Err(e) => fail(&e.message()),
         };
@@ -422,28 +447,34 @@ fn build_model(a: &Args, cfg: &mut Map<String, Value>, logs: &Arc<LogBuffer>, mu
         sampling_defaults = a.sampling_launch.clone();
     }
     let arch = cfg.get("arch").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let dialect = serve_api::models::dialect_for(arch.as_deref());
+    let mut dialect = match serve_api::models::dialect_for(arch.as_deref()) {
+        Ok(d) => d,
+        Err(e) => fail(&e.message()),
+    };
     let template = match file_of(&files, "chat_template.jinja") {
         Some(b) => String::from_utf8_lossy(b).into_owned(),
-        None => std::fs::read_to_string(root.join("serve").join("chat_template.jinja")).unwrap_or_default(),
+        // read_text(): universal newlines
+        None => std::fs::read_to_string(root.join("serve").join("chat_template.jinja")).unwrap_or_default()
+            .replace("\r\n", "\n").replace('\r', "\n"),
     };
     let model_name = cfg.get("model_name").map(serve_text::pyjson::py_str).unwrap_or_else(|| "basalt".into());
-    let svc = Service::new(engine.clone(), tok, dialect.template(&template), &model_name, vision, sampling_defaults,
-                           a.b("fit_max_tokens"), a.b("grammar"), mock || has_grammar, dialect,
-                           a.i("video_max_tokens").unwrap_or(config::VIDEO_MAX_TOKENS));
-    svc.set_logs(logs.clone());
+    let template = match dialect.template(&template) {
+        Ok(t) => t,
+        Err(e) => fail(&e.message()),
+    };
+    let svc = Arc::new(Service::new(engine.clone(), tok, template, &model_name, vision, Some(sampling_defaults),
+                                    a.b("fit_max_tokens"), a.b("grammar"), mock || has_grammar, Some(dialect),
+                                    Some(a.i("video_max_tokens").unwrap_or(config::VIDEO_MAX_TOKENS))));
     svc.set_idle_unload_s(a.f("idle_unload").unwrap_or(0.0));
     svc.set_idle_sleep_s(a.f("idle_sleep").unwrap_or(0.0));
     svc.set_min_free_vram_mib(a.i("min_free_vram_mib").unwrap_or(0));
     svc.set_reasoning_budget_tokens(a.i("reasoning_budget_tokens").unwrap_or(0));
-    svc.set_answer_room(a.get("answer_room").clone());
-    svc.set_reasoning_effort(a.s("reasoning_effort"));
+    svc.set_answer_room(a.get("answer_room"));
+    svc.set_reasoning_effort(a.st("reasoning_effort").map(Value::from));
     svc.set_thinking_loop_tokens(a.i("thinking_loop_tokens").unwrap_or(256));
-    let gargs = if mock { vec![] } else { serve_api::vision::engine_args(cfg) };
-    let gi = serve_api::vision::gpus_in_play(cfg, &gargs);
-    svc.set_gpu_indices(gi);
+    svc.set_gpu_indices(serve_api::vision::gpus_in_play(cfg));
     if multi {
-        svc.set_start_tries(SWAP_START_TRIES);
+        svc.set_start_tries(Some(SWAP_START_TRIES));
     }
     svc
 }
@@ -505,7 +536,7 @@ fn main() {
     };
     let a0 = settings[0].0.clone();
     let multi = settings.len() > 1;
-    serve_api::service::set_debug(a0.b("debug"));
+    serve_api::service::DEBUG.store(a0.b("debug"), std::sync::atomic::Ordering::SeqCst);
     engine_process::REQUEST_LINES.store(a0.b("request_lines"), std::sync::atomic::Ordering::SeqCst);
     let logs = Arc::new(LogBuffer::new());
     stdout::install(logs.clone());
@@ -565,7 +596,8 @@ fn main() {
     check_models(&services);
     let router = Router::new(services.clone());
     let svc = router.front.clone();
-    if !image_sources.url_hosts_text().is_empty() || !image_sources.dirs.is_empty() || image_sources.remote_only {
+    svc.set_image_sources(image_sources.clone());
+    if !image_sources.url_hosts.is_empty() || !image_sources.dirs.is_empty() || image_sources.remote_only {
         stdout::out(&tagged("images", &format!("from other machines{}: url-hosts={} dirs={}",
             if image_sources.remote_only { " and this one" } else { "" },
             if hosts.is_empty() { "-".to_string() } else { hosts.join(",") },
@@ -648,14 +680,17 @@ fn main() {
     let here = if ["0.0.0.0", "", "::"].contains(&host.as_str()) { "127.0.0.1".to_string() } else { host.clone() };
     for (s, (m, ..)) in services.iter().zip(settings.iter()) {
         s.start_idle_unload();
-        s.start_idle_sleep(!shared_sleep, if multi { Some(s.model.clone()) } else { None });
-        s.set_on_loaded(Some(announcer(s.clone(), m.clone(), multi, a.b("mock_engine"))));
+        s.start_idle_sleep(!shared_sleep, if multi { Some(s.model.as_str()) } else { None });
+        s.set_on_loaded(announcer(s.clone(), m.clone(), multi, a.b("mock_engine")));
     }
     stdout::out(&tagged("ready", &format!("http://{here}:{port}/v1  openai+anthropic  stats http://{here}:{port}/{}",
                                           if api_key.is_empty() { "" } else { " api-key=on" })));
     if a.b("mock_engine") {
         for s in &services {
-            s.on_loaded();
+            let hook = s.on_loaded.read().unwrap().clone();
+            if let Some(f) = hook {
+                f();
+            }
         }
     }
     if !LOOPBACK_NAMES.contains(&host.as_str()) {
@@ -682,16 +717,12 @@ fn main() {
         if a.b("mock_engine") || a.b("lazy") {
             open_browser(&url);
         } else {
-            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let prev = svc.take_on_loaded();
-            svc.set_on_loaded(Some(Box::new(move || {
-                if let Some(p) = &prev {
-                    p();
-                }
+            let done = std::sync::atomic::AtomicBool::new(false);
+            svc.set_on_loaded(Box::new(move || {
                 if !done.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     open_browser(&url);
                 }
-            })));
+            }));
         }
     }
     signals::install();
@@ -729,7 +760,9 @@ fn main() {
     router.stop_telemetry();
     for s in &services {
         let _ = s.engine.close();
-        s.close_vision();
+        if let Some(v) = &s.vision {
+            v.close();
+        }
     }
     stdout::out("[server] stopped");
     std::process::exit(rc);
@@ -758,12 +791,12 @@ fn announcer(s: Arc<Service>, m: Args, multi: bool, mock: bool) -> Box<dyn Fn() 
         }
         stdout::out(&tagged("weights", &format!("loaded{}, ctx={} images={}",
             if multi { format!(" {}", s.model) } else { String::new() }, engine.max_context(), if s.has_vision() { "on" } else { "off" })));
-        if let Some(video) = s.vision_video_state() {
+        if let Some(video) = s.vision.as_ref().and_then(|v| v.video_state()) {
             let mut said = said_video.lock().unwrap();
             if !*said {
                 *said = true;
                 let (state, why) = video.split_once(' ').unwrap_or((&video, ""));
-                let text = if s.dialect_video_pad() { format!("{state}, {why}") } else { "off, this model reads no video".into() };
+                let text = if !s.dialect.video_pad.is_empty() { format!("{state}, {why}") } else { "off, this model reads no video".into() };
                 stdout::out(&tagged("video", &text));
             }
         }

@@ -917,6 +917,7 @@ impl<'a> Ctx<'a> {
             return io(self.unknown_model(path, requested.as_ref().filter(|v| !v.is_null())));
         };
         self.svc = Some(svc.clone());
+        svc.set_request_path(Some(path));
         let access = self.image_access();
         let _docs = serve_api::api::documents::sources(access);
         match path {
@@ -959,9 +960,9 @@ impl<'a> Ctx<'a> {
         let mut chunks = serve_api::prompt::primed(chunks, &ids)?;
         if !stream {
             let out = openai::openai_collect(&mut chunks)?;
-            return self.ok(self.json(200, &out));
+            return ok(self.json(200, &out));
         }
-        self.ok(self.sse())?;
+        ok(self.sse())?;
         let _ = path;
         let mut write_err = false;
         loop {
@@ -1004,9 +1005,6 @@ impl<'a> Ctx<'a> {
         Err(Fail::Done)
     }
 
-    fn ok(&self, r: std::io::Result<()>) -> R<()> {
-        r.map_err(|e| Fail::Api(ApiError::Internal(e.to_string())))
-    }
 
     fn anthropic(&mut self, svc: &Svc, req: &mut Obj, _path: &str) -> R<()> {
         use serve_api::api::{anthropic, logprobs, structured};
@@ -1041,9 +1039,9 @@ impl<'a> Ctx<'a> {
         let mut events = serve_api::prompt::primed(events, &ids)?;
         if !stream {
             let out = anthropic::anthropic_collect(&mut events)?;
-            return self.ok(self.json(200, &out));
+            return ok(self.json(200, &out));
         }
-        self.ok(self.sse())?;
+        ok(self.sse())?;
         loop {
             let item = match events.next() {
                 None => break,
@@ -1077,12 +1075,12 @@ impl<'a> Ctx<'a> {
         let prepared = self.responses_prepare(svc, req);
         let (ids, thinking, tools, max_new, asm, req, force) = match prepared {
             Ok(p) => p,
-            Err(Fail::Api(ApiError::Responses(e))) => return self.ok(self.json(e.status, &e.body())).and(Err(Fail::Done)),
+            Err(Fail::Api(ApiError::Responses(e))) => return ok(self.json(e.status, &e.body())).and(Err(Fail::Done)),
             Err(Fail::Api(ApiError::Engine(EngineErr::ModelBusy(m)))) => {
-                return self.ok(self.json(409, &rs::error_body(&m, "server_error", None, Some("model_busy")))).and(Err(Fail::Done));
+                return ok(self.json(409, &rs::error_body(&m, "server_error", None, Some("model_busy")))).and(Err(Fail::Done));
             }
             Err(Fail::Api(ApiError::Engine(e))) if matches!(e, EngineErr::GpuBusy(_) | EngineErr::Starting(_) | EngineErr::Stuck(_)) || e.is_died() => {
-                return self.ok(self.json(503, &rs::error_body(&e.message(), "server_error", None, Some("server_error")))).and(Err(Fail::Done));
+                return ok(self.json(503, &rs::error_body(&e.message(), "server_error", None, Some("server_error")))).and(Err(Fail::Done));
             }
             Err(e) => return Err(e),
         };
@@ -1096,26 +1094,26 @@ impl<'a> Ctx<'a> {
                 let m = e.message();
                 let code = if m.contains("context") { Some("context_length_exceeded") } else { None };
                 let err = ResponsesError::new(m, Some("input"), code);
-                return self.ok(self.json(err.status, &err.body())).and(Err(Fail::Done));
+                return ok(self.json(err.status, &err.body())).and(Err(Fail::Done));
             }
             Err(e) => return Err(e.into()),
         };
         let stream = req.get("stream").map(pyjson::truthy).unwrap_or(false);
         if !stream {
             return match rs::collect(&mut items) {
-                Ok(result) => self.ok(self.json(200, &result)).and(Err(Fail::Done)),
+                Ok(result) => ok(self.json(200, &result)).and(Err(Fail::Done)),
                 Err(ApiError::Engine(e)) if e.is_died() => {
                     let m = self.died(&e);
-                    self.ok(self.json(503, &rs::error_body(&m, "server_error", None, Some("server_error")))).and(Err(Fail::Done))
+                    ok(self.json(503, &rs::error_body(&m, "server_error", None, Some("server_error")))).and(Err(Fail::Done))
                 }
                 Err(ApiError::Engine(EngineErr::Error(m))) => {
-                    self.ok(self.json(500, &rs::error_body(&m, "server_error", None, Some("server_error")))).and(Err(Fail::Done))
+                    ok(self.json(500, &rs::error_body(&m, "server_error", None, Some("server_error")))).and(Err(Fail::Done))
                 }
                 Err(e) if e.is_value() => {
                     let m = e.message();
                     let code = if m.contains("context") { Some("context_length_exceeded") } else { None };
                     let err = ResponsesError::new(m, Some("input"), code);
-                    self.ok(self.json(err.status, &err.body())).and(Err(Fail::Done))
+                    ok(self.json(err.status, &err.body())).and(Err(Fail::Done))
                 }
                 Err(e) => Err(e.into()),
             };
@@ -1182,7 +1180,7 @@ impl<'a> Ctx<'a> {
         let (tools, force) = serve_api::frontend::forced_call(req.get("tool_choice"), tools, &|n| svc.forced_opening(n))
             .map_err(|e| ApiError::Responses(ResponsesError::new(e.message(), Some("tool_choice"), None)))?;
         let kw = rs::template_kwargs(&req)?;
-        let tf = rs::text_format(&req);
+        let tf = rs::text_format(&req)?;
         serve_api::api::structured::check_format(tf.as_ref())
             .map_err(|e| ApiError::Responses(ResponsesError::new(e.message().replace("response_format", "text.format"), Some("text.format"), None)))?;
         if let Err(e) = svc.require_grammar(tf.as_ref()) {
@@ -1245,7 +1243,7 @@ impl<'a> Ctx<'a> {
         let Some(Value::String(content)) = content else { return Err(Fail::Api(ApiError::value("content: a string"))) };
         let Value::Bool(parse) = parse else { return Err(Fail::Api(ApiError::value("parse_special: true or false"))) };
         let ids = svc.tok.encode(content, parse, &[]);
-        self.ok(self.json(200, &json!({"tokens": ids}))).and(Err(Fail::Done))
+        ok(self.json(200, &json!({"tokens": ids}))).and(Err(Fail::Done))
     }
 
     fn detokenize(&mut self, svc: &Svc, req: &Obj) -> R<()> {
@@ -1265,7 +1263,7 @@ impl<'a> Ctx<'a> {
             }
         }
         let text = svc.tok.decode(&out).map_err(|_| Fail::Api(ApiError::value("tokens: an id outside the model's vocabulary")))?;
-        self.ok(self.json(200, &json!({"content": text}))).and(Err(Fail::Done))
+        ok(self.json(200, &json!({"content": text}))).and(Err(Fail::Done))
     }
 
     fn count_tokens(&mut self, svc: &Svc, req: &Obj) -> R<()> {
@@ -1273,8 +1271,12 @@ impl<'a> Ctx<'a> {
         let (tools, _) = serve_api::frontend::forced_call(req.get("tool_choice"), tools, &|n| svc.forced_opening(n))?;
         serve_text::text::stop_strings(req).map_err(ApiError::value)?;
         let n = svc.encode_prompt(&messages, tools.as_ref(), &kw)?.len();
-        self.ok(self.json(200, &json!({"input_tokens": n}))).and(Err(Fail::Done))
+        ok(self.json(200, &json!({"input_tokens": n}))).and(Err(Fail::Done))
     }
+}
+
+fn ok(r: std::io::Result<()>) -> R<()> {
+    r.map_err(|e| Fail::Api(ApiError::Internal(e.to_string())))
 }
 
 fn internal(m: String) -> std::io::Error {
