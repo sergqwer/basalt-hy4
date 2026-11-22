@@ -1,0 +1,15 @@
+{
+ "name": "post_messages_unknown_model",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "nope",
+  "max_tokens": 10,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ }
+}

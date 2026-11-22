@@ -1,0 +1,5 @@
+{
+ "name": "api_logs_bad_numbers",
+ "method": "GET",
+ "path": "/api/logs?after=x&limit=-3"
+}

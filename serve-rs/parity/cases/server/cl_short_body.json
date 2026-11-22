@@ -1,0 +1,11 @@
+{
+ "name": "cl_short_body",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "{}",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": "10"
+ },
+ "half_close": true
+}

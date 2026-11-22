@@ -1,0 +1,5 @@
+{
+ "name": "get_index_query",
+ "method": "GET",
+ "path": "/?x=1"
+}

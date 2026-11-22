@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+fixtures/tiny.basalt
+fixtures/*.tmp
+fake_engine/target/

@@ -1,0 +1,14 @@
+[package]
+name = "fake_engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# not a member of the serve-rs workspace: builds on its own
+[workspace]
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = 1

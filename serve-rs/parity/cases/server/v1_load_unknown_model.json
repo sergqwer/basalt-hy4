@@ -1,0 +1,8 @@
+{
+ "name": "v1_load_unknown_model",
+ "method": "POST",
+ "path": "/v1/load",
+ "body": {
+  "model": "nope"
+ }
+}

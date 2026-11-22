@@ -1,0 +1,14 @@
+{
+ "name": "cors_preflight",
+ "method": "OPTIONS",
+ "path": "/v1/chat/completions",
+ "server_args": [
+  "--cors-origin",
+  "https://chat.example.com"
+ ],
+ "headers": {
+  "Origin": "https://chat.example.com",
+  "Access-Control-Request-Method": "POST",
+  "Access-Control-Request-Headers": "authorization, x-custom"
+ }
+}

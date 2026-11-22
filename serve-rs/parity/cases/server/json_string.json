@@ -1,0 +1,9 @@
+{
+ "name": "json_string",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "\"hi\"",
+ "headers": {
+  "Content-Type": "application/json"
+ }
+}

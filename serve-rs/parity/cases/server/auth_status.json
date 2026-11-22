@@ -1,0 +1,9 @@
+{
+ "name": "auth_status",
+ "method": "GET",
+ "path": "/status",
+ "server_args": [
+  "--api-key",
+  "k"
+ ]
+}

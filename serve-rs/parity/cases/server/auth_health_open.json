@@ -1,0 +1,9 @@
+{
+ "name": "auth_health_open",
+ "method": "GET",
+ "path": "/health",
+ "server_args": [
+  "--api-key",
+  "k"
+ ]
+}

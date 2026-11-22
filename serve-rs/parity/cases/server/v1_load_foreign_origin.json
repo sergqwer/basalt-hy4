@@ -1,0 +1,9 @@
+{
+ "name": "v1_load_foreign_origin",
+ "method": "POST",
+ "path": "/v1/load",
+ "body": {},
+ "headers": {
+  "Origin": "https://evil.com"
+ }
+}

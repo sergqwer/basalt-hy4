@@ -1,0 +1,7 @@
+{
+ "name": "start_payload_zero",
+ "server_args": [
+  "--max-payload-mib",
+  "0"
+ ]
+}

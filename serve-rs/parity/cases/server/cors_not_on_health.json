@@ -1,0 +1,12 @@
+{
+ "name": "cors_not_on_health",
+ "method": "GET",
+ "path": "/health",
+ "server_args": [
+  "--cors-origin",
+  "https://chat.example.com"
+ ],
+ "headers": {
+  "Origin": "https://chat.example.com"
+ }
+}

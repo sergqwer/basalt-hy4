@@ -1,0 +1,18 @@
+{
+ "name": "chat_stream_disconnect",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "stream": true
+ },
+ "stream": true,
+ "disconnect_after_bytes": 400,
+ "settle_s": 1.5
+}

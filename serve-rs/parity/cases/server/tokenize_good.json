@@ -1,0 +1,8 @@
+{
+ "name": "tokenize_good",
+ "method": "POST",
+ "path": "/tokenize",
+ "body": {
+  "content": "hello <|im_end|>"
+ }
+}

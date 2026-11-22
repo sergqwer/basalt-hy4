@@ -1,0 +1,8 @@
+{
+ "name": "host_evil",
+ "method": "GET",
+ "path": "/health",
+ "headers": {
+  "Host": "evil.com"
+ }
+}

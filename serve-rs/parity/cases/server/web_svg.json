@@ -1,0 +1,5 @@
+{
+ "name": "web_svg",
+ "method": "GET",
+ "path": "/web/favicon.svg"
+}

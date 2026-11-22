@@ -1,0 +1,21 @@
+{
+ "name": "cors_post_listed_origin",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "server_args": [
+  "--cors-origin",
+  "https://chat.example.com"
+ ],
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ "headers": {
+  "Origin": "https://chat.example.com"
+ }
+}

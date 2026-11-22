@@ -1,0 +1,9 @@
+{
+ "name": "answer_now_session_header",
+ "method": "POST",
+ "path": "/v1/answer_now",
+ "body": {},
+ "headers": {
+  "x-session-id": "s1"
+ }
+}

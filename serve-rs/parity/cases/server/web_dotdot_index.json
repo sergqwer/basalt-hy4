@@ -1,0 +1,5 @@
+{
+ "name": "web_dotdot_index",
+ "method": "GET",
+ "path": "/web/../serve/web/app.js"
+}

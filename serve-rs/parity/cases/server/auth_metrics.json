@@ -1,0 +1,12 @@
+{
+ "name": "auth_metrics",
+ "method": "GET",
+ "path": "/metrics",
+ "server_args": [
+  "--api-key",
+  "k"
+ ],
+ "headers": {
+  "x-api-key": "wrong"
+ }
+}

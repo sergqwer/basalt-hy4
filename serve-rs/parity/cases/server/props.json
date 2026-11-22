@@ -1,0 +1,5 @@
+{
+ "name": "props",
+ "method": "GET",
+ "path": "/props"
+}

@@ -1,0 +1,7 @@
+{
+ "name": "v1_unload_no_ct",
+ "method": "POST",
+ "path": "/v1/unload",
+ "raw_body": "{}",
+ "headers": {}
+}

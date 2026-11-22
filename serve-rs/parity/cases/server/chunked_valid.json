@@ -1,0 +1,11 @@
+{
+ "name": "chunked_valid",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "44\r\n{\"model\": \"basalt\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}\r\n0\r\n\r\n",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": null,
+  "Transfer-Encoding": "chunked"
+ }
+}

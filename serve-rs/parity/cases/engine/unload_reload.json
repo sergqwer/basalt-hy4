@@ -1,0 +1,5 @@
+{"name": "unload_reload", "mock": false, "requests": [
+ {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "tiny-fake", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}},
+ {"method": "POST", "path": "/v1/unload", "body": {}},
+ {"method": "GET", "path": "/health"},
+ {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "tiny-fake", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}}]}

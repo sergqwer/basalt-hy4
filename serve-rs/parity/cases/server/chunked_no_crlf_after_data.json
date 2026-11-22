@@ -1,0 +1,11 @@
+{
+ "name": "chunked_no_crlf_after_data",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "2\r\n{}XX0\r\n\r\n",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": null,
+  "Transfer-Encoding": "chunked"
+ }
+}

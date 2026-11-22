@@ -1,0 +1,12 @@
+{
+ "name": "auth_key_file",
+ "method": "GET",
+ "path": "/v1/models",
+ "server_args": [
+  "--api-key-file",
+  "{fixtures}/api_key.txt"
+ ],
+ "headers": {
+  "Authorization": "Bearer filekey"
+ }
+}

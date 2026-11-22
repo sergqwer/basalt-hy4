@@ -1,0 +1,5 @@
+{
+ "name": "v1_unknown_get",
+ "method": "GET",
+ "path": "/v1/chat/completions"
+}

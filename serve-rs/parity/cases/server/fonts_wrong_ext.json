@@ -1,0 +1,5 @@
+{
+ "name": "fonts_wrong_ext",
+ "method": "GET",
+ "path": "/fonts/OFL.txt"
+}

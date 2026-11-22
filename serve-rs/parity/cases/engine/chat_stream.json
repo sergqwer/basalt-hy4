@@ -1,0 +1,2 @@
+{"name": "chat_stream", "mock": false, "method": "POST", "path": "/v1/chat/completions", "stream": true,
+ "body": {"model": "tiny-fake", "messages": [{"role": "user", "content": "hi"}], "stream": true, "max_tokens": 10}}

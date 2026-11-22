@@ -1,0 +1,5 @@
+{
+ "name": "models",
+ "method": "GET",
+ "path": "/models"
+}

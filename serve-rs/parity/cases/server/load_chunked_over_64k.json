@@ -1,0 +1,11 @@
+{
+ "name": "load_chunked_over_64k",
+ "method": "POST",
+ "path": "/load",
+ "raw_body": "20000\r\nabc",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": null,
+  "Transfer-Encoding": "chunked"
+ }
+}

@@ -1,0 +1,10 @@
+{
+ "name": "detokenize_bool",
+ "method": "POST",
+ "path": "/detokenize",
+ "body": {
+  "tokens": [
+   true
+  ]
+ }
+}

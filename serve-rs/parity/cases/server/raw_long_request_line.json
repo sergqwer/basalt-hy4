@@ -1,0 +1,4 @@
+{
+ "name": "raw_long_request_line",
+ "raw": "GET /{repeat:70000:a} HTTP/1.1\r\nHost: {host}\r\n\r\n"
+}

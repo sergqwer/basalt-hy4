@@ -1,0 +1,9 @@
+{
+ "name": "unload_own_origin",
+ "method": "POST",
+ "path": "/unload",
+ "body": {},
+ "headers": {
+  "Origin": "http://127.0.0.1:{port}"
+ }
+}

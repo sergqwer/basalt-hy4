@@ -1,0 +1,10 @@
+{
+ "name": "detokenize_out_of_vocab",
+ "method": "POST",
+ "path": "/detokenize",
+ "body": {
+  "tokens": [
+   99999999
+  ]
+ }
+}

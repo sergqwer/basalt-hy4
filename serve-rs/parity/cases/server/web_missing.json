@@ -1,0 +1,5 @@
+{
+ "name": "web_missing",
+ "method": "GET",
+ "path": "/web/missing.js"
+}

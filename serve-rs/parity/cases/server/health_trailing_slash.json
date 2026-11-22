@@ -1,0 +1,5 @@
+{
+ "name": "health_trailing_slash",
+ "method": "GET",
+ "path": "/health/"
+}

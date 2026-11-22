@@ -1,0 +1,4 @@
+{
+ "name": "raw_brew",
+ "raw": "BREW / HTTP/1.0\r\nHost: {host}\r\n\r\n"
+}
