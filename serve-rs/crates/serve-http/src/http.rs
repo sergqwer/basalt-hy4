@@ -329,7 +329,7 @@ fn parse_request(req: &mut Req, raw: &[u8]) -> io::Result<Parsed> {
     req.close_connection = true;
     let requestline = latin1(raw).trim_end_matches(['\r', '\n']).to_string();
     req.requestline = requestline.clone();
-    let words: Vec<&str> = requestline.split_whitespace().collect();
+    let words: Vec<&str> = serve_engine::py::split(&requestline);
     if words.is_empty() {
         return Ok(Parsed::Answered);
     }
@@ -348,6 +348,12 @@ fn parse_request(req: &mut Req, raw: &[u8]) -> io::Result<Parsed> {
         };
         if !version.starts_with("HTTP/") || bad() {
             req.send_error(400, Some(&format!("Bad request version ({})", serve_text::pyjson::py_str_repr(version))), None)?;
+            return Ok(Parsed::Answered);
+        }
+        let base = &version[5..];
+        let major: u64 = base.split('.').next().unwrap_or("0").parse().unwrap_or(0);
+        if major >= 2 {
+            req.send_error(505, Some(&format!("Invalid HTTP version ({base})")), None)?;
             return Ok(Parsed::Answered);
         }
         req.request_version = version.to_string();
@@ -369,17 +375,20 @@ fn parse_request(req: &mut Req, raw: &[u8]) -> io::Result<Parsed> {
     req.path = if path.starts_with("//") { format!("/{}", path.trim_start_matches('/')) } else { path };
     // http.client.parse_headers
     let mut lines: Vec<String> = Vec::new();
+    let mut count = 0usize;
     loop {
         let line = req.conn.readline(MAX_LINE + 1)?;
         if line.len() > MAX_LINE {
-            req.send_error(431, Some("Line too long"), Some("header line"))?;
+            req.send_error(431, Some("Line too long"), Some(&format!("got more than {MAX_LINE} bytes when reading header line")))?;
             return Ok(Parsed::Answered);
         }
+        // http.client._read_headers counts the blank line that ends the block too
         let done = line == b"\r\n" || line == b"\n" || line.is_empty();
+        count += 1;
         if !done {
             lines.push(latin1(&line));
         }
-        if lines.len() > MAX_HEADERS {
+        if count > MAX_HEADERS {
             req.send_error(431, Some("Too many headers"), Some(&format!("got more than {MAX_HEADERS} headers")))?;
             return Ok(Parsed::Answered);
         }
