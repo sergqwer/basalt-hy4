@@ -157,3 +157,39 @@ macro_rules! jobj {
         serde_json::Value::Object(m)
     }};
 }
+
+/// `int(v)` with Python's exceptions: ValueError (a 400) for a string that is no integer, TypeError / OverflowError
+/// (uncaught in the handler) for other types and infinities.
+pub fn int_call(v: &Value) -> crate::error::AResult<i64> {
+    if let Some(n) = py_int(v) {
+        return Ok(n);
+    }
+    match v {
+        Value::String(s) => Err(crate::error::ApiError::value(format!(
+            "invalid literal for int() with base 10: {}",
+            serve_text::pyjson::py_str_repr(s)
+        ))),
+        Value::Number(n) => {
+            let f = n.as_f64().unwrap_or(0.0);
+            Err(crate::error::ApiError::internal(if f.is_nan() {
+                "ValueError: cannot convert float NaN to integer".to_string()
+            } else {
+                "OverflowError: cannot convert float infinity to integer".to_string()
+            }))
+        }
+        other => Err(crate::error::ApiError::internal(format!(
+            "TypeError: int() argument must be a string, a bytes-like object or a real number, not '{}'",
+            serve_text::pyjson::type_name(other)
+        ))),
+    }
+}
+
+/// `int(req.get(a) or req.get(b) or ... or 0)`: the first truthy value through int().
+pub fn int_of_first(req: &Obj, keys: &[&str]) -> crate::error::AResult<i64> {
+    for k in keys {
+        if let Some(v) = req.get(*k).filter(|v| truthy(v)) {
+            return int_call(v);
+        }
+    }
+    Ok(0)
+}
