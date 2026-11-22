@@ -185,7 +185,10 @@ impl Parser {
     }
 
     fn width() -> usize {
-        let cols = std::env::var("COLUMNS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(80);
+        // shutil.get_terminal_size(): $COLUMNS (when > 0), else stdout's console, else 80
+        let cols = std::env::var("COLUMNS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|c| *c > 0)
+            .or_else(|| serve_engine::util::stdout::stdout_columns().filter(|c| *c > 0).map(|c| c as usize))
+            .unwrap_or(80);
         cols.saturating_sub(2)
     }
 
@@ -225,11 +228,9 @@ impl Parser {
             lines
         };
         let lines = if prefix.len() + self.prog.len() <= (0.75 * text_width as f64) as usize {
-            let mut l = get_lines(&parts, &indent, Some(&format!("{} ", self.prog)));
-            if !l.is_empty() {
-                l[0] = format!("{} {}", self.prog, l[0]);
-            }
-            l
+            let mut all = vec![self.prog.clone()];
+            all.extend(parts.iter().cloned());
+            get_lines(&all, &indent, Some(prefix))
         } else {
             let ind = " ".repeat(prefix.len());
             let mut l = vec![self.prog.clone()];

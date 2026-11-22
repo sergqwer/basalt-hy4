@@ -564,27 +564,23 @@ impl<'a> Ctx<'a> {
         Ok(())
     }
 
+    /// GET /api/logs?after=<id>&limit=<n>: the newest lines after that id, and the newest id.
     fn logs(&mut self) -> std::io::Result<()> {
         let path = self.req.path.clone();
-        let number = |name: &str| -> Option<i64> { query_first(&path, name).map(|v| py_int(&v).map(|n| n.max(0))).unwrap_or(None) };
-        let after = if query_has(&path, "after") {
-            match query_first(&path, "after").and_then(|v| py_int(&v)) {
-                Some(n) => Some(n.max(0)),
-                None => None, // int() failed: the default (None)
-            }
-        } else {
-            None
-        };
-        let limit_of = |default: usize| -> usize {
-            match query_first(&path, "limit") {
+        let number = |name: &str, default: Option<i64>| -> Option<i64> {
+            match query_first(&path, name) {
                 None => default,
-                Some(v) => py_int(&v).map(|n| n.max(0) as usize).unwrap_or(default),
+                Some(v) => py_int(&v).map(|n| n.max(0)).or(default),
             }
         };
-        let _ = number;
-        let limit = if after.is_none() { limit_of(LOG_FIRST_LINES).min(LOG_MAX_LINES) } else { limit_of(LOG_MAX_LINES).min(LOG_MAX_LINES) };
+        let after = if query_has(&path, "after") { number("after", None) } else { None };
+        let limit = if after.is_none() {
+            number("limit", Some(LOG_FIRST_LINES as i64)).unwrap().min(LOG_MAX_LINES as i64)
+        } else {
+            number("limit", Some(LOG_MAX_LINES as i64)).unwrap().min(LOG_MAX_LINES as i64)
+        };
         let logs = self.conf().logs.clone();
-        let (lines, last) = logs.since(after.unwrap_or(0) as u64, limit);
+        let (lines, last) = logs.since(after.unwrap_or(0), limit);
         self.json(200, &json!({"lines": lines, "last": last}))
     }
 

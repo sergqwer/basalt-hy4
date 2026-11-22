@@ -307,10 +307,9 @@ impl Router {
             }
         }
         let me = Arc::downgrade(self);
-        let extra: Box<dyn Fn() -> Map<String, Value> + Send + Sync> = Box::new(move || {
-            me.upgrade().map(|r| r.shown().telemetry_extra()).unwrap_or_default()
-        });
-        let sampler = Arc::new(Telemetry::new(Some(extra), cards, None));
+        let extra: serve_engine::util::telemetry::Extra = Box::new(move || me.upgrade().map(|r| r.shown().telemetry_extra()));
+        let cards: Vec<u32> = cards.into_iter().map(|c| c.max(0) as u32).collect();
+        let sampler = Arc::new(Telemetry::new(Some(extra), Some(&cards), None));
         for svc in &self.services {
             svc.set_telemetry(Some(sampler.clone()));
         }
