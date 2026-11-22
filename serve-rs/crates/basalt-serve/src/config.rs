@@ -253,6 +253,10 @@ pub fn build_parser() -> Parser {
         .help("echo the engine's per-request summary on stdout, for a supervisor that only sees this output"));
     ap.add(Arg::new("--claude-code-prompt").choices(&["local", "as_sent"]).default(json!("local")).help(
         "Claude Code's system prompt: local (the default) drops its Claude-only parts (identity, Anthropic's security          policy, model ids, pronoun rule) and shortens its memory how-to, the same text every turn; as_sent passes it as sent"));
+    ap.add(Arg::new("--bang-restart-tokens").ty(t_budget, "budget_count").default(json!(256)).metavar("N").help(
+        "a reply that repeats token 0 this many times in a row (\"!\" on most vocabularies: what the sampler answers \
+         when no logit is finite) ends there as length, and the next request starts the engine again with fresh state \
+         (0 = never)"));
     ap.add(Arg::new("--stop-token-text").kind(Kind::BoolOpt).default(json!(true)).help(
         "a stop token the model writes where no turn can end (inside a tool call's argument, after an opening backtick          or quote, after a space, closing a turn written out as an example) is written as its text and the reply goes          on (on by default); --no-stop-token-text ends the reply there"));
     ap.add(Arg::new("--lazy").kind(Kind::StoreTrue)

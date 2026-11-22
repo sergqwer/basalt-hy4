@@ -606,6 +606,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Claude Code's system prompt: local (the default) drops its Claude-only parts (identity, "
                          "Anthropic's security policy, model ids, pronoun rule) and shortens its memory how-to, the "
                          "same text every turn; as_sent passes it as sent")
+    ap.add_argument("--bang-restart-tokens", type=budget_count, default=256, metavar="N",
+                    help="a reply that repeats token 0 this many times in a row (\"!\" on most vocabularies: what "
+                         "the sampler answers when no logit is finite) ends there as length, and the next request "
+                         "starts the engine again with fresh state (0 = never)")
     ap.add_argument("--stop-token-text", action=argparse.BooleanOptionalAction, default=True,
                     help="a stop token the model writes where no turn can end (inside a tool call's argument, after an "
                          "opening backtick or quote, after a space, closing a turn written out as an example) is "

@@ -104,6 +104,8 @@ pub struct Settings {
     pub thinking_loop_tokens: i64,
     /// --stop-token-text: a stop id where no turn ends is written as its text
     pub stop_token_text: bool,
+    /// --bang-restart-tokens: token 0 this many times in a row ends a reply, the next request gets a fresh engine
+    pub bang_restart_tokens: i64,
     pub anthropic_think_unasked: bool,
     pub start_tries: Option<u32>,
     pub gpu_indices: Vec<u32>,
@@ -130,6 +132,7 @@ impl Default for Settings {
             reasoning_effort: None,
             thinking_loop_tokens: 256,
             stop_token_text: true,
+            bang_restart_tokens: 256,
             anthropic_think_unasked: true,
             start_tries: None,
             gpu_indices: vec![0],
@@ -222,6 +225,8 @@ pub struct Service {
     embeddings: Mutex<std::collections::HashMap<u64, String>>,
     request_path: Mutex<std::collections::HashMap<u64, String>>,
     pub booting: AtomicBool,
+    /// a reply was token 0 repeated (non-finite logits): the next request unloads the engine first
+    pub restart_pending: AtomicBool,
     pub load_kind: Mutex<&'static str>,
     pub boot_error: Mutex<Option<EngineErr>>,
     pub on_loaded: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -310,6 +315,7 @@ impl Service {
             embeddings: Mutex::new(Default::default()),
             request_path: Mutex::new(Default::default()),
             booting: AtomicBool::new(false),
+            restart_pending: AtomicBool::new(false),
             load_kind: Mutex::new("weights"),
             boot_error: Mutex::new(None),
             on_loaded: RwLock::new(None),
@@ -470,6 +476,13 @@ impl Service {
 
     /// ensure_loaded: start the engine if it is not running. Caller holds fifo.
     pub fn ensure_loaded(&self) -> Result<(), EngineErr> {
+        if self.restart_pending.load(Ordering::SeqCst) && self.status_lock.lock().unwrap().live_reqs.is_empty() {
+            self.restart_pending.store(false, Ordering::SeqCst);
+            if self.engine.has_process() && self.loaded() {
+                self.engine.unload()?;
+                out("[server] the last reply was token 0 repeated (non-finite logits): the engine starts again with fresh state");
+            }
+        }
         if let Some(e) = self.boot_error.lock().unwrap().clone() {
             let log = match &e {
                 EngineErr::StartError { log, .. } => log.clone(),

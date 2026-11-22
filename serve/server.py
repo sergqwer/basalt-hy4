@@ -307,6 +307,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     svc.reasoning_effort = a.reasoning_effort
     svc.thinking_loop_tokens = a.thinking_loop_tokens
     svc.stop_token_text = a.stop_token_text
+    svc.bang_restart_tokens = a.bang_restart_tokens
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
     if multi:

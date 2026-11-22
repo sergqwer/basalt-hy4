@@ -1,0 +1,49 @@
+{
+ "name": "bang_restart_off",
+ "mock": false,
+ "server_args": [
+  "--bang-restart-tokens",
+  "0"
+ ],
+ "engine_script": "engine/bang_engine.scenario",
+ "requests": [
+  {
+   "method": "POST",
+   "path": "/v1/chat/completions",
+   "body": {
+    "model": "tiny-fake",
+    "messages": [
+     {
+      "role": "user",
+      "content": "hi"
+     }
+    ],
+    "max_tokens": 20,
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/health"
+  },
+  {
+   "method": "POST",
+   "path": "/v1/chat/completions",
+   "body": {
+    "model": "tiny-fake",
+    "messages": [
+     {
+      "role": "user",
+      "content": "hi"
+     }
+    ],
+    "max_tokens": 20,
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    }
+   }
+  }
+ ]
+}

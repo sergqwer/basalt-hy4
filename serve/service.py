@@ -166,6 +166,11 @@ class Service:
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
         self.stop_token_text = True                      # a stop id where no turn ends is its text (--stop-token-text)
+        # Token 0 is what the sampler answers when no logit is finite; in Strata the state that made them NaN outlived
+        # its request (every later request of the conversation answered "!" at once until the engine was restarted).
+        # A reply that is token 0 this many times in a row ends, and the next request gets a fresh engine (0: off).
+        self.bang_restart_tokens = 256
+        self.restart_pending = False
         start = tokenizer.encode(self.dialect.turn_start, parse_special=True) if self.dialect.turn_start else []
         self.turn_start_id = start[0] if len(start) == 1 else None
 
@@ -284,6 +289,12 @@ class Service:
 
     def ensure_loaded(self):
         """Start the engine if it is not running, after the before_load hook and VRAM check. Caller holds fifo."""
+        if self.restart_pending and not self.live_reqs:     # never under a parallel request still running
+            self.restart_pending = False
+            if hasattr(self.engine, "unload") and self.loaded():
+                self.engine.unload()
+                print("[server] the last reply was token 0 repeated (non-finite logits): the engine starts again "
+                      "with fresh state", flush=True)
         if self.boot_error is not None:
             raise EngineStartError(str(self.boot_error), self.boot_error.log)
         if self.loaded() and not self._vision_down() and getattr(self.engine, "asleep", False) is not True:
@@ -1440,6 +1451,7 @@ class Service:
                     closed_early = False                # the thinking was already closed once
                     pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
+                    zeros = 0                           # token 0 in a row (bang_restart_tokens)
                     literals, relit = 0, False          # stop ids written as text (STOP_TEXT_MAX); this pass ended on one
                     owed = None                         # the text's last piece, which the model writes itself
                     examples = 0                        # turn starts written in the thinking or a code block, still open
@@ -1586,6 +1598,13 @@ class Service:
                                     yield "ping", None
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine
+                                    break
+                                zeros = zeros + 1 if t == 0 else 0
+                                if self.bang_restart_tokens and zeros >= self.bang_restart_tokens:
+                                    self.restart_pending = True     # finish stays "length"
+                                    print(f"[server] warning: the reply repeated token 0 ({self.tok.decode([0])!r}) "
+                                          f"{zeros} times in a row: ended as length, the next request starts the "
+                                          "engine again (--bang-restart-tokens)", flush=True)
                                     break
                                 if (self.thinking_loop_tokens and run_n >= self.thinking_loop_tokens
                                         and parser.state == "reasoning" and not parser.buf and not detok.pending()):

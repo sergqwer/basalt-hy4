@@ -1,0 +1,35 @@
+{
+ "plan": {
+  "devices": "0",
+  "cards": [
+   {
+    "smi": 0
+   }
+  ],
+  "notes": [],
+  "max_context": 4096
+ },
+ "start": [
+  "INFO engine=fake-0.1 arena_mib=0",
+  "READY 4096 stop"
+ ],
+ "replies": [
+  [
+   "T 0",
+   "T 0",
+   "T 0",
+   "T 0",
+   "T 0",
+   "T 0",
+   "T 0",
+   "T 0",
+   "T 0",
+   "T 0",
+   "DONE 10 {prompt_n} 1.0 1.0 length"
+  ]
+ ],
+ "stats": [],
+ "vram": [
+  "VRAM reserve_mib=0 cache_mib=0"
+ ]
+}

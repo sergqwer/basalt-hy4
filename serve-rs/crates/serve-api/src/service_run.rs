@@ -401,6 +401,8 @@ impl Run {
         let mut pt_settled = false;
         let mut run_id: Option<u32> = None;
         let mut run_n: i64 = 0;
+        let mut zeros: i64 = 0; // token 0 in a row (bang_restart_tokens)
+        let bang = svc.cfg.read().unwrap().bang_restart_tokens;
         let is_text = matches!(self.ids, Prompt::Text(_));
         for ev in std::mem::take(&mut self.opening) {
             y.yield_(RunItem::Event(ev))?;
@@ -623,6 +625,15 @@ impl Run {
                 }
                 if self.stops.as_ref().map(|s| s.hit.is_some()).unwrap_or(false) {
                     self.finish = "stop";
+                    break 'pass;
+                }
+                zeros = if t.id == 0 { zeros + 1 } else { 0 };
+                if bang != 0 && zeros >= bang {
+                    svc.restart_pending.store(true, Ordering::SeqCst); // finish stays "length"
+                    out(&format!(
+                        "[server] warning: the reply repeated token 0 ({}) {zeros} times in a row: ended as length, the next request starts the engine again (--bang-restart-tokens)",
+                        serve_text::pyjson::py_str_repr(&svc.tok.decode(&[0]).unwrap_or_default())
+                    ));
                     break 'pass;
                 }
                 if loop_tokens != 0 && run_n >= loop_tokens && self.parser.state() == "reasoning" && self.clean() {

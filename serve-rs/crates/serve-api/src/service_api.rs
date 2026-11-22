@@ -215,6 +215,10 @@ impl Service {
     pub fn set_effort_end(&self, v: bool) {
         self.cfg.write().unwrap().effort_end = v;
     }
+    pub fn set_bang_restart_tokens(&self, v: i64) {
+        self.cfg.write().unwrap().bang_restart_tokens = v;
+    }
+
     pub fn set_stop_token_text(&self, v: bool) {
         self.cfg.write().unwrap().stop_token_text = v;
     }
