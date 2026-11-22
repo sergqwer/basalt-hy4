@@ -43,6 +43,80 @@ void Runtime::shed_if_low() {
                       (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
 }
 
+namespace {
+int64_t pressure_ms() {
+    static const int64_t ms = [] {
+        const char* e = std::getenv("BASALT_CONV_PRESSURE_MS");
+        return e ? (int64_t) std::atoll(e) : (int64_t) 2000;
+    }();
+    return ms;
+}
+uint64_t pressure_margin() {
+    static const uint64_t m = [] {
+        const char* e = std::getenv("BASALT_CONV_PRESSURE_MARGIN_MIB");
+        return (uint64_t) (e ? std::max<long long>(0, std::atoll(e)) : 1024LL) << 20;
+    }();
+    return m;
+}
+}  // namespace
+
+bool Runtime::pressure_on() const { return pressure_ms() > 0 && conversations && conversations->bytes() > 0; }
+
+bool Runtime::pressure_due() const {
+    return pressure_on() && Clock::now() - pressure_at >= std::chrono::milliseconds(pressure_ms());
+}
+
+void Runtime::release_if_short(const char* when) {
+    if (pressure_ms() <= 0 || !conversations) return;
+    pressure_at = Clock::now();
+    const size_t held = conversations->bytes();
+    if (held == 0) { pressure_quiet.on = false; return; }
+    if (pressure_quiet.on && pressure_quiet.held == held) return;
+    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+    const auto t0 = Clock::now();
+    size_t to_disk = 0;
+    try {
+        const basalt::core::PressureRelease r = basalt::core::conversation_pressure_release(
+            floor, pressure_margin(), [] { return basalt::core::conversation_available_memory(); },
+            [&] {   // freed RAM back to the OS: the pooled checkpoint blocks, the heap, the disk writer's queue
+                basalt::core::CheckpointBytes::allocator_type::release_pooled();
+                basalt::platform::release_free_heap();
+                if (disk.enabled()) disk.flush();   // the store writes durably: the bytes leave the modified file cache
+            },
+            [&]() -> std::optional<basalt::core::PressureUnit> {
+                std::optional<basalt::core::PressureUnit> u = basalt::core::conversation_cache_release_one(*conversations);
+                for (auto& sc : conversations->take_spilled())
+                    if (disk.enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec) &&
+                        disk.put(std::move(sc), kDiskQueueCap))
+                        ++to_disk;
+                return u;
+            },
+            conversations->size() + 2);
+        pressure_quiet = {r.exhausted, conversations->bytes()};
+        if (!r.below || (r.released() == 0 && !r.exhausted)) return;
+        const long long before = r.before ? (long long) (*r.before >> 20) : -1;
+        const long long after = r.after ? (long long) (*r.after >> 20) : -1;
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        if (r.released() != 0)
+            basalt::log::info("basalt serve", "conversation cache: RAM below the floor (%s): released %zu dialog%s%s, "
+                              "%llu MiB (%zu to the disk tier) in %.0f ms; %lld -> %lld MiB available, floor %lld MiB + "
+                              "%llu; parked=%zu%s", when, r.dialogs, r.dialogs == 1 ? "" : "s",
+                              r.others ? " + the retained K/V" : "", (unsigned long long) (r.bytes >> 20), to_disk, ms,
+                              before, after, (long long) o.conversation_cache_min_free_mib,
+                              (unsigned long long) (pressure_margin() >> 20), conversations->size(),
+                              r.exhausted ? "; nothing left to release" : "");
+        else
+            basalt::log::info("basalt serve", "conversation cache: RAM below the floor (%s: %lld MiB available, floor "
+                              "%lld MiB): nothing left to release", when, after,
+                              (long long) o.conversation_cache_min_free_mib);
+        report_conversations();
+    } catch (const std::bad_alloc&) {   // the disk tier's put allocates, under this very pressure
+        pressure_quiet = {true, conversations->bytes()};
+        basalt::log::warn("basalt serve", "conversation cache: RAM below the floor (%s): an allocation failed while "
+                          "releasing; going on (parked=%zu)", when, conversations->size());
+    }
+}
+
 void Runtime::ckd_finish() {
     const void* dst = ckd.pending();
     if (dst == nullptr) return;

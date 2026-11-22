@@ -373,6 +373,14 @@ public:
         return std::exchange(reuse_, {});
     }
     size_t retained_bytes() const { return reuse_.bytes(); }
+    /// RAM pressure (conversation_pressure.hpp): the retained K/V goes.
+    void drop_reuse() {
+        reuse_ = {};
+        reuse_owner_ = nullptr;
+    }
+    /// RAM pressure: the budgeted conversation unused the longest leaves (to the tier below when spilling), else the
+    /// longest parked idle slot's; false when nothing is parked.
+    bool release_oldest() { return evict_oldest(false) || evict_oldest(true); }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
                entries_.size() - slot_count_ < slots_ && budgeted_bytes() <= budget_ - held - incoming;

@@ -62,6 +62,7 @@ void Runtime::stats_tick(bool force) {
 Flow Runtime::dispatch() {
     if (batch_on() || windows_in_flight()) {
         if (!try_next_line(line)) {
+            if (pressure_due()) release_if_short("between batch windows");
             const BusyClock busy(busy_s, busy_on, busy_from);
             const size_t active = (size_t) std::count_if(bs.begin(), bs.end(), [](const BSlot& b) { return b.active; });
             if (!next_batch_window()) return Flow::error;
@@ -83,9 +84,17 @@ Flow Runtime::dispatch() {
             got = r == 1;
             while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
             if (got) break;
+            if (pressure_due()) release_if_short("idle");
             parking = parking && park_idle_engine(pe);
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             if (!parking) break;
+        }
+        // RAM pressure (release_if_short) wakes the wait while the conversation cache holds something
+        while (!got && pressure_on()) {
+            const int r = next_line_within(line, 1000);
+            if (r < 0) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
+            got = r == 1;
+            if (!got && pressure_due()) release_if_short("idle");
         }
         if (!got && !next_line(line)) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
     }
@@ -186,6 +195,7 @@ Flow Runtime::dispatch() {
         admit_max_new = mn;
         line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
     }
+    if (line != "QUIT") release_if_short("before a request");
     between_requests(line);
     if (line == "QUIT") return Flow::quit;
     // the watchdog watches a request from here until this iteration ends, whichever way it ends

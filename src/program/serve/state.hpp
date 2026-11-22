@@ -6,6 +6,7 @@
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/conversation_memory.hpp"
+#include "basalt/core/conversation_pressure.hpp"
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -126,6 +127,18 @@ public:
     /// when it is on and holds no copy of them yet, the others are dropped), the checkpoint blocks kept for reuse are
     /// freed and the heap's free pages return to the OS. The checkpoints stay: a request may already resume from one.
     void shed_if_low();
+    /// RAM pressure on what the conversation cache holds, before a request, every BASALT_CONV_PRESSURE_MS (2000; 0 =
+    /// off) while idle and between batch windows: below --conversation-cache-min-free-mib available, the retained K/V,
+    /// then the parked conversations least recently active first (to the disk tier when it is on and holds no copy,
+    /// written durably; else dropped), then the idle slots' conversations parked out of VRAM leave RAM until the floor
+    /// plus BASALT_CONV_PRESSURE_MARGIN_MIB (1024) is available. One line per event. The RAM guard's shed (above)
+    /// stays the emergency below --ram-reserve-mib.
+    void release_if_short(const char* when);
+    /// The check is on and the cache holds something; due: and the period has passed.
+    bool pressure_on() const;
+    bool pressure_due() const;
+    Clock::time_point pressure_at{};
+    struct { bool on = false; size_t held = 0; } pressure_quiet;   ///< nothing left to release: said once
     /// From READY on the RAM guard watches MemAvailable against the reserve (--ram-reserve-mib); with 0 it never
     /// starts. The disk tier keeps a GiB above that floor either way.
     void start_guard();
