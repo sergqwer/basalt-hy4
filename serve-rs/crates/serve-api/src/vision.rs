@@ -674,9 +674,17 @@ pub fn normalize(data: Vec<u8>) -> Result<Vec<u8>, String> {
 
 fn converted(data: &[u8]) -> Result<Vec<u8>, String> {
     use image::ImageFormat as F;
-    let fmt = image::guess_format(data).ok().filter(|f| {
-        matches!(f, F::Jpeg | F::Png | F::Bmp | F::Gif | F::WebP | F::Tiff | F::Tga | F::Pnm | F::Qoi)
-    });
+    let fmt = image::guess_format(data)
+        .ok()
+        .filter(|f| matches!(f, F::Jpeg | F::Png | F::Bmp | F::Gif | F::WebP | F::Tiff | F::Tga | F::Pnm | F::Qoi))
+        .or_else(|| {
+            // TGA has no magic: Pillow's plugin accepts a plausible header (colormap 0/1, image type 1-3/9-11, depth)
+            let ok = data.len() >= 18
+                && data[1] <= 1
+                && matches!(data[2], 1 | 2 | 3 | 9 | 10 | 11)
+                && matches!(data[16], 1 | 8 | 15 | 16 | 24 | 32);
+            ok.then_some(F::Tga)
+        });
     let Some(fmt) = fmt else {
         return Err("the image could not be read: not a format this server decodes".into());
     };
