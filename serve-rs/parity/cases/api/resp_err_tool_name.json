@@ -1,0 +1,14 @@
+{
+ "name": "resp_err_tool_name",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "tools": [
+   {
+    "type": "function"
+   }
+  ]
+ }
+}

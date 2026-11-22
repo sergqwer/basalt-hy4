@@ -1,0 +1,13 @@
+{
+ "name": "resp_length",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "max_output_tokens": 5
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ]
+}

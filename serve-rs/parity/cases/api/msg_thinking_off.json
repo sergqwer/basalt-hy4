@@ -1,0 +1,21 @@
+{
+ "name": "msg_thinking_off",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "thinking": {
+   "type": "disabled"
+  }
+ },
+ "script": [
+  "Direct."
+ ]
+}

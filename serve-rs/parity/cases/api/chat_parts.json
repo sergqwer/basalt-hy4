@@ -1,0 +1,26 @@
+{
+ "name": "chat_parts",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "a"
+     },
+     {
+      "type": "text",
+      "text": "b"
+     }
+    ]
+   }
+  ]
+ },
+ "script": [
+  "Fine."
+ ]
+}

@@ -1,0 +1,20 @@
+{
+ "name": "msg_err_format",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "output_config": {
+   "format": {
+    "type": "xml"
+   }
+  }
+ }
+}

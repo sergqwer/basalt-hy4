@@ -1,0 +1,10 @@
+{
+ "name": "resp_err_max_output",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "max_output_tokens": 0
+ }
+}

@@ -1,0 +1,17 @@
+{
+ "name": "chat_err_format",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "response_format": {
+   "type": "xml"
+  }
+ }
+}

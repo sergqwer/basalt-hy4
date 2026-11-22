@@ -1,0 +1,15 @@
+{
+ "name": "chat_err_stop",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "stop": 5
+ }
+}

@@ -1,0 +1,21 @@
+{
+ "name": "msg_stop_seq",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "stop_sequences": [
+   "is 4"
+  ]
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ]
+}

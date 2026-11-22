@@ -1,0 +1,21 @@
+{
+ "name": "chat_err_image",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,iVBORw0KGgo="
+      }
+     }
+    ]
+   }
+  ]
+ }
+}

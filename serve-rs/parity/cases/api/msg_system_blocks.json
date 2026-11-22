@@ -1,0 +1,28 @@
+{
+ "name": "msg_system_blocks",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "system": [
+   {
+    "type": "text",
+    "text": "a"
+   },
+   {
+    "type": "text",
+    "text": "b"
+   }
+  ]
+ },
+ "script": [
+  "ok"
+ ]
+}

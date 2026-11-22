@@ -1,0 +1,29 @@
+{
+ "name": "chat_json_schema_stream",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "response_format": {
+   "type": "json_schema",
+   "json_schema": {
+    "name": "n",
+    "strict": true,
+    "schema": {
+     "type": "object"
+    }
+   }
+  },
+  "stream": true
+ },
+ "script": [
+  "x</think>\n\n{\"a\": 1}"
+ ],
+ "stream": true
+}

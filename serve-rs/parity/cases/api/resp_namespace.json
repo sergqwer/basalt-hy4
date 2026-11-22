@@ -1,0 +1,31 @@
+{
+ "name": "resp_namespace",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "tools": [
+   {
+    "type": "namespace",
+    "name": "fs",
+    "description": "files",
+    "tools": [
+     {
+      "name": "read",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    ]
+   },
+   {
+    "type": "web_search"
+   }
+  ]
+ },
+ "script": [
+  "ok"
+ ]
+}

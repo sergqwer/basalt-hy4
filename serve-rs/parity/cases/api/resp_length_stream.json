@@ -1,0 +1,15 @@
+{
+ "name": "resp_length_stream",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "max_output_tokens": 5,
+  "stream": true
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ],
+ "stream": true
+}

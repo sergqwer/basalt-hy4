@@ -1,0 +1,23 @@
+{
+ "name": "msg_thinking_off_stream",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "thinking": {
+   "type": "disabled"
+  },
+  "stream": true
+ },
+ "script": [
+  "Direct."
+ ],
+ "stream": true
+}

@@ -1,0 +1,26 @@
+{
+ "name": "msg_format",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "output_config": {
+   "format": {
+    "type": "json_schema",
+    "schema": {
+     "type": "object"
+    }
+   }
+  }
+ },
+ "script": [
+  "x</think>\n\n{\"a\": 1}"
+ ]
+}

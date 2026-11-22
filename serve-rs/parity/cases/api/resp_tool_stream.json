@@ -1,0 +1,34 @@
+{
+ "name": "resp_tool_stream",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "tools": [
+   {
+    "type": "function",
+    "name": "get_weather",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "stream": true
+ },
+ "script": [
+  "Checking.</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nKyiv\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
+ ],
+ "stream": true
+}

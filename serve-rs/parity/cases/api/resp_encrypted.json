@@ -1,0 +1,15 @@
+{
+ "name": "resp_encrypted",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "include": [
+   "reasoning.encrypted_content"
+  ]
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ]
+}

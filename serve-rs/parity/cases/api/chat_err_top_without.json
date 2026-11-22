@@ -1,0 +1,15 @@
+{
+ "name": "chat_err_top_without",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "top_logprobs": 2
+ }
+}

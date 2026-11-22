@@ -1,0 +1,23 @@
+{
+ "name": "chat_err_schema_ref",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "response_format": {
+   "type": "json_schema",
+   "json_schema": {
+    "name": "n",
+    "schema": {
+     "$ref": "http://x"
+    }
+   }
+  }
+ }
+}

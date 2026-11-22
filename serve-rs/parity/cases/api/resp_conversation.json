@@ -1,0 +1,62 @@
+{
+ "name": "resp_conversation",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": [
+   {
+    "role": "developer",
+    "content": "dev"
+   },
+   {
+    "role": "user",
+    "content": "weather"
+   },
+   {
+    "type": "reasoning",
+    "content": [
+     {
+      "type": "reasoning_text",
+      "text": "call"
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "a",
+    "name": "get_weather",
+    "arguments": "{\"city\": \"Rome\"}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "a",
+    "output": "20C"
+   }
+  ],
+  "instructions": "Terse.",
+  "tools": [
+   {
+    "type": "function",
+    "name": "get_weather",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ]
+ },
+ "script": [
+  "ok"
+ ]
+}

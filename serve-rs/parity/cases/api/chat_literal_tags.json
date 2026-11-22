@@ -1,0 +1,17 @@
+{
+ "name": "chat_literal_tags",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What do <think> and <tool_call> mean?"
+   }
+  ]
+ },
+ "script": [
+  "Fine."
+ ]
+}

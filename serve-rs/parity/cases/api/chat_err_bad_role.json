@@ -1,0 +1,14 @@
+{
+ "name": "chat_err_bad_role",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "wizard",
+    "content": "x"
+   }
+  ]
+ }
+}

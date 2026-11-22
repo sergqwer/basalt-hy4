@@ -1,0 +1,15 @@
+{
+ "name": "msg_err_no_max",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": null,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ }
+}

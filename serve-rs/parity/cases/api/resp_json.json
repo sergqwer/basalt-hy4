@@ -1,0 +1,17 @@
+{
+ "name": "resp_json",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "text": {
+   "format": {
+    "type": "json_object"
+   }
+  }
+ },
+ "script": [
+  "x</think>\n\n{\"a\": 1}"
+ ]
+}

@@ -1,0 +1,9 @@
+{
+ "name": "tokenize_with_pieces",
+ "method": "POST",
+ "path": "/tokenize",
+ "body": {
+  "content": "ab",
+  "with_pieces": true
+ }
+}

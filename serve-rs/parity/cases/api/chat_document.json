@@ -1,0 +1,29 @@
+{
+ "name": "chat_document",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "file",
+      "file": {
+       "filename": "a.txt",
+       "file_data": "data:text/plain;base64,aGVsbG8gd29ybGQ="
+      }
+     },
+     {
+      "type": "text",
+      "text": "summarize"
+     }
+    ]
+   }
+  ]
+ },
+ "script": [
+  "Read."
+ ]
+}

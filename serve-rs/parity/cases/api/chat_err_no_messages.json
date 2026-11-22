@@ -1,0 +1,9 @@
+{
+ "name": "chat_err_no_messages",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": []
+ }
+}

@@ -1,0 +1,14 @@
+{
+ "name": "resp_think_stream",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "stream": true
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ],
+ "stream": true
+}

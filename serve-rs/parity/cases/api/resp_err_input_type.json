@@ -1,0 +1,9 @@
+{
+ "name": "resp_err_input_type",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": 5
+ }
+}

@@ -1,0 +1,12 @@
+{
+ "name": "resp_think",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi"
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ]
+}
