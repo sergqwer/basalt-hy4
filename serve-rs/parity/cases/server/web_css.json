@@ -1,0 +1,5 @@
+{
+ "name": "web_css",
+ "method": "GET",
+ "path": "/web/app.css"
+}

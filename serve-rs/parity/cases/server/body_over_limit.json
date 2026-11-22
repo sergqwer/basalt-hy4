@@ -1,0 +1,13 @@
+{
+ "name": "body_over_limit",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "{\"x\": \"{repeat:1100000:a}\"}",
+ "headers": {
+  "Content-Type": "application/json"
+ },
+ "server_args": [
+  "--max-payload-mib",
+  "1"
+ ]
+}

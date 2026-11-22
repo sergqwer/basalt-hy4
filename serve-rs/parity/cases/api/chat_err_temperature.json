@@ -1,0 +1,15 @@
+{
+ "name": "chat_err_temperature",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "temperature": "hot"
+ }
+}

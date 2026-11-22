@@ -1,0 +1,5 @@
+{
+ "name": "metrics_unknown_model",
+ "method": "GET",
+ "path": "/metrics?model=nope"
+}

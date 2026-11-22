@@ -1,0 +1,9 @@
+{
+ "name": "invalid_json",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "{not json",
+ "headers": {
+  "Content-Type": "application/json"
+ }
+}

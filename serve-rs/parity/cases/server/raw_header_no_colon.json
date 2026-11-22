@@ -1,0 +1,4 @@
+{
+ "name": "raw_header_no_colon",
+ "raw": "GET /health HTTP/1.1\r\nHost: {host}\r\nnocolon\r\n\r\n"
+}

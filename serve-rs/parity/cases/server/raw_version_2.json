@@ -1,0 +1,4 @@
+{
+ "name": "raw_version_2",
+ "raw": "GET / HTTP/2.0\r\nHost: {host}\r\n\r\n"
+}

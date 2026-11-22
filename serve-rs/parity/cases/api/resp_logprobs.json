@@ -1,0 +1,16 @@
+{
+ "name": "resp_logprobs",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "include": [
+   "message.output_text.logprobs"
+  ],
+  "top_logprobs": 1
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ]
+}

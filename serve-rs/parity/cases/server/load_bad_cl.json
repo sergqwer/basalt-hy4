@@ -1,0 +1,10 @@
+{
+ "name": "load_bad_cl",
+ "method": "POST",
+ "path": "/load",
+ "raw_body": "{}",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": "x"
+ }
+}

@@ -1,0 +1,17 @@
+{
+ "name": "origin_own",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ "headers": {
+  "Origin": "http://127.0.0.1:{port}"
+ }
+}

@@ -1,0 +1,12 @@
+{
+ "name": "host_allowed_star",
+ "method": "GET",
+ "path": "/health",
+ "server_args": [
+  "--allowed-host",
+  "*"
+ ],
+ "headers": {
+  "Host": "evil.com"
+ }
+}

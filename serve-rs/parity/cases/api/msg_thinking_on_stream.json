@@ -1,0 +1,24 @@
+{
+ "name": "msg_thinking_on_stream",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 2048,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "thinking": {
+   "type": "enabled",
+   "budget_tokens": 1024
+  },
+  "stream": true
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ],
+ "stream": true
+}

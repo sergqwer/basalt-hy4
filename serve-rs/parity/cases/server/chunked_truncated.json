@@ -1,0 +1,12 @@
+{
+ "name": "chunked_truncated",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "10\r\n{}",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": null,
+  "Transfer-Encoding": "chunked"
+ },
+ "half_close": true
+}

@@ -1,0 +1,7 @@
+{
+ "name": "v1_load_no_ct",
+ "method": "POST",
+ "path": "/v1/load",
+ "raw_body": "{}",
+ "headers": {}
+}

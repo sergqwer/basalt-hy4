@@ -1,0 +1,20 @@
+{
+ "name": "opt_image_no_vision_resp",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "input_image",
+      "image_url": "data:image/png;base64,iVBORw0KGgo="
+     }
+    ]
+   }
+  ]
+ },
+ "server_args": []
+}

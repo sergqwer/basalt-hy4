@@ -1,0 +1,9 @@
+{
+ "name": "v1_unload_foreign_origin",
+ "method": "POST",
+ "path": "/v1/unload",
+ "body": {},
+ "headers": {
+  "Origin": "https://evil.com"
+ }
+}

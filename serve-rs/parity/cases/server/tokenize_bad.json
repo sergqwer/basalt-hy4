@@ -1,0 +1,8 @@
+{
+ "name": "tokenize_bad",
+ "method": "POST",
+ "path": "/tokenize",
+ "body": {
+  "content": 5
+ }
+}

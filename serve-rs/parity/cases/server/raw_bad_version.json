@@ -1,0 +1,4 @@
+{
+ "name": "raw_bad_version",
+ "raw": "GET / HTTPX/1.0\r\nHost: {host}\r\n\r\n"
+}

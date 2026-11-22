@@ -1,0 +1,10 @@
+{
+ "name": "resp_err_background",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "background": true
+ }
+}

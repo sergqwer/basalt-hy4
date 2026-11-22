@@ -1,0 +1,11 @@
+{
+ "name": "detokenize_bad",
+ "method": "POST",
+ "path": "/detokenize",
+ "body": {
+  "tokens": [
+   1,
+   -1
+  ]
+ }
+}

@@ -1,0 +1,14 @@
+{
+ "name": "resp_err_text_format",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "text": {
+   "format": {
+    "type": "xml"
+   }
+  }
+ }
+}

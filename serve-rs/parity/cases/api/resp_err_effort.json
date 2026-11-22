@@ -1,0 +1,12 @@
+{
+ "name": "resp_err_effort",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "reasoning": {
+   "effort": "extreme"
+  }
+ }
+}

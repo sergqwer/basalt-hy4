@@ -1,0 +1,25 @@
+{
+ "name": "opt_image_no_vision_msg",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 5,
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image",
+      "source": {
+       "type": "base64",
+       "media_type": "image/png",
+       "data": "iVBORw0KGgo="
+      }
+     }
+    ]
+   }
+  ]
+ },
+ "server_args": []
+}

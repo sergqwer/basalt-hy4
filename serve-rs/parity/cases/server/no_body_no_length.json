@@ -1,0 +1,8 @@
+{
+ "name": "no_body_no_length",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "headers": {
+  "Content-Type": "application/json"
+ }
+}

@@ -1,0 +1,34 @@
+{
+ "name": "count_tokens_tools",
+ "method": "POST",
+ "path": "/v1/messages/count_tokens",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Weather",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ]
+ }
+}

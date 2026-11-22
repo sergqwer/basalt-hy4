@@ -1,0 +1,15 @@
+{
+ "name": "messages_nonstream",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 100,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ }
+}

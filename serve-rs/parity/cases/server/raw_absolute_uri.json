@@ -1,0 +1,4 @@
+{
+ "name": "raw_absolute_uri",
+ "raw": "GET http://127.0.0.1:{port}/health HTTP/1.1\r\nHost: {host}\r\n\r\n"
+}

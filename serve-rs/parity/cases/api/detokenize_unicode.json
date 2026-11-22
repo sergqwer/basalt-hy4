@@ -1,0 +1,16 @@
+{
+ "name": "detokenize_unicode",
+ "method": "POST",
+ "path": "/detokenize",
+ "body": {
+  "tokens": [
+   104,
+   195,
+   169,
+   240,
+   159,
+   152,
+   128
+  ]
+ }
+}

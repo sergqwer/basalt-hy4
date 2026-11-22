@@ -1,0 +1,33 @@
+{
+ "name": "msg_document",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "document",
+      "source": {
+       "type": "text",
+       "media_type": "text/plain",
+       "data": "x\r\ny"
+      },
+      "title": "t.txt",
+      "context": "ctx"
+     },
+     {
+      "type": "text",
+      "text": "go"
+     }
+    ]
+   }
+  ]
+ },
+ "script": [
+  "ok"
+ ]
+}

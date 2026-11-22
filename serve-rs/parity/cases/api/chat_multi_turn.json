@@ -1,0 +1,30 @@
+{
+ "name": "chat_multi_turn",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "2+2"
+   },
+   {
+    "role": "assistant",
+    "content": "4",
+    "reasoning_content": "add"
+   },
+   {
+    "role": "user",
+    "content": "3+3"
+   }
+  ]
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ]
+}

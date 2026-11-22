@@ -1,0 +1,11 @@
+{
+ "name": "chunked_two_chunks_ext",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "5;ext=1\r\n{\"mod\r\n3f\r\nel\": \"basalt\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}\r\n0\r\nX-T: 1\r\n\r\n",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": null,
+  "Transfer-Encoding": "chunked"
+ }
+}

@@ -1,0 +1,8 @@
+{
+ "name": "vram_bool_reserve",
+ "method": "POST",
+ "path": "/v1/vram",
+ "body": {
+  "reserve_mib": true
+ }
+}

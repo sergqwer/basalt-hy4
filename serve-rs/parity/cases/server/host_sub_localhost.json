@@ -1,0 +1,8 @@
+{
+ "name": "host_sub_localhost",
+ "method": "GET",
+ "path": "/health",
+ "headers": {
+  "Host": "app.localhost"
+ }
+}

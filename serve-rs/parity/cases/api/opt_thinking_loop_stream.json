@@ -1,0 +1,23 @@
+{
+ "name": "opt_thinking_loop_stream",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "stream": true
+ },
+ "script": [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</think>\n\nok"
+ ],
+ "stream": true,
+ "server_args": [
+  "--thinking-loop-tokens",
+  "8"
+ ]
+}

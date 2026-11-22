@@ -1,0 +1,17 @@
+{
+ "name": "chat_err_logit_bias_key",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "logit_bias": {
+   "x": 1
+  }
+ }
+}

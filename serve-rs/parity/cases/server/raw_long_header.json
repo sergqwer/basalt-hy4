@@ -1,0 +1,4 @@
+{
+ "name": "raw_long_header",
+ "raw": "GET /health HTTP/1.1\r\nHost: {host}\r\nX-Long: {repeat:70000:b}\r\n\r\n"
+}

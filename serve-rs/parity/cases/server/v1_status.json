@@ -1,0 +1,5 @@
+{
+ "name": "v1_status",
+ "method": "GET",
+ "path": "/v1/status"
+}

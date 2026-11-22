@@ -1,0 +1,20 @@
+{
+ "name": "chat_nothink_stream",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "reasoning_effort": "none",
+  "stream": true
+ },
+ "script": [
+  "Direct."
+ ],
+ "stream": true
+}

@@ -1,0 +1,7 @@
+{
+ "name": "vram_no_ct",
+ "method": "POST",
+ "path": "/v1/vram",
+ "raw_body": "{}",
+ "headers": {}
+}

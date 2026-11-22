@@ -1,0 +1,7 @@
+{
+ "name": "start_bad_cors",
+ "server_args": [
+  "--cors-origin",
+  "chat.example.com"
+ ]
+}

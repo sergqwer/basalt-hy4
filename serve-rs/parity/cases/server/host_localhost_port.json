@@ -1,0 +1,8 @@
+{
+ "name": "host_localhost_port",
+ "method": "GET",
+ "path": "/health",
+ "headers": {
+  "Host": "localhost:{port}"
+ }
+}

@@ -1,0 +1,3 @@
+{"name": "info_routes", "mock": false, "requests": [
+ {"method": "GET", "path": "/health"}, {"method": "GET", "path": "/props"}, {"method": "GET", "path": "/v1/models"},
+ {"method": "GET", "path": "/v1/status"}, {"method": "GET", "path": "/metrics"}, {"method": "GET", "path": "/slots"}]}

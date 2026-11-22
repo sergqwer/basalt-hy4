@@ -1,0 +1,9 @@
+{
+ "name": "load_own_origin",
+ "method": "POST",
+ "path": "/load",
+ "body": {},
+ "headers": {
+  "Origin": "http://127.0.0.1:{port}"
+ }
+}

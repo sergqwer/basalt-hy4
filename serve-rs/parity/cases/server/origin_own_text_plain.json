@@ -1,0 +1,18 @@
+{
+ "name": "origin_own_text_plain",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ "headers": {
+  "Origin": "http://localhost:{port}",
+  "Content-Type": "text/plain"
+ }
+}

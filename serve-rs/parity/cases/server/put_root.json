@@ -1,0 +1,6 @@
+{
+ "name": "put_root",
+ "method": "PUT",
+ "path": "/",
+ "body": {}
+}

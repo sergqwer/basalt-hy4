@@ -1,0 +1,4 @@
+{
+ "name": "raw_two_hosts",
+ "raw": "GET /health HTTP/1.1\r\nHost: {host}\r\nHost: evil.com\r\n\r\n"
+}

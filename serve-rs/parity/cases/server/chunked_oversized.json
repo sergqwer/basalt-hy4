@@ -1,0 +1,15 @@
+{
+ "name": "chunked_oversized",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "200000\r\nabc",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": null,
+  "Transfer-Encoding": "chunked"
+ },
+ "server_args": [
+  "--max-payload-mib",
+  "1"
+ ]
+}

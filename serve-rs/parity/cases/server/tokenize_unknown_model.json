@@ -1,0 +1,9 @@
+{
+ "name": "tokenize_unknown_model",
+ "method": "POST",
+ "path": "/tokenize",
+ "body": {
+  "content": "x",
+  "model": "nope"
+ }
+}

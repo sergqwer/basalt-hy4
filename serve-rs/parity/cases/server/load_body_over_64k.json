@@ -1,0 +1,9 @@
+{
+ "name": "load_body_over_64k",
+ "method": "POST",
+ "path": "/load",
+ "raw_body": "{repeat:70000:a}",
+ "headers": {
+  "Content-Type": "application/json"
+ }
+}

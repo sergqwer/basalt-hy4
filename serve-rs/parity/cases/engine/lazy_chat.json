@@ -1,0 +1,3 @@
+{"name": "lazy_chat", "mock": false, "server_args": ["--lazy"], "requests": [
+ {"method": "GET", "path": "/health"},
+ {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "tiny-fake", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}}]}

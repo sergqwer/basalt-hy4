@@ -11,11 +11,13 @@
 
 namespace basalt::program::cli {
 
-/// `basalt serve --config FILE` or `basalt serve MODEL.basalt [--python PY] [server args...]`: runs the Python server
-/// over this binary.  The server gets `--engine-bin` and what was typed; a MODEL.basalt argument stands for `--model MODEL.basalt`.
+/// `basalt serve --config FILE` or `basalt serve MODEL.basalt [--python PY] [--server python|rust] [server args...]`:
+/// runs the server over this binary: the Python one (serve/, the default) or its Rust port (serve-rs: basalt-serve
+/// beside this binary or in serve-rs/target/{release,debug}), with the same arguments.  The server gets `--engine-bin` and what was typed; a MODEL.basalt argument stands for `--model MODEL.basalt`.
 /// Only returns on failure.
 int serve_subcommand(int argc, char** argv) {
     std::string python;
+    std::string server = "python";
     std::vector<std::string> extra;
     bool have_model = false;
     // the working directory changes below: the paths the server reads must not depend on it
@@ -34,6 +36,13 @@ int serve_subcommand(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--python") python = value();
+        else if (a == "--server") {
+            server = value();
+            if (server != "python" && server != "rust") {
+                basalt::log::error("basalt serve", "--server: python or rust, not %s", server.c_str());
+                std::exit(2);
+            }
+        }
         else if (a == "--model") { extra.insert(extra.end(), {a, absolute(value())}); have_model = true; }
         else if (a == "--config") extra.insert(extra.end(), {a, absolute(value())});
         // only the first argument can be MODEL.basalt; a later bare word is the value of the option before it
@@ -41,24 +50,48 @@ int serve_subcommand(int argc, char** argv) {
         else extra.push_back(a);
     }
     if (extra.empty()) {
-        basalt::log::error("basalt", "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [server args...]");
+        basalt::log::error("basalt", "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [--server python|rust] [server args...]");
         return 2;
     }
     const std::string exe = basalt::platform::module_path();
     if (exe.empty()) { basalt::log::error("basalt serve", "cannot find this binary"); return 1; }
     const std::string src_dir = basalt::platform::install_root();
     if (src_dir.empty()) { basalt::log::error("basalt serve", "cannot find the directory above this binary"); return 1; }
-    if (python.empty()) python = basalt::platform::python_interpreter(src_dir);
+    std::string program;
+    if (server == "rust") {
+#ifdef _WIN32
+        const char* name = "basalt-serve.exe";
+        const char sep = '\\';
+#else
+        const char* name = "basalt-serve";
+        const char sep = '/';
+#endif
+        const std::string exe_dir = exe.substr(0, exe.find_last_of("/\\"));
+        for (const std::string& dir : {exe_dir, src_dir + sep + "serve-rs" + sep + "target" + sep + "release",
+                                       src_dir + sep + "serve-rs" + sep + "target" + sep + "debug"}) {
+            const std::string candidate = dir + sep + name;
+            uint64_t size = 0;
+            if (basalt::platform::file_size(candidate, size)) { program = candidate; break; }
+        }
+        if (program.empty()) {
+            basalt::log::error("basalt serve", "--server rust: %s not found beside %s or in %s%cserve-rs%ctarget", name,
+                               exe.c_str(), src_dir.c_str(), sep, sep);
+            return 1;
+        }
+    } else if (python.empty()) {
+        python = basalt::platform::python_interpreter(src_dir);
+    }
     if (basalt::platform::set_working_dir(src_dir) != 0) {
         basalt::log::error("basalt serve", "cannot enter %s", src_dir.c_str());
         return 1;
     }
-    std::vector<std::string> args = {python, "-m", "serve.server", "--engine-bin", exe};
+    std::vector<std::string> args = server == "rust" ? std::vector<std::string>{program, "--engine-bin", exe}
+                                                     : std::vector<std::string>{python, "-m", "serve.server", "--engine-bin", exe};
     args.insert(args.end(), extra.begin(), extra.end());
     // Does not return when it works. Windows has no exec, so this process waits for the server and ends with the
     // server's exit code. Reaching the line below means the server never started, and errno says why.
     basalt::platform::exec_replacing(args);
-    basalt::log::error("basalt serve", "cannot run %s: %s", python.c_str(), std::strerror(errno));
+    basalt::log::error("basalt serve", "cannot run %s: %s", args[0].c_str(), std::strerror(errno));
     return 1;
 }
 

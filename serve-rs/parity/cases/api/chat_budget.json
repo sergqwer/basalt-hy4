@@ -1,0 +1,19 @@
+{
+ "name": "chat_budget",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "reasoning_budget_tokens": 4,
+  "max_tokens": 200
+ },
+ "script": [
+  "a b c d e f g h i j k l m n o p</think>\n\nok"
+ ]
+}

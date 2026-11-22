@@ -1,0 +1,11 @@
+{
+ "name": "detokenize_partial",
+ "method": "POST",
+ "path": "/detokenize",
+ "body": {
+  "tokens": [
+   240,
+   159
+  ]
+ }
+}

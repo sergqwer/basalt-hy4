@@ -1,0 +1,27 @@
+{
+ "name": "unload_then_status",
+ "requests": [
+  {
+   "method": "POST",
+   "path": "/v1/unload",
+   "body": {}
+  },
+  {
+   "method": "GET",
+   "path": "/health"
+  },
+  {
+   "method": "GET",
+   "path": "/props"
+  },
+  {
+   "method": "POST",
+   "path": "/v1/load",
+   "body": {}
+  },
+  {
+   "method": "GET",
+   "path": "/health"
+  }
+ ]
+}

@@ -1,0 +1,14 @@
+{
+ "name": "resp_err_item_ref",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": [
+   {
+    "type": "item_reference",
+    "id": "x"
+   }
+  ]
+ }
+}

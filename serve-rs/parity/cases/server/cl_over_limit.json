@@ -1,0 +1,14 @@
+{
+ "name": "cl_over_limit",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "{}",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": "2097152"
+ },
+ "server_args": [
+  "--max-payload-mib",
+  "1"
+ ]
+}

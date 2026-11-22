@@ -1,0 +1,21 @@
+{
+ "name": "opt_effort_default",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ],
+ "server_args": [
+  "--reasoning-effort",
+  "low"
+ ]
+}

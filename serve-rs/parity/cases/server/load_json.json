@@ -1,0 +1,6 @@
+{
+ "name": "load_json",
+ "method": "POST",
+ "path": "/load",
+ "body": {}
+}

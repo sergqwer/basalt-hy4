@@ -1,0 +1,11 @@
+{
+ "name": "load_chunked",
+ "method": "POST",
+ "path": "/load",
+ "raw_body": "2\r\n{}\r\n0\r\n\r\n",
+ "headers": {
+  "Content-Type": "application/json",
+  "Content-Length": null,
+  "Transfer-Encoding": "chunked"
+ }
+}

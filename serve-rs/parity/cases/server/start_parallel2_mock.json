@@ -1,0 +1,7 @@
+{
+ "name": "start_parallel2_mock",
+ "server_args": [
+  "--parallel",
+  "2"
+ ]
+}

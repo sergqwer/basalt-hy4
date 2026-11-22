@@ -1,0 +1,7 @@
+{
+ "name": "start_missing_key_file",
+ "server_args": [
+  "--api-key-file",
+  "{fixtures}/nope.txt"
+ ]
+}

@@ -1,0 +1,9 @@
+{
+ "name": "empty_body",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "",
+ "headers": {
+  "Content-Type": "application/json"
+ }
+}

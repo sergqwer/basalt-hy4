@@ -1,0 +1,9 @@
+{
+ "name": "json_array",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "raw_body": "[1, 2]",
+ "headers": {
+  "Content-Type": "application/json"
+ }
+}

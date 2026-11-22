@@ -1,0 +1,8 @@
+{
+ "name": "answer_now_unknown_id",
+ "method": "POST",
+ "path": "/v1/answer_now",
+ "body": {
+  "request_id": "chatcmpl-doesnotexist00"
+ }
+}

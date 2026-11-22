@@ -1,0 +1,12 @@
+{
+ "name": "host_evil_with_key",
+ "method": "GET",
+ "path": "/health",
+ "server_args": [
+  "--api-key",
+  "k"
+ ],
+ "headers": {
+  "Host": "evil.com"
+ }
+}

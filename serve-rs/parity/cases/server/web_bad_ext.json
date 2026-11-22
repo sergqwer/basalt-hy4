@@ -1,0 +1,5 @@
+{
+ "name": "web_bad_ext",
+ "method": "GET",
+ "path": "/web/index.html"
+}

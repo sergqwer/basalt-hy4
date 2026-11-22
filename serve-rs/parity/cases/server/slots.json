@@ -1,0 +1,5 @@
+{
+ "name": "slots",
+ "method": "GET",
+ "path": "/slots"
+}

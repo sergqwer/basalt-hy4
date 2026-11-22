@@ -6,9 +6,11 @@
 namespace basalt::program::cli {
 
 void usage() {
-    basalt::log::raw("basalt serve --config FILE [--python PY] [server args...]\n"
-                 "basalt serve MODEL.basalt [--python PY] [server args...]\n"
-                 "    runs the Python server (serve/) over this binary: the server reads its options and the engine flags\n"
+    basalt::log::raw("basalt serve --config FILE [--python PY] [--server python|rust] [server args...]\n"
+                 "basalt serve MODEL.basalt [--python PY] [--server python|rust] [server args...]\n"
+                 "    runs the server over this binary - the Python one (serve/, the default) or, with --server rust, its\n"
+                 "    Rust port (basalt-serve beside this binary or in serve-rs/target/{release,debug}); it takes the same\n"
+                 "    arguments. The server reads its options and the engine flags\n"
                  "    from the config file and the command line (the model is the config's or MODEL.basalt, which stands\n"
                  "    for --model); --python defaults to .venv/bin/python in the source tree, else python3; the other\n"
                  "    arguments go to the server.  It runs in the source tree; --model and --config paths are made absolute.\n"

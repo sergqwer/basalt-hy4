@@ -1,0 +1,9 @@
+{
+ "name": "start_key_and_key_file",
+ "server_args": [
+  "--api-key",
+  "k",
+  "--api-key-file",
+  "{fixtures}/api_key.txt"
+ ]
+}

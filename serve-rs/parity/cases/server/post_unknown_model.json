@@ -1,0 +1,14 @@
+{
+ "name": "post_unknown_model",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "nope",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ }
+}

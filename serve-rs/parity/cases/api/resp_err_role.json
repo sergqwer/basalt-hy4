@@ -1,0 +1,15 @@
+{
+ "name": "resp_err_role",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": [
+   {
+    "type": "message",
+    "role": "wizard",
+    "content": "x"
+   }
+  ]
+ }
+}

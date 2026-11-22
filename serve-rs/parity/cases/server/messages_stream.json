@@ -1,0 +1,17 @@
+{
+ "name": "messages_stream",
+ "method": "POST",
+ "path": "/v1/messages",
+ "stream": true,
+ "body": {
+  "model": "basalt",
+  "max_tokens": 100,
+  "stream": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ }
+}

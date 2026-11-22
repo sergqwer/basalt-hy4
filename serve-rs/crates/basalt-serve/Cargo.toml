@@ -1,0 +1,22 @@
+[package]
+name = "basalt-serve"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "basalt-serve"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+regex.workspace = true
+serve-text.workspace = true
+serve-engine.workspace = true
+serve-api.workspace = true
+serve-http.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

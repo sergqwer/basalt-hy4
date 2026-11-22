@@ -1,0 +1,5 @@
+{
+ "name": "web_dotdot",
+ "method": "GET",
+ "path": "/web/../x"
+}

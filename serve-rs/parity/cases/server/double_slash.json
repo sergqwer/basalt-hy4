@@ -1,0 +1,5 @@
+{
+ "name": "double_slash",
+ "method": "GET",
+ "path": "//health"
+}

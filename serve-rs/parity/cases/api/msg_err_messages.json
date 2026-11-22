@@ -1,0 +1,10 @@
+{
+ "name": "msg_err_messages",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": "x"
+ }
+}

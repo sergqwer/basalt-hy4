@@ -1,0 +1,21 @@
+{
+ "name": "chat_logit_bias",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "logit_bias": {
+   "65": 5,
+   "66": -100
+  }
+ },
+ "script": [
+  "ok"
+ ]
+}

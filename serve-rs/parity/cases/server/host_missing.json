@@ -1,0 +1,8 @@
+{
+ "name": "host_missing",
+ "method": "GET",
+ "path": "/health",
+ "headers": {
+  "Host": null
+ }
+}

@@ -1,0 +1,5 @@
+{
+ "name": "web_js",
+ "method": "GET",
+ "path": "/web/app.js"
+}

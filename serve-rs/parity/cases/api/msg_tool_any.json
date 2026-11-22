@@ -1,0 +1,41 @@
+{
+ "name": "msg_tool_any",
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 64,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Weather",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "tool_choice": {
+   "type": "any"
+  }
+ },
+ "script": [
+  "x</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nKyiv\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
+ ]
+}

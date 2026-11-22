@@ -1,0 +1,23 @@
+{
+ "name": "chat_stop_list_stream",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "stop": [
+   "zzz",
+   "answer"
+  ],
+  "stream": true
+ },
+ "script": [
+  "Let me think about it.</think>\n\nThe answer is 4."
+ ],
+ "stream": true
+}

@@ -1,0 +1,7 @@
+{
+ "name": "start_bad_allowed_host",
+ "server_args": [
+  "--allowed-host",
+  "a b"
+ ]
+}

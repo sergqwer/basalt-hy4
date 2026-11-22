@@ -1,0 +1,12 @@
+{
+ "name": "cors_preflight_other_origin",
+ "method": "OPTIONS",
+ "path": "/v1/models",
+ "server_args": [
+  "--cors-origin",
+  "https://chat.example.com"
+ ],
+ "headers": {
+  "Origin": "https://other.example.com"
+ }
+}

@@ -1,0 +1,9 @@
+{
+ "name": "tokenize_no_special",
+ "method": "POST",
+ "path": "/tokenize",
+ "body": {
+  "content": "hi <|im_end|>",
+  "parse_special": false
+ }
+}

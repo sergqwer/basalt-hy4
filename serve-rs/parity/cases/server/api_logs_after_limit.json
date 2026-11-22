@@ -1,0 +1,5 @@
+{
+ "name": "api_logs_after_limit",
+ "method": "GET",
+ "path": "/api/logs?after=0&limit=5"
+}

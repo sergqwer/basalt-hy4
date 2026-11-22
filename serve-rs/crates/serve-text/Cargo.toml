@@ -1,0 +1,10 @@
+[package]
+name = "serve-text"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+regex.workspace = true
+fancy-regex = "0.14"
+unicode-general-category = "1"

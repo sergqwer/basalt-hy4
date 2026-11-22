@@ -1,0 +1,5 @@
+{
+ "name": "health_query",
+ "method": "GET",
+ "path": "/health?verbose=1&x"
+}

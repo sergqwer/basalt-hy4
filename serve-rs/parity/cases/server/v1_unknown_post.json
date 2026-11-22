@@ -1,0 +1,8 @@
+{
+ "name": "v1_unknown_post",
+ "method": "POST",
+ "path": "/v1/nope",
+ "body": {
+  "model": "basalt"
+ }
+}

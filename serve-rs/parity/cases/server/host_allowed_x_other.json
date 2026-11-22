@@ -1,0 +1,12 @@
+{
+ "name": "host_allowed_x_other",
+ "method": "GET",
+ "path": "/health",
+ "server_args": [
+  "--allowed-host",
+  "x"
+ ],
+ "headers": {
+  "Host": "y"
+ }
+}

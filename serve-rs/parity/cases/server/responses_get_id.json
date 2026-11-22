@@ -1,0 +1,6 @@
+{
+ "name": "responses_get_id",
+ "method": "POST",
+ "path": "/v1/responses/xyz",
+ "body": {}
+}

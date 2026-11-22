@@ -1,0 +1,9 @@
+{
+ "name": "tokenize_bad_parse_special",
+ "method": "POST",
+ "path": "/tokenize",
+ "body": {
+  "content": "x",
+  "parse_special": "no"
+ }
+}

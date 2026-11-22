@@ -1,0 +1,52 @@
+{
+ "name": "concurrent_chats",
+ "requests": [
+  {
+   "method": "GET",
+   "path": "/v1/status"
+  },
+  {
+   "method": "GET",
+   "path": "/slots"
+  },
+  {
+   "parallel": true,
+   "requests": [
+    {
+     "method": "POST",
+     "path": "/v1/chat/completions",
+     "body": {
+      "model": "basalt",
+      "messages": [
+       {
+        "role": "user",
+        "content": "hi"
+       }
+      ]
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/v1/chat/completions",
+     "body": {
+      "model": "basalt",
+      "messages": [
+       {
+        "role": "user",
+        "content": "hi"
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "method": "GET",
+   "path": "/slots"
+  },
+  {
+   "method": "GET",
+   "path": "/props"
+  }
+ ]
+}

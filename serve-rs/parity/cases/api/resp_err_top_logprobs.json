@@ -1,0 +1,10 @@
+{
+ "name": "resp_err_top_logprobs",
+ "method": "POST",
+ "path": "/v1/responses",
+ "body": {
+  "model": "basalt",
+  "input": "hi",
+  "top_logprobs": 50
+ }
+}

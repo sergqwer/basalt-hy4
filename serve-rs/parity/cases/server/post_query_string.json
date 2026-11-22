@@ -1,0 +1,15 @@
+{
+ "name": "post_query_string",
+ "method": "POST",
+ "path": "/v1/messages?beta=true",
+ "body": {
+  "model": "basalt",
+  "max_tokens": 50,
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ }
+}
