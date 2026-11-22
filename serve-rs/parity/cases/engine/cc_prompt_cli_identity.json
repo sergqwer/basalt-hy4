@@ -1,0 +1,17 @@
+{
+ "name": "cc_prompt_cli_identity",
+ "mock": false,
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "tiny-fake",
+  "max_tokens": 10,
+  "system": "x-anthropic-billing-header: cc_version=2.1.318.02d; cc_entrypoint=sdk-cli;You are Claude Code, Anthropic's official CLI for Claude.\n\n# Environment\nYou have been invoked in the following environment:\n - Primary working directory: D:\\x\n - The most recent Claude models are the Claude 5 family.\n\n# Plan mode\nDo not edit files yet.",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ }
+}

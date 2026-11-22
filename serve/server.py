@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
-from serve import ROOT, service  # noqa: E402
+from serve import ROOT, frontend, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
                           sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
@@ -340,6 +340,7 @@ def main() -> int:
     a = settings[0][0]                                  # the options every model shares read the same in each
     multi = len(settings) > 1
     service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
+    frontend.CLAUDE_CODE_PROMPT = a.claude_code_prompt
     logs = LogBuffer()                                  # this process's and the engine's output
     sys.stdout, sys.stderr = (TeeStream(ColorStream.wrap(sys.stdout), logs, "srv"),
                               TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))

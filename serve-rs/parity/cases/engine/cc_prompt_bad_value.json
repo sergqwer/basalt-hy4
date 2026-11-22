@@ -1,0 +1,1 @@
+{"name": "cc_prompt_bad_value", "mock": false, "server_args": ["--claude-code-prompt", "bogus"]}

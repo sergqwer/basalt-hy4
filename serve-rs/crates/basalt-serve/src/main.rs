@@ -523,6 +523,8 @@ fn main() {
     let multi = settings.len() > 1;
     serve_api::service::DEBUG.store(a0.b("debug"), std::sync::atomic::Ordering::SeqCst);
     engine_process::REQUEST_LINES.store(a0.b("request_lines"), std::sync::atomic::Ordering::SeqCst);
+    serve_api::frontend::CLAUDE_CODE_LOCAL
+        .store(a0.s("claude_code_prompt").as_deref() != Some("as_sent"), std::sync::atomic::Ordering::SeqCst);
     let logs = Arc::new(LogBuffer::new());
     stdout::install(logs.clone());
     stdout::out(&tagged("legend", LEGEND));

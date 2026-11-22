@@ -602,6 +602,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="log one line per request and the raw model text after each reply")
     ap.add_argument("--request-lines", action="store_true",
                     help="echo the engine's per-request summary on stdout, for a supervisor that only sees this output")
+    ap.add_argument("--claude-code-prompt", choices=("local", "as_sent"), default="local",
+                    help="Claude Code's system prompt: local (the default) drops its Claude-only parts (identity, "
+                         "Anthropic's security policy, model ids, pronoun rule) and shortens its memory how-to, the "
+                         "same text every turn; as_sent passes it as sent")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded; load on first request; a sidecar image encoder is dropped, --vision dynamic stays")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")

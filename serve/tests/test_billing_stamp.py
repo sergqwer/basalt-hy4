@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from serve.engine.mock import MockEngine
+from serve import frontend
 from serve.frontend import ChatTemplate, anthropic_to_messages
 from serve.service import Service
 from serve.util.text import ByteTokenizer
@@ -15,6 +16,12 @@ CTX = 4096
 
 class ClaudeCodeBillingStamp(unittest.TestCase):
     HEADER = "x-anthropic-billing-header: cc_version=2.1.170.{v}; cc_entrypoint=sdk-cli; cch={c};"
+
+    def setUp(self):                            # the stamp as sent (--claude-code-prompt local drops the header)
+        self._mode, frontend.CLAUDE_CODE_PROMPT = frontend.CLAUDE_CODE_PROMPT, "as_sent"
+
+    def tearDown(self):
+        frontend.CLAUDE_CODE_PROMPT = self._mode
 
     def system_of(self, system):
         return anthropic_to_messages({"system": system, "messages": [{"role": "user", "content": "u"}]})[0][0]["content"]

@@ -1,0 +1,33 @@
+{
+ "name": "cc_prompt_no_memory_path",
+ "mock": false,
+ "method": "POST",
+ "path": "/v1/messages",
+ "body": {
+  "model": "tiny-fake",
+  "max_tokens": 10,
+  "system": [
+   {
+    "type": "text",
+    "text": "x-anthropic-billing-header: cc_version=2.1.318.02d; cc_entrypoint=sdk-cli;"
+   },
+   {
+    "type": "text",
+    "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    "cache_control": {
+     "type": "ephemeral"
+    }
+   },
+   {
+    "type": "text",
+    "text": "\n# Memory\nNo path here.\n\n# Next\nx"
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ }
+}
