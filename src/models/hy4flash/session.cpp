@@ -2813,6 +2813,12 @@ private:
                 grow_failed_ = true;
                 return false;
             }
+            // Inside a ringed prompt the ring's threads may still be issuing, and the copy stream still running, copies of
+            // the next layer's experts out of the tier's card slots: the shrink and the lend below move experts between
+            // slots and unmap the arena's tail, so a copy left in flight reads unmapped memory (an illegal access the next
+            // checked launch reports).
+            ring_join();
+            if (copy_) cudaStreamSynchronize(copy_);
             cudaStreamSynchronize(stream_);
             if (attempt == 0) tier_->shrink();
             else if (!tier_->partial_lend() || !tier_->lend(grow_bytes(target))) tier_->lend_all();
