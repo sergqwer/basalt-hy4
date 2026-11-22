@@ -47,6 +47,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <numeric>
 #include <cstring>
 #include <memory>
@@ -58,6 +59,86 @@
 #include <vector>
 #include <condition_variable>
 #include <mutex>
+
+
+// ---- GPTQ calibration dump (env-gated; tools in hy4-data/gptq). BASALT_GPTQ_DUMP=DIR enables it.
+//   BASALT_GPTQ_MOE_LAYERS=lo-hi  each moe() call appends to DIR/moe_lNN.bin a record: int64 {T, N, K, 3}, T x N fp16
+//                                 expert inputs (the latent after routed_down), T x K int32 expert ids, T x K f32 weights.
+//   BASALT_GPTQ_DENSE_LAYERS=a,b  each prompt gemm() of those layers (and the global tensors when -1 is listed) appends
+//                                 every BASALT_GPTQ_DENSE_STRIDE-th input row to DIR/dense/<tensor>.bin: int64 {T, N, 0, 3}
+//                                 then T x N fp16.
+namespace gptq_dump {
+inline const std::string& dir() {
+    static const std::string d = [] { const char* e = std::getenv("BASALT_GPTQ_DUMP"); return std::string(e ? e : ""); }();
+    return d;
+}
+inline bool moe_layer(int l) {
+    static const std::pair<int, int> r = [] {
+        const char* e = std::getenv("BASALT_GPTQ_MOE_LAYERS");
+        int lo = 1, hi = 0;
+        if (e && std::sscanf(e, "%d-%d", &lo, &hi) != 2) hi = lo = std::atoi(e);
+        return std::make_pair(lo, hi);
+    }();
+    return !dir().empty() && l >= r.first && l <= r.second;
+}
+inline bool dense_layer(int l) {
+    static const std::set<int> s = [] {
+        std::set<int> o;
+        const char* e = std::getenv("BASALT_GPTQ_DENSE_LAYERS");
+        for (const char* p = e; p && *p;) {
+            o.insert(std::atoi(p));
+            p = std::strchr(p, ',');
+            if (p) ++p;
+        }
+        return o;
+    }();
+    return !dir().empty() && s.count(l) > 0;
+}
+inline int dense_stride() {
+    static const int s = [] { const char* e = std::getenv("BASALT_GPTQ_DENSE_STRIDE"); return e ? std::max(1, std::atoi(e)) : 8; }();
+    return s;
+}
+inline uint16_t to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int32_t e = (int32_t) ((x >> 23) & 0xff) - 127 + 15;
+    uint32_t m = x & 0x7fffffu;
+    if (((x >> 23) & 0xff) == 0xff) return (uint16_t) (sign | 0x7c00u | (m ? 0x200u : 0));
+    if (e >= 31) return (uint16_t) (sign | 0x7c00u);
+    if (e <= 0) {
+        if (e < -10) return (uint16_t) sign;
+        m |= 0x800000u;
+        const int shift = 14 - e;
+        uint32_t h = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (h & 1))) ++h;
+        return (uint16_t) (sign | h);
+    }
+    uint32_t h = ((uint32_t) e << 10) | (m >> 13);
+    const uint32_t rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) ++h;
+    return (uint16_t) (sign | h);
+}
+inline void write_rows(const std::string& path, const float* host, int64_t T, int64_t N, int64_t K, const int32_t* ids,
+                       const float* w) {
+    std::FILE* f = std::fopen(path.c_str(), "ab");
+    if (!f) {
+        basalt::log::warn("basalt hy4flash", "gptq dump: cannot write %s", path.c_str());
+        return;
+    }
+    const int64_t hdr[4] = {T, N, K, 3};
+    std::fwrite(hdr, 8, 4, f);
+    std::vector<uint16_t> h((size_t) (T * N));
+    for (size_t i = 0; i < h.size(); ++i) h[i] = to_half(host[i]);
+    std::fwrite(h.data(), 2, h.size(), f);
+    if (K > 0) {
+        std::fwrite(ids, 4, (size_t) (T * K), f);
+        std::fwrite(w, 4, (size_t) (T * K), f);
+    }
+    std::fclose(f);
+}
+}  // namespace gptq_dump
 
 namespace basalt::models::hy4flash {
 namespace {
@@ -1106,8 +1187,22 @@ private:
     }
 
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
+    // GPTQ calibration: every dense_stride()-th input row of a prompt product of a dumped layer (gptq_dump above)
+    void dense_dump(const DevTensor* w, const float* x, int n_in, int R) {
+        std::string name = m_.name_of(w);
+        int layer = -1;
+        if (name.rfind("blk.", 0) == 0) layer = std::atoi(name.c_str() + 4);
+        if (name.empty() || !gptq_dump::dense_layer(layer)) return;
+        diag_sync();
+        const int st = gptq_dump::dense_stride();
+        const int T = (R + st - 1) / st;
+        std::vector<float> h((size_t) T * n_in);
+        cudaMemcpy2D(h.data(), (size_t) n_in * 4, x, (size_t) n_in * 4 * st, (size_t) n_in * 4, T, cudaMemcpyDeviceToHost);
+        gptq_dump::write_rows(gptq_dump::dir() + "/dense/" + name + ".bin", h.data(), T, n_in, 0, nullptr, nullptr);
+    }
     void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
         namespace mmq = basalt::prefill::mmq;
+        if (!gptq_dump::dir().empty() && R > kMaxWindow) dense_dump(w, x, n_in, R);
         if (R > kMaxWindow && mmq::built() && mmq::fits(w->type, n_out)) {   // a chunk: the tensor-core MMQ product, arows_ rows a time
             if (loaded_.insert({w->type, n_out}).second) mmq::load(w->type, n_out);
             for (int r0 = 0; r0 < R; r0 += arows_) {
@@ -2071,6 +2166,17 @@ private:
         }
         if (diag(l)) dump("moe_lat-" + std::to_string(l), lat_out_, (int64_t) R * L);
         if (diag(l)) dump("xlat-" + std::to_string(l), xlat_, (int64_t) R * L);
+        if (gptq_dump::moe_layer(l)) {   // GPTQ calibration: the experts' inputs, ids and weights of this call
+            diag_sync();
+            std::vector<float> hx((size_t) R * L), hw((size_t) R * K);
+            std::vector<int32_t> hi((size_t) R * K);
+            cudaMemcpy(hx.data(), xlat_, hx.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(hi.data(), ids_, hi.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(hw.data(), rw_, hw.size() * 4, cudaMemcpyDeviceToHost);
+            char nm[32];
+            std::snprintf(nm, sizeof nm, "/moe_l%02d.bin", l);
+            gptq_dump::write_rows(gptq_dump::dir() + nm, hx.data(), R, L, K, hi.data(), hw.data());
+        }
         moe_tail(l, R);
         return true;
     }

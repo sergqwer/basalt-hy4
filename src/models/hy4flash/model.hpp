@@ -44,6 +44,12 @@ public:
     /// Device tensor `blk.<layer>.<suffix>` or a global name; null when absent.
     const DevTensor* tensor(const std::string& name) const;
     const DevTensor* tensor(int layer, const char* suffix) const { return tensor("blk." + std::to_string(layer) + "." + suffix); }
+    /// The name of a device tensor (empty when it is not one of ours); for the GPTQ input dump.
+    std::string name_of(const DevTensor* t) const {
+        for (const auto& kv : dev_)
+            if (&kv.second == t) return kv.first;
+        return {};
+    }
     /// One token-embedding row, dequantised into `out` (n_embd floats).
     bool embedding_row(int32_t token, float* out) const;
     ngram::PleReader& engram_reader() const { return *engram_; }
