@@ -1,0 +1,22 @@
+{
+ "name": "opt_budget_request_off",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "reasoning_budget_tokens": 0
+ },
+ "script": [
+  "w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w</think>\n\nDone."
+ ],
+ "server_args": [
+  "--reasoning-budget-tokens",
+  "8"
+ ]
+}

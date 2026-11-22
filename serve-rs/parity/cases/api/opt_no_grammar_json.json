@@ -1,0 +1,20 @@
+{
+ "name": "opt_no_grammar_json",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "response_format": {
+   "type": "json_object"
+  }
+ },
+ "server_args": [
+  "--no-grammar"
+ ]
+}

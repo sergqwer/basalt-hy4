@@ -19,3 +19,7 @@ flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "webp", "tiff", "tga", "pnm", "qoi"] }
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }

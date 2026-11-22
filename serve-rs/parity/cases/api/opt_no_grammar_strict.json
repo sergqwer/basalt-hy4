@@ -1,0 +1,30 @@
+{
+ "name": "opt_no_grammar_strict",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "response_format": {
+   "type": "json_schema",
+   "json_schema": {
+    "name": "n",
+    "strict": true,
+    "schema": {
+     "type": "object"
+    }
+   }
+  }
+ },
+ "script": [
+  "x</think>\n\n{}"
+ ],
+ "server_args": [
+  "--no-grammar"
+ ]
+}

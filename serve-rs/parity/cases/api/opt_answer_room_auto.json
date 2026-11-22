@@ -1,0 +1,22 @@
+{
+ "name": "opt_answer_room_auto",
+ "method": "POST",
+ "path": "/v1/chat/completions",
+ "body": {
+  "model": "basalt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "max_tokens": 40
+ },
+ "script": [
+  "w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w</think>\n\nDone."
+ ],
+ "server_args": [
+  "--answer-room",
+  "auto"
+ ]
+}

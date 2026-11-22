@@ -180,6 +180,33 @@ case("tokenize_plain_special", "/tokenize", {"content": "<|im_end|>", "parse_spe
 case("detokenize_unicode", "/detokenize", {"tokens": [104, 195, 169, 240, 159, 152, 128]})
 case("detokenize_partial", "/detokenize", {"tokens": [240, 159]})
 
+# server options that change the API layer
+LONG = " ".join(["w"] * 60) + "</think>\n\nDone."
+LOOP = "a" * 40 + "</think>\n\nok"
+def opt(name, args, path="/v1/chat/completions", body=None, script=None, stream=False):
+    b = body or {"model": "basalt", "messages": U}
+    if stream:
+        b = {**b, "stream": True}
+    case("opt_" + name, path, b, script, stream, server_args=args)
+opt("fit_max_tokens", ["--fit-max-tokens"], body={"model": "basalt", "messages": U, "max_tokens": 10 ** 6}, script=THINK)
+opt("no_grammar_json", ["--no-grammar"], body={"model": "basalt", "messages": U, "response_format": {"type": "json_object"}})
+opt("no_grammar_strict", ["--no-grammar"], body={"model": "basalt", "messages": U, "response_format": {
+    "type": "json_schema", "json_schema": {"name": "n", "strict": True, "schema": {"type": "object"}}}}, script="x</think>\n\n{}")
+opt("budget_default", ["--reasoning-budget-tokens", "8"], script=LONG)
+opt("budget_default_stream", ["--reasoning-budget-tokens", "8"], script=LONG, stream=True)
+opt("budget_request_off", ["--reasoning-budget-tokens", "8"], body={"model": "basalt", "messages": U, "reasoning_budget_tokens": 0}, script=LONG)
+opt("answer_room", ["--answer-room", "20"], body={"model": "basalt", "messages": U, "max_tokens": 40}, script=LONG)
+opt("answer_room_auto", ["--answer-room", "auto"], body={"model": "basalt", "messages": U, "max_tokens": 40}, script=LONG)
+opt("effort_default", ["--reasoning-effort", "low"], script=THINK)
+opt("effort_none", ["--reasoning-effort", "none"], script="Direct.")
+opt("thinking_loop", ["--thinking-loop-tokens", "8"], script=LOOP)
+opt("thinking_loop_stream", ["--thinking-loop-tokens", "8"], script=LOOP, stream=True)
+opt("alias", ["--alias", "other"], body={"model": "other", "messages": U}, script=THINK)
+opt("image_no_vision_resp", [], path="/v1/responses", body={"model": "basalt", "input": [{"role": "user", "content": [
+    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}]}]})
+opt("image_no_vision_msg", [], path="/v1/messages", body={"model": "basalt", "max_tokens": 5, "messages": [{"role": "user", "content": [
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}]}]})
+
 for name, c in CASES.items():
     (HERE / f"{name}.json").write_text(json.dumps(c, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 print(len(CASES), "cases")

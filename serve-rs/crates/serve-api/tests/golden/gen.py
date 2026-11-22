@@ -226,15 +226,78 @@ def parser_cases(svc, kind):
     return out
 
 
+def office(kind):
+    import io
+    import zipfile
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    R = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    PR = 'xmlns="http://schemas.openxmlformats.org/package/2006/relationships"'
+    files = {}
+    if kind == "docx":
+        files["word/document.xml"] = (f'<?xml version="1.0"?><w:document {W}><w:body><w:p><w:r><w:t>Hello</w:t></w:r>'
+                                      '<w:r><w:tab/><w:t xml:space="preserve"> Word &amp; co</w:t></w:r></w:p>'
+                                      '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr></w:tbl>'
+                                      '<w:p><w:r><w:t>Line</w:t><w:br/><w:t>break</w:t></w:r></w:p></w:body></w:document>')
+    elif kind == "pptx":
+        A = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+        files["ppt/presentation.xml"] = (f'<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" {R}>'
+                                         '<p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId1"/></p:sldIdLst></p:presentation>')
+        files["ppt/_rels/presentation.xml.rels"] = (f'<Relationships {PR}><Relationship Id="rId1" Target="slides/slide2.xml"/>'
+                                                    '<Relationship Id="rId2" Target="slides/slide1.xml"/></Relationships>')
+        files["ppt/slides/slide1.xml"] = f'<s {A}><a:p><a:r><a:t>Title one</a:t></a:r></a:p><a:p><a:r><a:t> </a:t></a:r></a:p></s>'
+        files["ppt/slides/slide2.xml"] = f'<s {A}><a:p><a:r><a:t>Second </a:t></a:r><a:r><a:t>slide</a:t></a:r></a:p></s>'
+    else:
+        S = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        files["xl/workbook.xml"] = f'<workbook {S} {R}><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        files["xl/_rels/workbook.xml.rels"] = f'<Relationships {PR}><Relationship Id="rId1" Target="/xl/worksheets/sheet1.xml"/></Relationships>'
+        files["xl/sharedStrings.xml"] = f'<sst {S}><si><t>name</t></si><si><t>val</t></si></sst>'
+        files["xl/worksheets/sheet1.xml"] = (f'<worksheet {S}><sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c></row>'
+                                             '<row><c><v>3.5</v></c><c t="b"><v>1</v></c><c t="inlineStr"><is><t>inl</t></is></c></row>'
+                                             '<row><c/></row></sheetData></worksheet>')
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
+        for k, v in files.items():
+            z.writestr(k, v)
+    return b.getvalue()
+
+
+def document_cases():
+    import base64
+    from serve.api import documents
+    sys.path.insert(0, str(Path(__file__).parent))
+    import pdfs
+    out = []
+    blobs = {f"{k}.pdf": ("application/pdf", v) for k, v in pdfs.corpus().items()}
+    for k in ("docx", "pptx", "xlsx"):
+        blobs[f"a.{k}"] = ("", office(k))
+    blobs["notes.md"] = ("text/markdown", "# T\r\n\n\n\n\nbody  \n".encode())
+    blobs["bad.txt"] = ("text/plain", b"\xff\xfe")
+    blobs["fake.pdf"] = ("application/pdf", b"not a pdf")
+    blobs["broken.docx"] = ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", b"PK\x03\x04junk")
+    for name, (media, data) in blobs.items():
+        for pages in ([None, "1", "2-3,1", "9", "x", 1] if name == "many.pdf" else [None]):
+            part = {"type": "file", "file": {"filename": name,
+                                             "file_data": f"data:{media};base64,{base64.b64encode(data).decode()}"}}
+            if pages is not None:
+                part["file"]["pages"] = pages
+            try:
+                items = documents.expand_documents([{"type": "text", "text": "before"}, part])
+                res = {"items": items}
+            except Exception as e:  # noqa: BLE001
+                res = err(e)
+            out.append({"part": part, **res})
+    return out
+
+
 def main():
-    gold = {}
+    gold = {"documents": document_cases()}
     for kind in ("qwen", "hy4"):
         svc = service(kind)
         frontend._TOOL_ORDERS.clear()
         gold[kind] = {"chat": chat_cases(svc), "parser": parser_cases(svc, kind)}
     path = Path(__file__).with_name("golden.json")
     path.write_text(json.dumps(gold, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
-    print(path, sum(len(v["chat"]) + len(v["parser"]) for v in gold.values()), "cases")
+    print(path, sum(len(v["chat"]) + len(v["parser"]) for k, v in gold.items() if k != "documents") + len(gold["documents"]), "cases")
 
 
 if __name__ == "__main__":

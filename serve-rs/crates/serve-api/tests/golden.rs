@@ -236,3 +236,47 @@ fn hy4_template_matches_transformers() {
     eprintln!("hy4 transformers reference: {pass} pass, {fail} fail");
     assert_eq!(fail, 0);
 }
+
+/// Documents (gen.py document_cases): PDFs built by tests/golden/pdfs.py through pypdf, Office files, text, errors.
+#[test]
+fn documents_match_python() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/golden.json");
+    let gold: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let (mut pass, mut fail) = (0, 0);
+    for case in gold["documents"].as_array().unwrap() {
+        let content = vec![json!({"type": "text", "text": "before"}), case["part"].clone()];
+        let got = match serve_api::api::documents::expand_documents(&content) {
+            Ok(items) => json!({"items": items}),
+            Err(e) => json!({"message": e.message()}),
+        };
+        let want = if case.get("items").is_some() { json!({"items": case["items"]}) } else { json!({"message": case["message"]}) };
+        if same_but_png(&got, &want) {
+            pass += 1;
+        } else {
+            fail += 1;
+            eprintln!("--- {}\nwant {}\n got {}", case["part"]["file"]["filename"], want.to_string().chars().take(800).collect::<String>(),
+                      got.to_string().chars().take(800).collect::<String>());
+        }
+    }
+    eprintln!("documents: {pass} pass, {fail} fail");
+    assert_eq!(fail, 0);
+}
+
+/// Equal, with data:image/png URLs compared by their decoded pixels (Pillow's zlib stream is not reproduced).
+fn same_but_png(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) if x.starts_with("data:image/png;base64,") && y.starts_with("data:image/png;base64,") => {
+            use base64::Engine as _;
+            let px = |s: &str| {
+                let raw = base64::engine::general_purpose::STANDARD.decode(&s[22..]).ok()?;
+                image::load_from_memory(&raw).ok().map(|i| (i.width(), i.height(), i.to_rgba8().into_raw()))
+            };
+            px(x).is_some() && px(x) == px(y)
+        }
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_but_png(p, q)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|((k1, v1), (k2, v2))| k1 == k2 && same_but_png(v1, v2))
+        }
+        _ => a == b,
+    }
+}
