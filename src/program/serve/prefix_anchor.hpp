@@ -23,8 +23,11 @@ struct HeldMeet {
     bool respelled() const { return held > 0 && !exact; }
 };
 
-/// The held ids past the common prefix that may be respelled: a reply's worth.
-constexpr int64_t kRespellMax = 1 << 17;
+/// The held ids past the common prefix that may be respelled: a context's worth. The first respelled reply of a long
+/// conversation stays where it is while the conversation grows, so the held ids past it are the whole rest of the
+/// conversation, not one reply (a cap of 1 << 17 dropped every conversation longer than that past its first respelling
+/// back to the system prompt).
+constexpr int64_t kRespellMax = 1 << 20;
 
 /// `bytes(id)` is the raw bytes a token stands for (empty when it has none). An exact prefix meets a prompt only when it is
 /// shorter than it: the prompt's last token always starts the first window. With `respell` false only an exact

@@ -74,13 +74,30 @@ int main() {
     check(meet({10, 11, 3, 4}, {10, 11, 1, 2}, false).held == 0, "without a tokenizer table only a prefix meets");
     check(meet({10, 11, 3, 4}, {10, 11, 1, 12}).held == 0, "an id without bytes (a picture's): the prompt is as it is");
     check(meet({10, 11, 12, 4}, {10, 11, 1, 2}).held == 0, "a prompt id without bytes: the prompt is as it is");
-    {   // a reply of 1<<17 + 1 pieces is another conversation, not a reply sent back
+    {   // more than a context's worth of pieces past the shared start is not respelled
         Ids held = {10, 11}, prompt = {10, 11};
-        for (int i = 0; i < (1 << 17) + 1; ++i) held.push_back(5);
-        for (int i = 0; i < (1 << 17) + 1; ++i) prompt.push_back(5);
+        for (int64_t i = 0; i < basalt::program::serve::kRespellMax + 1; ++i) held.push_back(5);
+        for (int64_t i = 0; i < basalt::program::serve::kRespellMax + 1; ++i) prompt.push_back(5);
         prompt[2] = 3;
         prompt.push_back(4);
-        check(meet(prompt, held).held == 0, "more than a reply's worth past the shared start: as it is");
+        check(meet(prompt, held).held == 0, "more than a context's worth past the shared start: as it is");
+    }
+    {   // a long conversation: the first respelled reply 200K tokens back, the held ids past it still spell the prompt
+        Ids held = {10, 1, 2}, prompt = {10, 3};
+        for (int i = 0; i < 200000; ++i) held.push_back(6);
+        for (int i = 0; i < 200000; ++i) prompt.push_back(6);
+        prompt.push_back(4);
+        const HeldMeet m = meet(prompt, held);
+        check(m.held == (int64_t) held.size() && m.resume == (int64_t) prompt.size() - 1 && m.respelled(),
+              "a respelling far back in a long conversation still meets its next prompt");
+    }
+    {   // the live ids end in a reply sent back in other bytes; its checkpoint before that reply still meets the prompt
+        const Ids check_ids = {10, 1, 2, 6, 5};          // respelled ab, then a turn end
+        const Ids live = {10, 1, 2, 6, 5, 6, 6};         // ... and the reply the model wrote, cc
+        const Ids prompt = {10, 3, 6, 5, 1, 4};          // the reply came back as a: other bytes
+        check(meet(prompt, live).held == 0, "a reply sent back in other bytes: the live ids meet nothing");
+        const HeldMeet m = meet(prompt, check_ids);
+        check(m.held == 5 && m.resume == 4 && m.respelled(), "the checkpoint before it meets the prompt with its respelled ids");
     }
     {   // the slot that holds the conversation is told from one that does not
         const Ids prompt = {10, 11, 3, 4, 5, 6};

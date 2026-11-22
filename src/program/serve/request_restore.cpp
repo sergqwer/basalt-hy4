@@ -35,10 +35,24 @@ void Request::respell_prompt() {
         }
     };
     if (runtime_.live_ok && runtime_.live_imgs.empty()) offer(runtime_.live, own_slot);
+    // the live chain's checkpoints too: when the last reply came back in other bytes (the live ids meet nothing), the
+    // checkpoints still hold the earlier replies in the model's pieces, and only one that is respelled meets the prompt -
+    // else every checkpoint past the first respelled reply misses and the prompt is read from the system prompt on
+    bool from_check = false;
+    for (const ConvCheckpoint& c : runtime_.checks)
+        if (c.imgs.empty() && (int64_t) c.ids.size() > meet.held) {
+            const std::vector<int32_t>* had = best;
+            offer(c.ids, own_slot);
+            if (best != had) from_check = true;
+        }
     if (!in_slot && runtime_.slots_share_cells())
         for (int b = 0; b < (int) runtime_.bs.size(); ++b) {
             const BSlot& sl = runtime_.bs[(size_t) b];
-            if (b != own_slot && !sl.active && sl.cached && sl.cvec == want_cvec && sl.imgs.empty()) offer(sl.ids, b);
+            if (b != own_slot && !sl.active && sl.cached && sl.cvec == want_cvec && sl.imgs.empty()) {
+                const std::vector<int32_t>* had = best;
+                offer(sl.ids, b);
+                if (best != had) from_check = false;
+            }
         }
     if (best == nullptr || !meet.respelled()) return;
     const int64_t grown = meet.held + n - meet.resume;
@@ -48,9 +62,11 @@ void Request::respell_prompt() {
     splice_held(best->data(), meet, ids32.data(), n, ids);
     ids32 = std::vector<int32_t>(ids.begin(), ids.end());
     runtime_.cur = ids;
+    const std::string whose = from_slot >= 0 && from_slot != own_slot ? "slot " + std::to_string(from_slot)
+                              : from_check ? "a checkpoint of the live conversation (" + std::to_string(meet.held) + " tokens)"
+                                           : std::string("the live conversation");
     basalt::log::info("basalt serve", "prompt kept the ids of %s from token %lld on: the same bytes in other pieces "
-                      "(%+lld tokens)", from_slot < 0 ? "the live conversation" : ("slot " + std::to_string(from_slot)).c_str(),
-                      (long long) from, (long long) (grown - n));
+                      "(%+lld tokens)", whose.c_str(), (long long) from, (long long) (grown - n));
     n = grown;
 }
 
