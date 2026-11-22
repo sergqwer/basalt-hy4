@@ -1502,6 +1502,7 @@ private:
                 }
             });
         }
+        if (R > kMaxWindow && bsegs_.empty()) kv_dump(l, pos0, R, H, swa, selecting, counts);   // DIAG HY4_KV_DUMP
         }
         if (!(phases & (kOutput | kAttend))) return true;
         if (!(phases & kTail)) {   // each segment over its own cache
@@ -3228,6 +3229,58 @@ private:
 
     // diagnostic: a layer whose inner tensors are dumped (the first three)
     bool diag(int l) const { return !m_.diag_dump().empty() && l < 3; }
+
+    // DIAG HY4_KV_DUMP=DIR (with --kv f32): a prompt chunk's cache rows (the sparse layers and window layers 2/14/26/38), every
+    // 256th row's query rows, cells and indexer query, the pooled keys and the sinks, appended to DIR/<what>-<layer>.bin.
+    void kv_dump(int l, int64_t pos0, int R, int H, bool swa, bool selecting, const int32_t* counts) {
+        static const char* dir = std::getenv("HY4_KV_DUMP");
+        if (!dir || !f32() || (swa && l != 2 && l != 14 && l != 26 && l != 38)) return;
+        cudaStreamSynchronize(stream_);
+        const auto put = [&](const char* what, const void* p, size_t n, const char* mode = "ab") {
+            const std::string path = std::string(dir) + "/" + what + "-" + std::to_string(l) + ".bin";
+            if (std::FILE* f = std::fopen(path.c_str(), mode)) { std::fwrite(p, 1, n, f); std::fclose(f); }
+        };
+        const int ring = swa ? swa_ring() : 0;
+        std::vector<float> rows((size_t) R * kRowWidth);
+        for (int t = 0; t < R; ++t) {
+            const int64_t cell = ring ? (pos0 + t) % ring : pos0 + t;
+            cudaMemcpy(rows.data() + (size_t) t * kRowWidth, (const float*) cache_[(size_t) l] + (size_t) cell * kRowWidth, kRowWidth * 4, cudaMemcpyDeviceToHost);
+        }
+        put("rows", rows.data(), rows.size() * 4);
+        if (pos0 == 0) {
+            std::vector<float> s((size_t) H);
+            cudaMemcpy(s.data(), F(l, "attn_sinks.weight"), (size_t) H * 4, cudaMemcpyDeviceToHost);
+            put("sinks", s.data(), s.size() * 4, "wb");
+        }
+        const int D = g_.idx_dim, IH = g_.idx_heads;
+        for (int t = 0; t < R; ++t) {
+            const int64_t pos = pos0 + t;
+            if (pos % 256 != 255) continue;
+            std::vector<float> q((size_t) H * kRowWidth);
+            cudaMemcpy(q.data(), qcur_ + (size_t) t * H * kRowWidth, q.size() * 4, cudaMemcpyDeviceToHost);
+            const int32_t p32 = (int32_t) pos;
+            put("qpos", &p32, 4);
+            put("q", q.data(), q.size() * 4);
+            if (swa) continue;
+            std::vector<int32_t> cl((size_t) cells_stride_ + 1, -1);
+            cl[0] = counts[t];
+            const bool sel = selecting && (pos / g_.idx_pool) > (g_.idx_top_k / g_.idx_pool - (g_.idx_select_tail ? 1 : 0));
+            if (sel) cudaMemcpy(cl.data() + 1, icells_ + (size_t) t * cells_stride_, (size_t) cells_stride_ * 4, cudaMemcpyDeviceToHost);
+            put("cells", cl.data(), cl.size() * 4);
+            std::vector<float> iq((size_t) IH * D + IH, 0.f);
+            if (sel) {
+                cudaMemcpy(iq.data(), iq_ + (size_t) t * IH * D, (size_t) IH * D * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(iq.data() + (size_t) IH * D, iw_ + (size_t) t * IH, (size_t) IH * 4, cudaMemcpyDeviceToHost);
+            }
+            put("iq", iq.data(), iq.size() * 4);
+        }
+        if (!swa) {
+            const size_t pools = (size_t) ((pos0 + R) / g_.idx_pool);
+            std::vector<uint16_t> pk(pools * D);
+            cudaMemcpy(pk.data(), ipool_[(size_t) l], pk.size() * 2, cudaMemcpyDeviceToHost);
+            put("pool", pk.data(), pk.size() * 2, "wb");
+        }
+    }
 
     // diagnostic: the stream drained. A window's weighted sum waits on the device for the word join_moe writes, so the MoE is
     // joined first: a wait for the stream before it would never end.
