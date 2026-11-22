@@ -1390,7 +1390,10 @@ struct PumpSetup {
 
 /// ProcessEngine._pump: route the engine's stdout lines after READY.
 fn pump(mut r: BufReader<std::process::ChildStdout>, s: PumpSetup) {
-    let current = |s: &PumpSetup| s.me.upgrade().map(|m| m.st().gen == s.gen && m.st().proc_set).unwrap_or(false);
+    let current = |s: &PumpSetup| s.me.upgrade().map(|m| {
+        let st = m.st();
+        st.gen == s.gen && st.proc_set
+    }).unwrap_or(false);
     let mut buf = Vec::new();
     let mut last: Option<String> = None;
     loop {

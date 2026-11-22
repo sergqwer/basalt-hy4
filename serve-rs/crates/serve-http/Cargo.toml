@@ -9,6 +9,7 @@ regex.workspace = true
 serve-text.workspace = true
 serve-engine.workspace = true
 serve-api.workspace = true
+socket2 = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
