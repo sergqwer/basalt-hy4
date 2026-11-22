@@ -41,6 +41,63 @@ pub const QUIT_S: f64 = 20.0;
 pub const QUIT_DISK_S: f64 = 300.0;
 pub const PENALTY_LAST_N_DEFAULT: i64 = 64;
 pub const RESTART_RETRY_S: f64 = 15.0;
+// An engine that ended (a crash, a kill) gives its pinned RAM back some seconds after its process is gone: a restart
+// waits for the RAM free before that engine started (less RELEASE_SLACK), at most RELEASE_WAIT_S, and stops waiting
+// early once the free RAM has not grown for RELEASE_STEADY_S (another program took the rest meanwhile).
+pub const RELEASE_WAIT_S: f64 = 120.0;
+pub const RELEASE_SLACK: u64 = 4 << 30;
+pub const RELEASE_STEADY_S: f64 = 10.0;
+/// what counts as still growing between two readings
+pub const RELEASE_GROWTH: u64 = 256 << 20;
+
+/// Wait until the RAM an ended engine held is free again: `before` (the free RAM when it started) less RELEASE_SLACK,
+/// or a reading that has stopped growing for RELEASE_STEADY_S, at most `wait_s`. A start sized while a dead engine's
+/// pinned memory is still on its way back plans a RAM tier too small for the model. True when the RAM came back (or
+/// nothing was to wait for). `sleep`, `now` and `available` stand in for the clock and the reading in tests.
+pub fn await_release_with(before: Option<u64>, wait_s: f64, sleep: &dyn Fn(f64), now: &dyn Fn() -> f64,
+                          available: &dyn Fn() -> Option<u64>) -> bool {
+    let free = available();
+    let (Some(before), Some(mut free)) = (before, free) else { return true };
+    if free as f64 >= before as f64 - RELEASE_SLACK as f64 {
+        return true;
+    }
+    let gib = (1u64 << 30) as f64;
+    let f1 = serve_text::pyjson::py_fixed;
+    stdout::out(&format!("[server] waiting for the last engine's memory: {} GiB of RAM free, {} GiB before it started (at most {} s)",
+                         f1(free as f64 / gib, 1), f1(before as f64 / gib, 1), f1(wait_s, 0)));
+    let t0 = now();
+    let (mut peak, mut peak_t) = (free, t0);
+    loop {
+        sleep(0.5);
+        let (f, t) = (available(), now());
+        let Some(f) = f else { return true };
+        free = f;
+        if free as f64 >= before as f64 - RELEASE_SLACK as f64 {
+            stdout::out(&format!("[server] memory back: {} GiB of RAM free after {} s", f1(free as f64 / gib, 1), f1(t - t0, 1)));
+            return true;
+        }
+        if free as f64 > peak as f64 + RELEASE_GROWTH as f64 {
+            peak = free;
+            peak_t = t;
+        }
+        if t - peak_t >= RELEASE_STEADY_S {
+            stdout::out(&format!(
+                "[server] warning: the free RAM stays at {} GiB after {} s ({} GiB before the last engine started): another program holds the rest; starting anyway", f1(free as f64 / gib, 1), f1(t - t0, 1), f1(before as f64 / gib, 1)));
+            return false;
+        }
+        if t - t0 >= wait_s {
+            stdout::out(&format!("[server] warning: the last engine's memory is not back after {} s ({} GiB free); starting anyway",
+                                 f1(wait_s, 0), f1(free as f64 / gib, 1)));
+            return false;
+        }
+    }
+}
+
+fn await_release(before: Option<u64>) -> bool {
+    let t0 = std::time::Instant::now();
+    await_release_with(before, RELEASE_WAIT_S, &|s| std::thread::sleep(secs(s)), &|| t0.elapsed().as_secs_f64(),
+                       &crate::util::ram::available_bytes)
+}
 pub const ENC_TIMEOUT_S: f64 = 300.0;
 pub const BDONE_WAIT_S: f64 = 2.0;
 pub const YIELDS_MAX: usize = 2;
@@ -434,6 +491,7 @@ struct St {
     parked: Option<BTreeMap<u32, u64>>,
     restore_s: f64,
     max_context: i64,
+    ram_before: Option<u64>,
     known_ctx: i64,
     can_stop: bool,
     info: JsonMap,
@@ -525,6 +583,7 @@ impl ProcessEngine {
                 restore_s: 0.0,
                 max_context: 0,
                 known_ctx: 0,
+                ram_before: None,
                 can_stop: false,
                 info: Map::new(),
                 video: None,
@@ -771,6 +830,7 @@ impl Inner {
         }
         let sink = if log.is_some() { None } else { STDERR_SINK.lock().unwrap().clone() };
         self.st().max_context = 0;
+        self.st().ram_before = crate::util::ram::available_bytes(); // what a restart waits for once this process has ended
         let mut cmd = Command::new(&sp.bin);
         cmd.arg("--serve").args(&sp.args).stdin(Stdio::piped()).stdout(Stdio::piped());
         if let Some(c) = &sp.cwd {
@@ -1280,7 +1340,9 @@ impl Inner {
             st.load_status = Map::new();
         }
         let r = (|| {
-            self.close()?;
+            let before = self.st().ram_before;
+            self.close()?; // the process has exited here (or EngineStuck)
+            await_release(before);
             for i in 0..tries {
                 self.st().ended = true;
                 match self.init(false) {
@@ -1298,6 +1360,8 @@ impl Inner {
                         if i == tries - 1 {
                             return Err(e);
                         }
+                        let before = self.st().ram_before; // what the refused start had pinned
+                        await_release(before);
                         stdout::out(&format!(
                             "[server] warning: the engine did not start (try {} of {}), retrying in {} s",
                             i + 1, tries, serve_text::pyjson::py_format_g(RESTART_RETRY_S)));
@@ -3060,5 +3124,60 @@ mod tests {
         let c = conversation_facts("CONV parked=1 bytes=2 restored_ms=1.5");
         assert_eq!(c["restored_ms"], json!(1.5));
         assert_eq!(engine_line("a\r\n"), "a\n");
+    }
+}
+
+#[cfg(test)]
+mod release_wait_tests {
+    //! serve/tests/test_release_wait.py
+    use super::*;
+    use std::cell::RefCell;
+
+    const GIB: u64 = 1 << 30;
+
+    fn wait(before: Option<u64>, readings: Vec<Option<u64>>, wait_s: f64) -> (bool, f64) {
+        let t = RefCell::new(0.0f64);
+        let r = RefCell::new(readings);
+        let ok = await_release_with(before, wait_s, &|s| *t.borrow_mut() += s, &|| *t.borrow(), &|| {
+            let mut r = r.borrow_mut();
+            if r.len() > 1 { r.remove(0) } else { r[0] }
+        });
+        let elapsed = *t.borrow();
+        (ok, elapsed)
+    }
+
+    #[test]
+    fn nothing_to_wait_for() {
+        assert_eq!(wait(Some(110 * GIB), vec![Some(108 * GIB)], RELEASE_WAIT_S), (true, 0.0));
+    }
+
+    #[test]
+    fn waits_until_the_memory_is_back() {
+        let r = [53, 53, 60, 80, 100, 108].iter().map(|g| Some(g * GIB)).collect();
+        let (ok, t) = wait(Some(110 * GIB), r, RELEASE_WAIT_S);
+        assert!(ok);
+        assert!((t - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_reading_that_stopped_growing_ends_the_wait() {
+        let r = [53, 70, 90].iter().map(|g| Some(g * GIB)).collect();
+        let (ok, t) = wait(Some(110 * GIB), r, RELEASE_WAIT_S);
+        assert!(!ok);
+        assert!(t < RELEASE_WAIT_S && t >= RELEASE_STEADY_S);
+    }
+
+    #[test]
+    fn bounded() {
+        let r = (0..1000).map(|i| Some(50 * GIB + i * (RELEASE_GROWTH + 1))).collect();
+        let (ok, t) = wait(Some(500 * GIB), r, 20.0);
+        assert!(!ok);
+        assert!(t <= 21.0);
+    }
+
+    #[test]
+    fn no_reading() {
+        assert!(wait(None, vec![Some(53 * GIB)], RELEASE_WAIT_S).0);
+        assert!(wait(Some(110 * GIB), vec![None], RELEASE_WAIT_S).0);
     }
 }
