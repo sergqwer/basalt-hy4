@@ -1,0 +1,21 @@
+[package]
+name = "serve-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+regex.workspace = true
+indexmap.workspace = true
+libc.workspace = true
+serve-text.workspace = true
+serve-engine.workspace = true
+minijinja = { version = "3.1", features = ["loop_controls", "preserve_order", "json"] }
+minijinja-contrib = { version = "3.1", features = ["pycompat"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+sha2 = "0.10"
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "webp", "tiff", "tga", "pnm", "qoi"] }
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
