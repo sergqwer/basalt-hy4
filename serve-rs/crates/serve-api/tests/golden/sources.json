@@ -1,0 +1,490 @@
+{
+ "hosts": [
+  [
+   "example.com",
+   {
+    "ok": [
+     "example.com",
+     null
+    ]
+   }
+  ],
+  [
+   "Example.COM:8080",
+   {
+    "ok": [
+     "example.com",
+     8080
+    ]
+   }
+  ],
+  [
+   "[::1]",
+   {
+    "ok": [
+     "::1",
+     null
+    ]
+   }
+  ],
+  [
+   "[::1]:99",
+   {
+    "ok": [
+     "::1",
+     99
+    ]
+   }
+  ],
+  [
+   "1.2.3.4:80",
+   {
+    "ok": [
+     "1.2.3.4",
+     80
+    ]
+   }
+  ],
+  [
+   "a..b",
+   {
+    "error": "expected HOST or HOST:PORT, not 'a..b'",
+    "log": null
+   }
+  ],
+  [
+   ".x",
+   {
+    "error": "expected HOST or HOST:PORT, not '.x'",
+    "log": null
+   }
+  ],
+  [
+   "x.",
+   {
+    "error": "expected HOST or HOST:PORT, not 'x.'",
+    "log": null
+   }
+  ],
+  [
+   "x:0",
+   {
+    "error": "expected HOST or HOST:PORT, not 'x:0'",
+    "log": null
+   }
+  ],
+  [
+   "x:65536",
+   {
+    "error": "expected HOST or HOST:PORT, not 'x:65536'",
+    "log": null
+   }
+  ],
+  [
+   "[zz]",
+   {
+    "error": "expected HOST or HOST:PORT, not '[zz]'",
+    "log": null
+   }
+  ],
+  [
+   "",
+   {
+    "error": "expected HOST or HOST:PORT, not ''",
+    "log": null
+   }
+  ],
+  [
+   "  host  ",
+   {
+    "ok": [
+     "host",
+     null
+    ]
+   }
+  ],
+  [
+   "h:99999",
+   {
+    "error": "expected HOST or HOST:PORT, not 'h:99999'",
+    "log": null
+   }
+  ],
+  [
+   "*.x",
+   {
+    "error": "expected HOST or HOST:PORT, not '*.x'",
+    "log": null
+   }
+  ],
+  [
+   "xn--d1a.ua",
+   {
+    "ok": [
+     "xn--d1a.ua",
+     null
+    ]
+   }
+  ]
+ ],
+ "addrs": [
+  [
+   "8.8.8.8",
+   true
+  ],
+  [
+   "10.1.1.1",
+   false
+  ],
+  [
+   "100.64.0.1",
+   false
+  ],
+  [
+   "127.0.0.1",
+   false
+  ],
+  [
+   "192.168.1.1",
+   false
+  ],
+  [
+   "172.16.5.5",
+   false
+  ],
+  [
+   "224.0.0.1",
+   false
+  ],
+  [
+   "2606:4700::1111",
+   true
+  ],
+  [
+   "fe80::1",
+   false
+  ],
+  [
+   "::1",
+   false
+  ],
+  [
+   "2001:db8::1",
+   false
+  ],
+  [
+   "::ffff:8.8.8.8",
+   false
+  ],
+  [
+   "not an ip",
+   false
+  ],
+  [
+   "1.2.3",
+   false
+  ],
+  [
+   "2002::1",
+   false
+  ]
+ ],
+ "wpaths": [
+  [
+   "C:\\x\\y.png",
+   false
+  ],
+  [
+   "C:/x/y.png",
+   false
+  ],
+  [
+   "\\server\\share\\a.png",
+   true
+  ],
+  [
+   "C:x.png",
+   true
+  ],
+  [
+   "C:\\a\\CON.png",
+   true
+  ],
+  [
+   "C:\\a\\b.png:ads",
+   true
+  ],
+  [
+   "C:\\a\\b. ",
+   true
+  ],
+  [
+   "C:\\a\\..\\b.png",
+   false
+  ],
+  [
+   "C:\\a\\com1.txt",
+   true
+  ],
+  [
+   "C:\\a\\LPT¹",
+   true
+  ],
+  [
+   "relative.png",
+   true
+  ]
+ ],
+ "furls": [
+  [
+   "file:///C:/x/y.png",
+   {
+    "ok": "C:/x/y.png"
+   },
+   {
+    "ok": "C:/x/y.png"
+   }
+  ],
+  [
+   "file://C:/x/y.png",
+   {
+    "ok": "C:/x/y.png"
+   },
+   {
+    "ok": "C:/x/y.png"
+   }
+  ],
+  [
+   "file://localhost/etc/x",
+   {
+    "ok": "/etc/x"
+   },
+   {
+    "ok": "/etc/x"
+   }
+  ],
+  [
+   "file://host/x",
+   {
+    "error": "a file: URL may not name another host",
+    "log": null
+   },
+   {
+    "ok": "host/x"
+   }
+  ],
+  [
+   "file:/tmp/x%20y",
+   {
+    "ok": "/tmp/x y"
+   },
+   {
+    "ok": "/tmp/x y"
+   }
+  ],
+  [
+   "file:///tmp/a%25b",
+   {
+    "ok": "/tmp/a%b"
+   },
+   {
+    "ok": "/tmp/a%b"
+   }
+  ]
+ ],
+ "loads": [
+  [
+   "data:image/png;base64,aGVsbG8=",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "ok": "aGVsbG8="
+   }
+  ],
+  [
+   "data:image/png,aGVsbG8=",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "a data: URL must be base64",
+    "log": null
+   }
+  ],
+  [
+   "data:x",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "a data: URL needs a comma before its payload",
+    "log": null
+   }
+  ],
+  [
+   "data:;base64,",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "a data: URL's payload is empty",
+    "log": null
+   }
+  ],
+  [
+   "data:;base64,a$b",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "a data: URL's payload is not valid base64",
+    "log": null
+   }
+  ],
+  [
+   "data:;base64,aGVs bG8=\n",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "ok": "aGVsbG8="
+   }
+  ],
+  [
+   "http://example.com/a.png",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "image source refused by server policy: this client is not on the server's machine, so an http(s) URL needs --image-url-host HOST on the server. A data: URL always works.",
+    "log": "image source refused by server policy: peer='10.0.0.9' why=peer kind=url host='example.com'"
+   }
+  ],
+  [
+   "https://evil.com/a.png",
+   {
+    "url_hosts": [
+     [
+      "example.com",
+      null
+     ]
+    ],
+    "why": "host",
+    "peer": "1.1.1.1"
+   },
+   {
+    "error": "image source refused by server policy: the request's Host is not a loopback name, and the URL's host and port are not among those allowed with --image-url-host. A data: URL always works.",
+    "log": "image source refused by server policy: peer='1.1.1.1' why=host kind=url host='evil.com'"
+   }
+  ],
+  [
+   "http://user@example.com/a",
+   {
+    "url_hosts": [
+     [
+      "example.com",
+      null
+     ]
+    ],
+    "why": "host",
+    "peer": "1.1.1.1"
+   },
+   {
+    "error": "image source refused by server policy: the request's Host is not a loopback name, and the URL's host and port are not among those allowed with --image-url-host. A data: URL always works.",
+    "log": "image source refused by server policy: peer='1.1.1.1' why=host kind=url host='example.com'"
+   }
+  ],
+  [
+   "ftp://x/y",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "an image must be a data: URL, an http(s) URL or a local file path",
+    "log": null
+   }
+  ],
+  [
+   "C:/secret.png",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "image source refused by server policy: this client is not on the server's machine, so a file path needs --image-dir on the server. A data: URL always works.",
+    "log": "image source refused by server policy: peer='10.0.0.9' why=peer kind=path"
+   }
+  ],
+  [
+   "/etc/passwd",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "image source refused by server policy: this client is not on the server's machine, so a file path needs --image-dir on the server. A data: URL always works.",
+    "log": "image source refused by server policy: peer='10.0.0.9' why=peer kind=path"
+   }
+  ],
+  [
+   "",
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "an image must be a data: URL, an http(s) URL or a local file path",
+    "log": null
+   }
+  ],
+  [
+   5,
+   {
+    "url_hosts": [],
+    "why": "peer",
+    "peer": "10.0.0.9"
+   },
+   {
+    "error": "an image must be a data: URL, an http(s) URL or a local file path",
+    "log": null
+   }
+  ],
+  [
+   "http://exa mple.com/",
+   {
+    "url_hosts": [
+     [
+      "example.com",
+      null
+     ]
+    ],
+    "why": "host",
+    "peer": "1.1.1.1"
+   },
+   {
+    "error": "image source refused by server policy: the request's Host is not a loopback name, and the URL's host and port are not among those allowed with --image-url-host. A data: URL always works.",
+    "log": "image source refused by server policy: peer='1.1.1.1' why=host kind=url host='exa mple.com'"
+   }
+  ]
+ ]
+}
