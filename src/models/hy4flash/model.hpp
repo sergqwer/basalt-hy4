@@ -49,6 +49,12 @@ public:
     const DevTensor* tensor(int layer, const char* suffix) const { return tensor("blk." + std::to_string(layer) + "." + suffix); }
     /// The dense NVFP4 planes matrices (type 45): [K, rows] shapes, for the decode products' workspace.
     std::vector<const DevTensor*> planes_tensors() const;
+    /// The name of a device tensor (empty when it is not one of ours); for the GPTQ input dump.
+    std::string name_of(const DevTensor* t) const {
+        for (const auto& kv : dev_)
+            if (&kv.second == t) return kv.first;
+        return {};
+    }
     /// One token-embedding row, dequantised into `out` (n_embd floats).
     bool embedding_row(int32_t token, float* out) const;
     /// One token-embedding row as stored (embedding_type(): 8 = Q8_0, 30 = BF16), embedding_row_bytes() long; null for a
