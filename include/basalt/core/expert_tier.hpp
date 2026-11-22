@@ -83,6 +83,9 @@ struct ExpertTierSpec {
     /// Bytes of each segment the base arena of copies is mapped in, so a prompt or the caches can borrow part of it
     /// (ExpertTier::lend) and the rest keep their experts; 0: one allocation, which only lend_all gives up.
     uint64_t lend_segment = 0;
+    /// The model reads its prompts only from experts in RAM or on a card: a plan that leaves experts in the file is refused
+    /// at the start (with what is missing and why), instead of a start that serves until its first prompt fails.
+    bool ram_required = false;
     /// The prompt path's host buffers, which are allocated before the RAM tier is sized beside them. Each is optional.
     struct Host {
         std::function<bool(std::string&)> open;                 ///< before the RAM tier is sized

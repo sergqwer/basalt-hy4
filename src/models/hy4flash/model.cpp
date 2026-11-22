@@ -112,6 +112,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.share_max_tokens = 16384;
     s.share_stride = expert_stride();
     s.lend_segment = kExpertLendSegment;
+    s.ram_required = true;   // session.cpp's prompt path stages experts from a slot, pinned RAM or a second card only
     return s;
 }
 

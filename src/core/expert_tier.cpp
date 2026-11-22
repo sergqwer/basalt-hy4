@@ -182,6 +182,19 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         ram_slots = ram_in();
         homes_ = core::policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     }
+    if (s_.ram_required && homes_.file > 0) {
+        const double gib = 1073741824.0, missing = (double) homes_.file * (double) one_each_ram / gib;
+        char buf[640];
+        std::snprintf(buf, sizeof buf,
+                      "%d of %d experts per layer (%.1f GiB) do not fit in RAM: %.1f GiB free (%.1f GiB kept for the "
+                      "system%s), the RAM tier needs %.1f GiB more. This model runs only with every expert in RAM or on a "
+                      "card. Free that much RAM (an engine that just ended may still be giving its memory back: start "
+                      "again in a minute), or add a second card (--gpu 0,1)",
+                      homes_.file, n_expert_, missing, (double) avail / gib, (double) tier_reserve / gib,
+                      ram_given ? "; the RAM tier capped by --resident-budget-gib or --diag-tier-ram" : "", missing);
+        err = buf;
+        return false;
+    }
     const uint64_t ram_floor =
         tier_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
     if (homes_.peer == 0) {

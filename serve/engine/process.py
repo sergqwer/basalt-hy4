@@ -54,7 +54,7 @@ from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
 from serve.engine.slots import AdmissionQueue
 from serve.prompt import PromptText
-from serve.util import vram
+from serve.util import ram, vram
 from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
 
@@ -74,6 +74,13 @@ PP_SLACK = 3.0
 ENGINE_READY_S = 900.0
 QUIT_S = 20.0            # an engine's time to end after QUIT
 QUIT_DISK_S = 300.0      # ... with a disk tier: it writes the conversations it holds first
+# An engine that ended (a crash, a kill) gives its pinned RAM back some seconds after its process is gone: a restart
+# waits for the RAM free before that engine started (less RELEASE_SLACK), at most RELEASE_WAIT_S, and stops waiting
+# early once the free RAM has not grown for RELEASE_STEADY_S (another program took the rest meanwhile).
+RELEASE_WAIT_S = 120.0
+RELEASE_SLACK = 4 << 30
+RELEASE_STEADY_S = 10.0
+RELEASE_GROWTH = 256 << 20   # what counts as still growing between two readings
 
 
 def conversation_facts(line: str) -> dict:
@@ -315,6 +322,7 @@ class ProcessEngine:
             narrator.start()
         sink = None if log else ProcessEngine.stderr_sink
         self.max_context = 0                            # before the new process is visible: never its predecessor's
+        self.ram_before = ram.available_bytes()         # what a restart waits for once this process has ended
         try:
             self.proc = lifeline.popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE if sink else self.log,
@@ -604,7 +612,9 @@ class ProcessEngine:
         self.starting = True                     # prepare() answers 503 meanwhile
         self.loading, self.load_status = True, {}
         try:
-            self.close()
+            before = getattr(self, "ram_before", None)
+            self.close()                         # the process has exited here (or EngineStuck)
+            self.await_release(before)
             for i in range(tries):
                 # not alive until READY, so no request sees a half-started engine; __init__ clears `ended`
                 self.ended = True
@@ -620,6 +630,7 @@ class ProcessEngine:
                         pass
                     if i == tries - 1:
                         raise
+                    self.await_release(getattr(self, "ram_before", None))   # what the refused start had pinned
                     print(f"[server] warning: the engine did not start (try {i + 1} of {tries}), retrying in "
                           f"{self.RESTART_RETRY_S:g} s", flush=True)
                     time.sleep(self.RESTART_RETRY_S)
@@ -629,6 +640,42 @@ class ProcessEngine:
             with self.slot_cv:                   # wake the requests that waited through the restart
                 self.slot_cv.notify_all()
         self.info = {**info, **self.info}
+
+    def await_release(self, before: int | None, wait_s: float | None = None, sleep=time.sleep, now=time.monotonic,
+                      available=None) -> bool:
+        """Wait until the RAM an ended engine held is free again: `before` (the free RAM when it started) less
+        RELEASE_SLACK, or a reading that has stopped growing for RELEASE_STEADY_S, at most `wait_s` (RELEASE_WAIT_S).
+        A start sized while a dead engine's pinned memory is still on its way back plans a RAM tier too small for the
+        model. True when the RAM came back (or nothing was to wait for)."""
+        available = available or ram.available_bytes
+        wait_s = RELEASE_WAIT_S if wait_s is None else wait_s
+        free = available()
+        if before is None or free is None or free >= before - RELEASE_SLACK:
+            return True
+        gib = 1 << 30
+        print(f"[server] waiting for the last engine's memory: {free / gib:.1f} GiB of RAM free, "
+              f"{before / gib:.1f} GiB before it started (at most {wait_s:.0f} s)", flush=True)
+        t0 = now()
+        peak, peak_t = free, t0
+        while True:
+            sleep(0.5)
+            free, t = available(), now()
+            if free is None:
+                return True
+            if free >= before - RELEASE_SLACK:
+                print(f"[server] memory back: {free / gib:.1f} GiB of RAM free after {t - t0:.1f} s", flush=True)
+                return True
+            if free > peak + RELEASE_GROWTH:
+                peak, peak_t = free, t
+            if t - peak_t >= RELEASE_STEADY_S:
+                print(f"[server] warning: the free RAM stays at {free / gib:.1f} GiB after {t - t0:.1f} s "
+                      f"({before / gib:.1f} GiB before the last engine started): another program holds the rest; "
+                      f"starting anyway", flush=True)
+                return False
+            if t - t0 >= wait_s:
+                print(f"[server] warning: the last engine's memory is not back after {wait_s:.0f} s "
+                      f"({free / gib:.1f} GiB free); starting anyway", flush=True)
+                return False
 
     def _parse_done(self, line):
         f = line.split()
