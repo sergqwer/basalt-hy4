@@ -231,7 +231,7 @@ static void layout(const PeerShare::Dims& d, Peer&& peer, Host&& host) {
     peer((size_t) R * (size_t) d.n_ff * 2 * 4);                      // gu
     peer((size_t) R * (size_t) d.n_ff * 4);                          // h
     peer(mmq::q8_bytes(R, d.n_ff));                                  // hq
-    peer((size_t) R * 4);                                            // ident
+    peer(((size_t) R + (size_t) mmq::kIdsTail) * 4);                 // ident (MMQ reads a tile of ids past the last row)
     peer((size_t) d.max_rows * 4);                                   // tok
     peer((size_t) G * (size_t) (d.launch_experts + 1) * 4);          // bounds
     for (int s = 0; s < 2; ++s) {

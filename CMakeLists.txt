@@ -1227,6 +1227,11 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_mmq_nvfp4_test PRIVATE mmq ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_mmq_nvfp4_test COMMAND prefill_mmq_nvfp4_test --no-bench)
   set_tests_properties(prefill_mmq_nvfp4_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # an MMQ product's ids table ending at an unmapped granule: the kIdsTail entries the tile reads past the last row
+  add_executable(prefill_mmq_ids_tail_test tests/cuda/prefill_mmq_ids_tail_test.cpp)
+  target_link_libraries(prefill_mmq_ids_tail_test PRIVATE mmq core ggml_quants ${_gpu_runtime_target})
+  basalt_gpu_test(NAME prefill_mmq_ids_tail_test COMMAND prefill_mmq_ids_tail_test)
+  set_tests_properties(prefill_mmq_ids_tail_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 if(BUILD_TESTING)
   # NVFP4 block decode against the E2M1/UE4M3 spec (exhaustive) and ggml's row dequantizer; with an experts.bin,
