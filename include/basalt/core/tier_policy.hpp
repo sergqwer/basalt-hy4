@@ -39,6 +39,10 @@ inline void count_look(uint16_t& looks) {
     if (looks < kLookCap) ++looks;
 }
 
+/// The admission filter (TinyLFU's rule): a missed expert takes a slot only when it was looked up more lately than the
+/// expert that slot would evict, so a run of experts that come once does not churn the ones that recur.
+inline bool admits_over(uint16_t looks_new, uint16_t looks_victim) { return looks_new > looks_victim; }
+
 /// With victims picked by use: whether a slot whose expert has `looks_a` lookups and was last used at `stamp_a` gives way
 /// before one with `looks_b` and `stamp_b`. Fewer lookups first; the one used longest ago among equals.
 inline bool yields_before(uint16_t looks_a, uint64_t stamp_a, uint16_t looks_b, uint64_t stamp_b) {

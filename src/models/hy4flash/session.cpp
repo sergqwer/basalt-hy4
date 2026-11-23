@@ -619,6 +619,7 @@ public:
         stream_out("the prompt's end");
         if (tier_) {
             std::string e;
+            route_counts_end();
             if (lent_ && !tier_->reclaim(e, /*restore=*/true)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
             tier_->grow();   // the slots beside the base arena, if a short prompt took them
         }
@@ -812,7 +813,9 @@ public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
+        if (dp_on_ || dp_windows_ > 0) dp_reset();   // a request's decode profile ends with its next prompt
         if (!big_.rows) {   // a prompt starts
+            pcount_.clear();   // the re-seed counts this prompt's routing alone
             turn_report();
             if (tier_) tier_->forget_use();
         }
@@ -2615,6 +2618,7 @@ private:
         float *xa = X_, *xb = Xn_;
         if (g_.swa[(size_t) l]) {   // a sliding-window layer's attention is one graph: its row spans come from pos_d_ on the card
             const uint32_t seq0 = seq_want_;
+            dp_mark(kDpGap);
             if (!replay(l, R, 0, [&] {
                     bk::hc_mixes_plain(xa, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
                     bk::hc_pre_rms_norm(xa, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
@@ -2626,8 +2630,10 @@ private:
                     moe_head(l, R, false);
                 }, err))
                 return false;
+            dp_mark(kDpWin);
             seq_want_ = seq0 + 1;
         } else {
+        dp_mark(kDpGap);
         if (!replay(l, R, 0, [&] {
                 bk::hc_mixes_plain(xa, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
                 bk::hc_pre_rms_norm(xa, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
@@ -2635,7 +2641,9 @@ private:
                 attention_step(l, pos0, R, 0, e, kQuery);
             }, err))
             return false;
+        dp_mark(kDpSq);
         if (!attention_step(l, pos0, R, 0, err, kCells)) return false;
+        dp_mark(kDpScells);
         const uint32_t seq0 = seq_want_;
         if (!replay(l, R, 1, [&] {
                 std::string e;
@@ -2646,10 +2654,14 @@ private:
                 moe_head(l, R, false);
             }, err))
             return false;
+        dp_mark(kDpSatt);
         seq_want_ = seq0 + 1;   // the doorbell in the graph rings once a replay
         }
         std::swap(X_, Xn_);
+        const double th = now_ms();
         if (!moe_group(l, tl, lay, 0, R, err)) return false;
+        dp_host_moe_ += dp_on_ ? now_ms() - th : 0.0;
+        dp_mark(kDpMoe);
         xa = X_;
         xb = Xn_;
         if (!replay(l, R, 2, [&] {
@@ -2657,6 +2669,7 @@ private:
                 add_norm_hc_post(moe_out_, sh_, F(l, "post_ffw_norm.weight"), g_.rms_eps, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
             }, err))
             return false;
+        dp_mark(kDpUp);
         std::swap(X_, Xn_);
         return true;
     }
@@ -2770,6 +2783,10 @@ private:
                 return false;
             }
             by[(size_t) hid[(size_t) p]].push_back(p);
+        }
+        if (route_count_on()) {   // the prompt's routing per (layer, expert): the re-seed, DIAG HY4_ROUTE_COUNTS
+            if (pcount_.empty()) pcount_.assign((size_t) (g_.n_layers - g_.n_dense) * g_.n_expert, 0);
+            for (int e = 0; e < g_.n_expert; ++e) pcount_[(size_t) tl * g_.n_expert + e] += (int64_t) by[(size_t) e].size();
         }
         bool ringed = ring_ && R >= kRingRows && tier_ && ring_ready(tl, R);
         // the second card's experts: in a ringed chunk the ones planned with the ring copy (their staging may have started), else
@@ -3108,6 +3125,11 @@ private:
         }
         tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
         if (!await_ids(l, g0, err)) return false;
+        if (std::FILE* tf = route_trace()) {   // DIAG HY4_ROUTE_TRACE: int32 records {layer, rows, ids[rows * K]} of every decode group
+            const int32_t hd[2] = {tl, G};
+            std::fwrite(hd, 4, 2, tf);
+            std::fwrite(h_ids_, 4, (size_t) G * K, tf);
+        }
         int32_t uniq[kLookupK];
         int uidx[kLookupK], nu = 0;
         core::ExpertTier::Use* use = pd.use;
@@ -3345,6 +3367,7 @@ private:
             *pos_h_ = (int32_t) pos0;
             cudaMemcpyAsync(pos_d_, pos_h_, 4, cudaMemcpyHostToDevice, stream_);
         }
+        dp_window_begin(R);
         fill_streams(e_, E, R, X_, stream_);
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
         ring_join();
@@ -3355,7 +3378,9 @@ private:
             basalt::core::progress_tick();   // a layer issued: the watchdog tells a slow window from a stopped one
             ring_ahead(l, R);
             tl_mark(kTlEngram);
+            dp_mark(kDpGap);
             if (!engram(l, pos0, R, tokens, err)) return false;
+            dp_mark(kDpEngram);
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             if (graphs_ && l >= g_.n_dense) {
                 if (!(bsegs_.empty() ? layer_replayed(l, pos0, R, hc, err) : layer_batched(l, pos0, R, hc, err))) return false;
@@ -3403,6 +3428,7 @@ private:
             }
             std::swap(X_, Xn_);
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
+            dp_mark(kDpDense);
         }
         if (fused) {   // once a process: shows the fused boundaries ran
             static std::atomic<bool> told{false};
@@ -3410,6 +3436,7 @@ private:
                 basalt::log::info("basalt hy4flash", "hc_post_mix_norm: %lld launches after the first %d-row window", bk::hc_post_mix_norm_launches(), R);
         }
         tl_mark(kTlTail);
+        dp_mark(kDpGap);
         if (!join_moe(err)) return false;
         if (tier_) tier_->pump(-1, core::ExpertTier::kAllPieces);
         if (head_rows > 0) {
@@ -3872,6 +3899,108 @@ private:
     // from event pairs (the indexer, inside it the scores and the top-k select, the sparse and the window layers' attention, the
     // MoE; "rest" = wall - their sum). The events are read once at the chunk's end. Off by default; the output is unchanged.
     enum { kPtIndexer, kPtScore, kPtSelect, kPtAttSparse, kPtAttWin, kPtMoe, kPtDense, kPtAQkv, kPtAMeta, kPtAKb, kPtAPrep, kPtAVb, kPtAOut, kPtN };
+    // DIAG HY4_ROUTE_COUNTS=FILE: at a prompt's end, its routing counts (int64, MoE layers x experts) are written to FILE.
+    // Re-seed (default; HY4_RESEED=0 turns it off): the take-back after a lending prompt refills the returned slots with that
+    // prompt's most routed experts per layer (descending count) instead of the experts the lends evicted. Placement only: the
+    // outputs do not change. Measured at 128K (agent text): routed experts 61.3 -> 56.4 ms a window, decode 37.2 -> 39.5 tok/s.
+    // DIAG HY4_ROUTE_TRACE=FILE: the decode routing, appended (the format of the tier simulator, hy4-data/e3/sim_hy4_tier.py).
+    static std::FILE* route_trace() {
+        static std::FILE* f = [] { const char* e = std::getenv("HY4_ROUTE_TRACE"); return e && *e ? std::fopen(e, "ab") : nullptr; }();
+        return f;
+    }
+    static const char* route_count_file() { static const char* f = std::getenv("HY4_ROUTE_COUNTS"); return f; }
+    static bool reseed_on() { static const bool on = [] { const char* e = std::getenv("HY4_RESEED"); return !(e && *e == '0'); }(); return on; }
+    static bool route_count_on() { return route_count_file() != nullptr || reseed_on(); }
+    std::vector<int64_t> pcount_;
+    void route_counts_end() {
+        if (pcount_.empty()) return;
+        const int nl = g_.n_layers - g_.n_dense, ne = g_.n_expert;
+        if (const char* f = route_count_file()) {
+            if (std::FILE* fp = std::fopen(f, "wb")) {
+                std::fwrite(pcount_.data(), sizeof(int64_t), pcount_.size(), fp);
+                std::fclose(fp);
+            }
+        }
+        if (reseed_on() && tier_ && lent_) {   // only a lending prompt's take-back refills
+            int64_t placed = 0;
+            for (int l = 0; l < nl; ++l) {
+                std::vector<int32_t> order;
+                for (int e = 0; e < ne; ++e)
+                    if (pcount_[(size_t) l * ne + e] > 0) order.push_back(e);
+                const int64_t* c = pcount_.data() + (size_t) l * ne;
+                std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return c[a] > c[b]; });
+                placed += (int64_t) order.size();
+                tier_->set_recall(l, order);
+            }
+            basalt::log::info("basalt hy4flash", "HY4_RESEED: the take-back refills from the prompt's routing (%lld routed (layer, expert) pairs)",
+                              (long long) placed);
+        }
+        pcount_.clear();
+    }
+
+    // DIAG HY4_DECODE_PROFILE=N: a decode window's (graphs) stream in contiguous event steps, summed per kind and logged per
+    // window every N windows: window layers' graph (attention + MoE head), sparse layers' query graph, their cells (eager:
+    // meta, query/cache rows, indexer), their attention + output + MoE head graph, the routed experts (moe_group: the card's
+    // share and the waits for the CPU's), the up projection graph, the Engram, the dense layer, and the gaps (host, tail).
+    enum { kDpWin, kDpSq, kDpScells, kDpSatt, kDpMoe, kDpUp, kDpEngram, kDpDense, kDpGap, kDpN };
+    static int dp_every() { static const int n = [] { const char* e = std::getenv("HY4_DECODE_PROFILE"); return e ? std::atoi(e) : 0; }(); return n; }
+    std::vector<cudaEvent_t> dp_ev_;
+    std::vector<int> dp_cat_;   // the kind of the step each event closes (-1: opens)
+    double dp_ms_[kDpN] = {}, dp_host_moe_ = 0, dp_wall_ = 0, dp_t0_ = 0;
+    int64_t dp_windows_ = 0, dp_rows_ = 0;
+    bool dp_on_ = false;
+    void dp_mark(int cat) {
+        if (!dp_on_) return;
+        if (dp_cat_.size() == dp_ev_.size()) {
+            cudaEvent_t e = nullptr;
+            cudaEventCreate(&e);
+            dp_ev_.push_back(e);
+        }
+        cudaEventRecord(dp_ev_[dp_cat_.size()], stream_);
+        dp_cat_.push_back(cat);
+    }
+    void dp_flush() {   // the last window's steps (its tokens were read, so its events are done)
+        if (dp_cat_.size() > 1) {
+            cudaEventSynchronize(dp_ev_[dp_cat_.size() - 1]);
+            for (size_t k = 1; k < dp_cat_.size(); ++k) {
+                float x = 0;
+                if (dp_cat_[k] >= 0 && cudaEventElapsedTime(&x, dp_ev_[k - 1], dp_ev_[k]) == cudaSuccess) dp_ms_[dp_cat_[k]] += x;
+            }
+            dp_wall_ += now_ms() - dp_t0_;
+            ++dp_windows_;
+            if (dp_windows_ == 29 && tier_) tier_->report("after 29 windows");   // the shares over windows 1-29, for runs of any length
+            if (dp_windows_ % dp_every() == 0) {
+                const double n = (double) dp_windows_;
+                double gpu = 0;
+                for (double v : dp_ms_) gpu += v;
+                basalt::log::info("basalt hy4flash", "decode profile: %lld windows (%.2f rows), ms a window: window layers %.2f, sparse query %.2f, "
+                                  "sparse cells+indexer %.2f, sparse attention+head %.2f, routed experts %.2f (host in moe_group %.2f), up %.2f, "
+                                  "engram %.2f, dense %.2f, gaps %.2f; stream %.2f, host wall to the next window %.2f",
+                                  (long long) dp_windows_, dp_rows_ / n, dp_ms_[kDpWin] / n, dp_ms_[kDpSq] / n, dp_ms_[kDpScells] / n,
+                                  dp_ms_[kDpSatt] / n, dp_ms_[kDpMoe] / n, dp_host_moe_ / n, dp_ms_[kDpUp] / n, dp_ms_[kDpEngram] / n,
+                                  dp_ms_[kDpDense] / n, dp_ms_[kDpGap] / n, gpu / n, dp_wall_ / n);
+            }
+        }
+        dp_cat_.clear();
+    }
+    void dp_reset() {
+        if (dp_on_) dp_flush();
+        std::fill(std::begin(dp_ms_), std::end(dp_ms_), 0.0);
+        dp_host_moe_ = dp_wall_ = 0;
+        dp_windows_ = dp_rows_ = 0;
+        dp_on_ = false;
+    }
+    void dp_window_begin(int R) {
+        const bool on = dp_every() > 0 && graphs_ && bsegs_.empty();
+        if (on && !dp_on_ && dp_windows_ == 0 && tier_) tier_->report("decode start");   // the base the 29-window shares are read against
+        if (dp_on_) dp_flush();
+        dp_on_ = on;
+        if (!on) return;
+        dp_rows_ += R;
+        dp_t0_ = now_ms();
+        dp_mark(-1);
+    }
+
     // The stream's timeline in contiguous steps (each mark ends the step before it): every GPU ms of the chunk falls in one
     // step, idle waits included. Steps: the Engram, the hyper-connections and norms, the attention (its projections, the
     // indexer and the attention kernels), the dense layers' FFN, the MoE's head (router, routed_down, shared expert), the

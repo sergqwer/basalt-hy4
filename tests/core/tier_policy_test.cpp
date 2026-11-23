@@ -265,6 +265,9 @@ int main() {
         CHECK(yields_before(1, 100, 2, 50));   // fewer lookups first, however recent
         CHECK(yields_before(3, 40, 3, 50));    // the older among equals
         CHECK(!yields_before(3, 50, 3, 50));
+        CHECK(admits_over(3, 2));               // the admission filter: only a more looked-up expert takes the slot
+        CHECK(!admits_over(2, 2));
+        CHECK(!admits_over(1, 4));
         // 4 slots; expert 0 comes every 6th token and every other token brings a new expert: oldest-first always evicts expert 0
         // before it returns, by use it keeps the slot its second visit takes
         for (bool by_use : {false, true}) {
