@@ -2829,7 +2829,9 @@ private:
             d.dst = pair_rows_;
             d.ld_dst = L;
             mmq_.run(d, st);
-            cudaEventRecord(B.done, st);
+            // B.done frees the staging blobs for the copy stream (the unringed launches below); a ringed launch reads the ring,
+            // and its other inputs are ordered on st itself, so it records nothing: one call fewer per launch under WDDM
+            if (!ringed) cudaEventRecord(B.done, st);
             pos += rows;
         };
         if (ringed) {
