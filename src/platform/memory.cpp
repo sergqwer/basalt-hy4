@@ -887,6 +887,41 @@ void free_region(void* p, uint64_t bytes) {
     VirtualFree(p, 0, MEM_RELEASE);
 }
 
+bool video_memory(const char* luid, uint32_t node_mask, uint64_t& local_budget, uint64_t& local_usage, uint64_t& nonlocal_budget,
+                  uint64_t& nonlocal_usage) {
+    local_budget = local_usage = nonlocal_budget = nonlocal_usage = 0;
+    if (!luid || !node_mask) return false;
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory))) return false;
+    bool found = false;
+    for (UINT i = 0; !found; ++i) {
+        IDXGIAdapter1* adapter = nullptr;
+        if (factory->EnumAdapters1(i, &adapter) != S_OK) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        IDXGIAdapter3* a3 = nullptr;
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && std::memcmp(&desc.AdapterLuid, luid, 8) == 0 &&
+            SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3))) {
+            for (UINT node = 0; node < 32; ++node) {
+                if (!(node_mask & (uint32_t(1) << node))) continue;
+                DXGI_QUERY_VIDEO_MEMORY_INFO l{}, n{};
+                if (SUCCEEDED(a3->QueryVideoMemoryInfo(node, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &l))) {
+                    local_budget += l.Budget;
+                    local_usage += l.CurrentUsage;
+                }
+                if (SUCCEEDED(a3->QueryVideoMemoryInfo(node, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &n))) {
+                    nonlocal_budget += n.Budget;
+                    nonlocal_usage += n.CurrentUsage;
+                }
+                found = true;
+            }
+            a3->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
+}
+
 bool pin_budget(uint64_t& limit, std::string& why, const char* luid, uint32_t node_mask, bool shared_mapping) {
     limit = 0;
     why.clear();
@@ -1095,7 +1130,8 @@ void free_region(void* p, uint64_t bytes) {
     munmap(p, bytes);
 }
 
-bool pin_budget(uint64_t&, std::string&, const char*, uint32_t, bool) { return false; }   // no OS-side budget below the driver's own limit
+bool pin_budget(uint64_t&, std::string&, const char*, uint32_t, bool) { return false; }
+bool video_memory(const char*, uint32_t, uint64_t& a, uint64_t& b, uint64_t& c, uint64_t& d) { a = b = c = d = 0; return false; }   // no OS-side budget below the driver's own limit
 #endif
 
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,

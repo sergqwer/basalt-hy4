@@ -3529,11 +3529,15 @@ private:
         pt_used_ = 0;
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
+        static cudaDeviceProp prop = [] { cudaDeviceProp p{}; int d = 0; cudaGetDevice(&d); cudaGetDeviceProperties(&p, d); return p; }();
+        uint64_t lb = 0, lu = 0, nb = 0, nu = 0;
+        basalt::platform::video_memory(prop.luid, prop.luidDeviceNodeMask, lb, lu, nb, nu);
+        constexpr double G = 1073741824.0;
         basalt::log::info("basalt hy4flash", "prompt chunk %d: %d rows, %lld cells, %.0f ms wall; indexer %.0f (scores %.0f, select %.0f), attention sparse %.0f window %.0f, "
-                          "MoE %.0f, rest %.0f ms; %lld positions backed, tier %lld slots, %.2f GiB free",
+                          "MoE %.0f, rest %.0f ms; %lld positions backed, tier %lld slots, %.2f GiB free; DXGI local %.2f of %.2f GiB, non-local %.2f of %.2f GiB",
                           pt_chunk_++, rows, (long long) cells, wall, ms[kPtIndexer], ms[kPtScore], ms[kPtSelect], ms[kPtAttSparse], ms[kPtAttWin], ms[kPtMoe],
                           wall - ms[kPtIndexer] - ms[kPtAttSparse] - ms[kPtAttWin] - ms[kPtMoe], (long long) backed_, tier_ ? (long long) tier_->slots() : 0LL,
-                          fr / 1073741824.0);
+                          fr / 1073741824.0, lu / G, lb / G, nu / G, nb / G);
     }
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
