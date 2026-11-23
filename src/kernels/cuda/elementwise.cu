@@ -406,4 +406,94 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     sync_if_needed(stream, "rms_norm_weighted");
 }
 
+namespace {
+struct PatchU64 {
+    int32_t idx[kPatchU64];
+    unsigned long long val[kPatchU64];
+};
+__global__ void patch_u64_kernel(const PatchU64 p, int n, unsigned long long* dst) {
+    if ((int) threadIdx.x < n) dst[p.idx[threadIdx.x]] = p.val[threadIdx.x];
+}
+
+// One block, a thread per routed pair. A pair's group is the first pair routed to its expert; groups are numbered, and
+// their entries laid out, in the order of those first pairs.
+__global__ void window_plan_kernel(const int32_t* __restrict__ ids, const unsigned long long* __restrict__ tab, int n, int k,
+                                   int n_expert, unsigned long long* ptr, int32_t* start, int32_t* ng, int32_t* dst,
+                                   int32_t* tok) {
+    __shared__ int32_t e_s[128];
+    __shared__ int32_t lead_cnt[128];   // a group's first pair: its entry count, else 0
+    __shared__ unsigned long long a_s[128];
+    const int r = (int) threadIdx.x;
+    int32_t e = -1;
+    unsigned long long a = 0;
+    if (r < n) {
+        e = ids[r];
+        if (e >= 0 && e < n_expert) a = tab[e];
+        if (a == 0) e = -1;
+    }
+    e_s[r] = e;
+    a_s[r] = a;
+    __syncthreads();
+    int first = -1, rank = 0, cnt = 0;
+    if (e >= 0)
+        for (int j = 0; j < n; ++j)
+            if (e_s[j] == e) {
+                if (first < 0) first = j;
+                if (j < r) ++rank;
+                ++cnt;
+            }
+    lead_cnt[r] = (e >= 0 && first == r) ? cnt : 0;
+    __syncthreads();
+    if (e >= 0) {
+        int g = 0, st = 0;
+        for (int j = 0; j < first; ++j)
+            if (lead_cnt[j] > 0) {
+                ++g;
+                st += lead_cnt[j];
+            }
+        dst[st + rank] = r;
+        tok[st + rank] = r / k;
+        if (first == r) {
+            ptr[g] = a_s[r];
+            start[g] = st;
+        }
+    }
+    if (r == 0) {
+        int g = 0, ne = 0;
+        for (int j = 0; j < n; ++j)
+            if (lead_cnt[j] > 0) {
+                ++g;
+                ne += lead_cnt[j];
+            }
+        start[g] = ne;
+        ng[0] = g;
+    }
+}
+}  // namespace
+
+void patch_u64(const int32_t* idx, const unsigned long long* val, int n, unsigned long long* dst, void* stream) {
+    if (n <= 0) return;
+    if (n > kPatchU64) {
+        basalt::log::error("basalt", "patch_u64: %d pairs, at most %d", n, kPatchU64);
+        std::exit(1);
+    }
+    PatchU64 p;
+    for (int i = 0; i < n; ++i) {
+        p.idx[i] = idx[i];
+        p.val[i] = val[i];
+    }
+    patch_u64_kernel<<<1, kPatchU64, 0, (cudaStream_t) stream>>>(p, n, dst);
+    check_launch("patch_u64");
+}
+
+void window_plan(const int32_t* ids, const unsigned long long* tab, int n, int k, int n_expert, unsigned long long* ptr,
+                 int32_t* start, int32_t* ng, int32_t* dst, int32_t* tok, void* stream) {
+    if (n <= 0 || n > 128) {
+        basalt::log::error("basalt", "window_plan: %d routed pairs, at most 128", n);
+        std::exit(1);
+    }
+    window_plan_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, tab, n, k, n_expert, ptr, start, ng, dst, tok);
+    check_launch("window_plan");
+}
+
 }  // namespace basalt::kernels

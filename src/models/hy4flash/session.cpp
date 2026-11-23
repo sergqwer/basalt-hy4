@@ -47,6 +47,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <numeric>
 #include <cstring>
 #include <memory>
@@ -130,6 +131,7 @@ struct Scratch {
     float *iscore = nullptr, *ex_rows = nullptr;
     int32_t *iidx_meta = nullptr, *pos_d = nullptr, *pos_h = nullptr, *heads_ids = nullptr, *heads_bounds = nullptr, *bounds_tab = nullptr;
     void *attw = nullptr, *q8 = nullptr, *xq_n = nullptr, *ex_xq = nullptr, *ex_scr = nullptr, *ex_plan = nullptr, *ex_plan2 = nullptr;
+    void* ex_gplan = nullptr;   // BASALT_GPU_STEER: the plan a decode layer's card experts are given on the card
     void *xq1 = nullptr, *xq2 = nullptr;
     struct Staged {
         uint8_t* blobs = nullptr;
@@ -229,6 +231,14 @@ public:
                     cudaHostGetDevicePointer((void**) &d_words_, h_words_, 0) != cudaSuccess)
                     ok = false;
             }
+            if (const char* tv = std::getenv("BASALT_ROUTE_TRACE"); tv && *tv) prof_.trace = std::fopen(tv, "ab");
+            if (const char* pv = std::getenv("BASALT_DECODE_PROFILE"); pv && *pv && *pv != '0') {   // diagnostics only
+                if (cudaHostAlloc((void**) &prof_.h, (size_t) kProfLayers * 4 * 8, kMapped) == cudaSuccess &&
+                    cudaHostGetDevicePointer((void**) &prof_.d, prof_.h, 0) == cudaSuccess) {
+                    pinned_.push_back(prof_.h);
+                    prof_.on = true;
+                }
+            }
             if (cudaHostAlloc((void**) &stage_h_, kStageInts * 4, kMapped) != cudaSuccess) ok = false;
             else {
                 pinned_.push_back(stage_h_);
@@ -308,6 +318,7 @@ public:
         sc.ex_rows = f((int64_t) kLookupK * g_.n_latent);
         sc.ex_plan = alloc(sizeof(WindowPut), ok);
         sc.ex_plan2 = alloc(sizeof(WindowPlan), ok);
+        sc.ex_gplan = alloc(sizeof(WindowPlan), ok);
         // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
         const size_t stride = m_.expert_stride();
         for (Scratch::Staged& b : sc.stage) {
@@ -346,7 +357,7 @@ public:
     // The session's pointers into the shared scratch.
     void adopt(Scratch& sc) {
         iscore_ = sc.iscore; iidx_meta_ = sc.iidx_meta; pos_d_ = sc.pos_d; pos_h_ = sc.pos_h; attw_ = sc.attw; q8_ = sc.q8;
-        xq_n_ = sc.xq_n; ex_xq_ = sc.ex_xq; ex_scr_ = sc.ex_scr; ex_rows_ = sc.ex_rows; ex_plan_ = sc.ex_plan; ex_plan2_ = sc.ex_plan2;
+        xq_n_ = sc.xq_n; ex_xq_ = sc.ex_xq; ex_scr_ = sc.ex_scr; ex_rows_ = sc.ex_rows; ex_plan_ = sc.ex_plan; ex_plan2_ = sc.ex_plan2; ex_gplan_ = sc.ex_gplan;
         for (int i = 0; i < 2; ++i) {
             stage_[i].blobs = sc.stage[i].blobs;
             stage_[i].tok = sc.stage[i].tok;
@@ -629,6 +640,7 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
+        prof_t0 = prof_.on ? now_ms() : 0;
         // the lossy routing flags apply to decode windows only: prompts route as the model does
         struct Lossy {
             core::ExpertTier*& t;
@@ -656,7 +668,89 @@ public:
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the window failed"};
         turn_count(r.n_tokens);
+        if (prof_.on) prof_window(r.n_tokens, now_ms() - prof_t0);
+        if (prof_.trace) std::fflush(prof_.trace);
         return {};
+    }
+
+    // ---- the decode profile (BASALT_DECODE_PROFILE=1, diagnostics): per MoE layer of a window, host and card times around the
+    // router's ids and the CPU's share; a summary line every kProfEvery windows. The card stamps cost one extra wait kernel
+    // argument; nothing else changes on the card.
+    static constexpr int kProfLayers = 64, kProfEvery = 50;
+    struct Prof {
+        bool on = false, ready_first = false;
+        uint64_t *h = nullptr, *d = nullptr;   // mapped [layer][4]: card at the word, card past it
+        std::FILE* trace = nullptr;            // BASALT_ROUTE_TRACE
+        double enter[kProfLayers] = {}, ids[kProfLayers] = {}, cpu_at[kProfLayers] = {}, ret[kProfLayers] = {}, word_at[kProfLayers] = {};
+        bool late[kProfLayers] = {};
+        int n_cpu[kProfLayers] = {}, n_uniq[kProfLayers] = {}, n_fetch[kProfLayers] = {};
+        uint64_t bytes = 0;
+        int64_t promo0 = -1;   // the tier's slot copies at the line before
+        // sums over the windows since the last line
+        int64_t windows = 0, tokens = 0, layers = 0, cpu_layers = 0, late_n = 0, cpu_exp = 0, uniq = 0, fetch = 0, gsteer = 0;
+        double wall = 0, wait_ids = 0, steer = 0, launch = 0, cpu = 0, stall = 0, host_gap = 0, fetch_stall = 0;
+    } prof_;
+    double prof_t0 = 0;
+    void prof_window(int n_tokens, double wall) {
+        Prof& p = prof_;
+        const int nl = std::min(kProfLayers, g_.n_layers - g_.n_dense);
+        double prev_ret = 0;
+        for (int tl = 0; tl < nl; ++tl) {
+            if (p.ids[tl] == 0) continue;
+            ++p.layers;
+            p.wait_ids += p.ids[tl] - p.enter[tl];
+            p.steer += p.cpu_at[tl] - p.ids[tl];
+            p.launch += p.ret[tl] - p.cpu_at[tl];
+            if (prev_ret > 0) p.host_gap += p.enter[tl] - prev_ret;   // the host between two layers' MoE (next layer's launches, the join)
+            prev_ret = p.ret[tl];
+            p.late_n += p.late[tl];
+            p.uniq += p.n_uniq[tl];
+            p.fetch += p.n_fetch[tl];
+            if (p.word_at[tl] > 0) {
+                ++p.cpu_layers;
+                p.cpu_exp += p.n_cpu[tl];
+                p.cpu += p.word_at[tl] - p.cpu_at[tl];
+                volatile uint64_t* s = p.h + (size_t) tl * 4;
+                if (s[0] && s[1] >= s[0]) p.stall += (double) (s[1] - s[0]) * 1e-6;
+                s[0] = s[1] = 0;
+            }
+            if (volatile uint64_t* s = p.h + (size_t) tl * 4; s[2] && s[3] >= s[2]) {
+                p.fetch_stall += (double) (s[3] - s[2]) * 1e-6;
+                s[2] = s[3] = 0;
+            }
+            p.ids[tl] = 0;
+        }
+        ++p.windows;
+        p.tokens += n_tokens;
+        p.wall += wall;
+        if (p.windows < kProfEvery) return;
+        const double w = (double) p.windows;
+        const int64_t promo = tier_ ? tier_->promoted() : 0;
+        const double copies = p.promo0 >= 0 ? (double) (promo - p.promo0) / w : 0.0;   // slot copies a window (fetches with a slot + promotions)
+        basalt::log::info("basalt hy4flash",
+                          "decode RAM reads, a window: CPU %.1f MB (%.1f GB/s over its share), bus fetches %.1f MB, slot copies %.1f "
+                          "(fetches that took a slot plus promotions, %.1f MB); CPU / bus split of the misses %.0f%% / %.0f%%",
+                          p.cpu_exp / w * p.bytes / 1e6, p.cpu > 0 ? (double) p.cpu_exp * (double) p.bytes / (p.cpu * 1e6) : 0.0,
+                          p.fetch / w * p.bytes / 1e6, copies, copies * p.bytes / 1e6,
+                          p.cpu_exp + p.fetch ? 100.0 * p.cpu_exp / (double) (p.cpu_exp + p.fetch) : 0.0,
+                          p.cpu_exp + p.fetch ? 100.0 * p.fetch / (double) (p.cpu_exp + p.fetch) : 0.0);
+        basalt::log::info("basalt hy4flash",
+                          "decode profile, %lld windows of %.2f rows, ms a window: wall %.2f | host: waiting for ids %.2f, lookup+CPU start "
+                          "%.2f, plans+launches %.2f, between layers %.2f | CPU share %.2f (%.1f layers, %.1f experts, %.1f GB/s) | card "
+                          "held at the word %.2f, at the bus fetch %.2f | ids ready on arrival %.0f%% | distinct experts %.1f, fetched %.1f | "
+                          "layers planned on the card %.1f",
+                          (long long) p.windows, p.tokens / w, p.wall / w, p.wait_ids / w, p.steer / w, p.launch / w, p.host_gap / w,
+                          p.cpu / w, p.cpu_layers / w, p.cpu_exp / w, p.cpu > 0 ? (double) p.cpu_exp * (double) p.bytes / (p.cpu * 1e6) : 0.0,
+                          p.stall / w, p.fetch_stall / w, p.layers ? 100.0 * p.late_n / p.layers : 0.0, p.uniq / w, p.fetch / w, p.gsteer / w);
+        const bool on = p.on;
+        uint64_t *h = p.h, *d = p.d;
+        std::FILE* trace = p.trace;
+        p = Prof{};
+        p.promo0 = promo;
+        p.trace = trace;
+        p.on = on;
+        p.h = h;
+        p.d = d;
     }
 
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
@@ -1957,6 +2051,31 @@ private:
             return k >= 0 ? early_[(size_t) k].raw.data() + (size_t) e * n_cols * W : pf->raw.data() + (size_t) pf->at[(size_t) (off + t)] * n_cols * W;
         };
         const double norm_start = time_prompt ? now_ms() : 0;
+        // the codes need a fifth more room in the rows' buffer (arows_ rows of n_embd floats) than the rows themselves
+        if (engram_gpu_ && (int64_t) R * n_cols * W * 5 <= (int64_t) arows_ * g_.n_embd * 4) {   // BASALT_ENGRAM_GPU: the card decodes and norms the codes
+            if (!d_elut_) {
+                if (cudaMalloc((void**) &d_elut_, 256 * 4) != cudaSuccess) { err = "no device memory for the Engram table"; return false; }
+                bufs_.push_back(d_elut_);
+                cudaMemcpy(d_elut_, lut.data(), 256 * 4, cudaMemcpyHostToDevice);
+            }
+            const size_t rb = (size_t) n_cols * W;   // a token's code bytes
+            uint8_t* hraw = (uint8_t*) h_erows_;
+            for (int t = 0; t < R; ++t) std::memcpy(hraw + (size_t) t * rb, rows_of(t), rb);
+            // the codes ride in the second half of the rows' device buffer (it is sized for n_embd floats a row, the rows take n_cols * W)
+            uint8_t* draw = (uint8_t*) (erows_ + (size_t) R * rb);
+            put_f32((float*) draw, (const float*) hraw, (int64_t) ((R * rb + 3) / 4));
+            put_f32(evalid_, h_evalid_, R);
+            engram_rows(draw, d_elut_, (const float*) T(l, "engram_lookup_norm.weight")->ptr, evalid_, R, n_cols, W, erows_, stream_);
+            if (time_prompt) t_eng_norm_ms_ += now_ms() - norm_start;
+            if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
+            cudaEventRecord(eng_ev_, stream_);
+            gemm(T(l, "engram_kv.weight"), erows_, ekv_, n_cols * W, 5 * g_.n_embd, R);
+            EngramArgs a;
+            a.n_embd = g_.n_embd;
+            engram_apply(ekv_, F(l, "engram_kv_b.weight"), F(l, "engram_gate.weight"), F(l, "engram_pre_gamma.weight"),
+                         F(l, "engram_hc_scale.weight"), evalid_, R, a, X_, stream_);
+            return true;
+        }
         for (int t = 0; t < R; ++t) {
             const float valid = h_evalid_[t];
             const uint8_t* trow = rows_of(t);
@@ -2098,6 +2217,15 @@ private:
         quant_n(R);
         gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
         if (!prompt) publish(0, std::min(kMaxWindow, R));
+        if (!prompt && gsteer_now_) {   // the card's experts right behind the ids, while the host places the rest
+            WindowPlan* gp = (WindowPlan*) ex_gplan_;
+            const int tl = l - g_.n_dense;
+            const ExpertLayer& el = m_.pack().experts[(size_t) l];
+            const kernels::NativeExpertLayout lay = kernels::native_expert_layout(el.gu_type, el.d_type, g_.n_latent, g_.n_ff_exp);
+            bk::window_plan(ids_, tier_->dev_table(tl), R * K, K, g_.n_expert, gp->ptr, gp->start, gp->ng, gp->dst, gp->tok, stream_);
+            kernels::native_expert_grouped_clamped(lay, g_.clamp_exp[(size_t) l], gp->ptr, gp->start, gp->ng, gp->dst, gp->tok, R * K,
+                                                   R * K, ex_xq_, ex_scr_, ex_rows_, stream_);
+        }
         float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
         gemm_n(T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp, R);
         gemm_n(T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp, R);
@@ -2153,6 +2281,11 @@ private:
             return false;
         }
         float *xa = X_, *xb = Xn_;
+        struct Steer {
+            bool& on;
+            ~Steer() { on = false; }
+        } steer{gsteer_now_};
+        gsteer_now_ = tier_ && tier_->gpu_steer() && !tier_->peer_for(tl);
         if (g_.swa[(size_t) l]) {   // a sliding-window layer's attention is one graph: its row spans come from pos_d_ on the card
             const uint32_t seq0 = seq_want_;
             if (!replay(l, R, 0, [&] {
@@ -2487,6 +2620,7 @@ private:
         for (int s = 0; s < (1 << 22); ++s) {
             if (*seq == seq_want_) {
                 std::atomic_thread_fence(std::memory_order_acquire);
+                if (prof_.on) prof_.ready_first = s == 0;
                 return true;
             }
             platform::cpu_relax();
@@ -2553,7 +2687,19 @@ private:
             pd.peer = peer;
         }
         tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
+        const bool prof = prof_.on && tl < kProfLayers && g0 == 0;
+        if (prof) prof_.enter[tl] = now_ms();
         if (!await_ids(err)) return false;
+        if (prof) {
+            prof_.ids[tl] = now_ms();
+            prof_.late[tl] = prof_.ready_first;
+            prof_.gsteer += gsteer_now_;
+        }
+        if (prof_.trace) {   // BASALT_ROUTE_TRACE: int32 records {layer, rows, ids[rows * K]} of every decode group
+            const int32_t hd[2] = {tl, G};
+            std::fwrite(hd, 4, 2, prof_.trace);
+            std::fwrite(h_ids_, 4, (size_t) G * K, prof_.trace);
+        }
         int32_t uniq[kLookupK];
         int uidx[kLookupK], nu = 0;
         core::ExpertTier::Use* use = pd.use;
@@ -2602,6 +2748,17 @@ private:
         if (pd.cpu && !pd.reading) tier_->promote(tl, lk);
         // then the CPU's share: it takes longest, and the pool's workers run it while the card's share launches
         if (pd.cpu) tier_->start_cpu_window(tl, h_x_, lk, use, h_rows_);
+        tier_->issue_fetch();   // BASALT_FETCH_LATE: the bus copies fetch() decided (else none are left)
+        if (prof) {
+            prof_.cpu_at[tl] = now_ms();
+            prof_.word_at[tl] = 0;
+            int n = 0;
+            for (int i = 0; i < nu; ++i) n += !lk.dev[i] && !lk.peer[i] && !lk.reading[i] && !lk.dropped[i];
+            prof_.n_cpu[tl] = n;
+            prof_.n_uniq[tl] = nu;
+            prof_.n_fetch[tl] = n_fetched;
+            prof_.bytes = m_.pack().experts[(size_t) l].blob_bytes;
+        }
         // the card's share: the experts its slots hold, then the fetched ones once their copies landed; the plans travel in
         // kernel parameters, in stream order
         const auto make_plan = [&](WindowPlan& p, bool fetched, int& ne) {
@@ -2635,23 +2792,27 @@ private:
                                                 : lk.dropped[uidx[r]] ? tier_->zero_row()
                                                                       : d_rows_ + (size_t) r * L);
         put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), st);
-        if (nhits) launch(ex_plan_, nhits, ne);
+        if (nhits && !gsteer_now_) launch(ex_plan_, nhits, ne);   // BASALT_GPU_STEER: the card planned and ran them already
         if (pd.word) read_ahead(l, pd.word, st);
         if (n_fetched) {
             WindowPlan p2;
             const int ng = make_plan(p2, true, ne);
+            if (prof) stamp_time(prof_.d + (size_t) tl * 4 + 2, st);
             tier_->await_fetch(st);
+            if (prof) stamp_time(prof_.d + (size_t) tl * 4 + 3, st);
             put_words(&p2, ex_plan2_, (int) (sizeof(WindowPlan) / 4), st);
             launch(ex_plan2_, ng, ne);
         }
         // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !peer->run_fetched(err)) return false;
-        if (pd.word) wait_word_mark(d_words_ + 1, pd.word, ra_mark_, st);
+        if (pd.word) wait_word_mark(d_words_ + 1, pd.word, ra_mark_, st, prof ? prof_.d + (size_t) tl * 4 : nullptr);
         const float* const* rows = (const float* const*) ((uint8_t*) ex_plan_ + offsetof(WindowPut, rows));
         weighted_sum_window(rows, rw_ + (size_t) g0 * K, G, K, L, lat_out_ + (size_t) g0 * L, st);
         if (pd.cpu && !pd.reading) tier_->mark_gap(st);   // the promotions' copies start behind the sum
+        tier_->publish_table(tl, st);   // BASALT_GPU_STEER: this lookup's landings and evictions, before the layer's next plan
         // the rows land and the word is written on the joiner thread, while this thread queues the next layer's work: the
         // card goes on as soon as the CPU's and the second card's rows are in, not once the next launches are out
+        if (prof) prof_.ret[tl] = now_ms();
         if (use_joiner_ && pd.word && !pd.reading) {
             if (!joiner_.joinable()) joiner_ = std::thread([this] { joiner_loop(); });
             {
@@ -2665,6 +2826,7 @@ private:
     }
 
     void joiner_loop() {
+        if (kernels::cpu::pool_pin_enabled()) kernels::cpu::pool_pin_host();   // BASALT_POOL_PIN: the core the workers leave
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(jm_);
@@ -2711,6 +2873,7 @@ private:
         if (pd.peer && pd.peer_raised && !pd.peer->finish(nullptr, pe)) ok = false;
         if (pd.peer && !pd.peer_raised) pd.peer->raise(0, nullptr, nullptr, pe);
         if (!pe.empty() && err.empty()) err = pe;
+        if (prof_.on && pd.word && pd.tl < kProfLayers) prof_.word_at[pd.tl] = now_ms();
         if (pd.word) {
             std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
             *(volatile uint32_t*) (h_words_ + 1) = pd.word;
@@ -2777,6 +2940,7 @@ private:
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
         ring_join();
         ring_layer_[0] = ring_layer_[1] = -1;
+        if (graphs_ && bsegs_.empty() && tier_) tier_->publish_table(-1, stream_);   // BASALT_GPU_STEER: the window's table
         for (int l = 0; l < g_.n_layers; ++l) {
             basalt::core::progress_tick();   // a layer issued: the watchdog tells a slow window from a stopped one
             ring_ahead(l, R);
@@ -3024,7 +3188,10 @@ private:
     void *mmq_xq_ = nullptr;
     int32_t *mmq_ident_ = nullptr, *heads_ids_ = nullptr, *heads_bounds_ = nullptr;
     void* xq_n_ = nullptr;   // quant_n
-    void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr;
+    void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr, *ex_gplan_ = nullptr;
+    bool gsteer_now_ = false;   // BASALT_GPU_STEER, inside a solo decode window's MoE layer: its card experts are planned on the card
+    const bool engram_gpu_ = [] { const char* e = std::getenv("BASALT_ENGRAM_GPU"); return e && *e && *e != '0'; }();
+    float* d_elut_ = nullptr;   // engram_gpu_: the E4M3 decode table on the card
     float* ex_rows_ = nullptr;
     float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_e_ = nullptr, *h_erows_ = nullptr, *h_evalid_ = nullptr;
     const float** rowptr_d_ = nullptr;

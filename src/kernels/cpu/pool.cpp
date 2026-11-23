@@ -11,14 +11,28 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#if defined(_WIN32)
+#include "basalt/platform/win.hpp"
+#else
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace basalt::kernels::cpu {
 
 namespace {
+bool pool_pin_setting();
+void pin_worker(int cpu);
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
 }  // namespace
+
+bool pool_pin_enabled() { return pool_pin_setting(); }
+void pool_pin_host() {
+    const int c = detect_cpu_topology(true, PoolAffinity::All).host_core;
+    if (c >= 0) pin_worker(c);
+}
 
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
     return detect_cpu_topology(skip_first, affinity).worker_cores;
@@ -64,6 +78,28 @@ private:
     std::chrono::steady_clock::time_point t0_{};
 };
 
+// BASALT_POOL_PIN=1: each worker on its own core's first logical processor (hard affinity; the pool's threads end with it).
+// Unpinned, the OS may stack two workers on one core's siblings or move them mid-layer.
+bool pool_pin_setting() {
+    const char* e = std::getenv("BASALT_POOL_PIN");
+    return e != nullptr && *e != '\0' && *e != '0';
+}
+void pin_worker(int cpu) {
+    if (cpu < 0) return;
+#if defined(_WIN32)
+    GROUP_AFFINITY ga{};
+    ga.Group = (WORD) (cpu / 64);
+    ga.Mask = KAFFINITY(1) << (cpu & 63);
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr))
+        basalt::log::warn("basalt", "expert pool: pinning a worker to processor %d failed (%lu)", cpu, (unsigned long) GetLastError());
+#else
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
+}
+
 std::atomic<const ExpertPool*> g_diag_pool{nullptr};
 void diag_active_pool(std::FILE* f) {
     if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
@@ -106,6 +142,8 @@ ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
     basalt::core::diag_pool_fn().store(&diag_active_pool);
+    pin_ = pool_pin_setting();
+    if (pin_) basalt::log::info("basalt", "expert pool: %d workers pinned one a core (BASALT_POOL_PIN)", n_);
     split_multi_.resize((size_t) kMaxSplitMulti);
     fused_.reset(new FusedExpert[(size_t) kMaxSplitMulti]);
     threads_.reserve((size_t) n_);
@@ -139,6 +177,7 @@ void ExpertPool::publish() {
 
 void ExpertPool::worker(int id) {
     uint32_t seen = 0;
+    if (pin_ && id < (int) topo_.worker_cores.size()) pin_worker(topo_.worker_cores[(size_t) id]);
     // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction: a
     // `set_active_workers` before the first batch waits for `parked_ == n_` and would otherwise never return.
     parked_.fetch_add(1, std::memory_order_acq_rel);
@@ -424,7 +463,8 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     mjobs_ = jobs;
     nfmt_ = &f;
     const int threads = active_.load(std::memory_order_relaxed) + 1;
-    const int tpt = cpu_avx512_ok() ? kTasksPerThread : kTasksPerThreadAvx2;
+    static const int tpt_env = [] { const char* e = std::getenv("BASALT_POOL_TPT"); return e ? std::atoi(e) : 0; }();   // a test knob
+    const int tpt = tpt_env > 0 ? tpt_env : cpu_avx512_ok() ? kTasksPerThread : kTasksPerThreadAvx2;
     // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
     // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
     // The share of tasks follows the share of bytes of the two projections.

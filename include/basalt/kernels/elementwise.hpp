@@ -124,4 +124,15 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
 void copy_i32x3_from_mapped(int32_t* d0, const int32_t* s0, int64_t n0, int32_t* d1, const int32_t* s1, int64_t n1,
                             int32_t* d2, const int32_t* s2, int64_t n2, void* stream);
 
+/// dst[idx[i]] = val[i] for i < n, the pairs travelling in the kernel's parameters (n <= kPatchU64); in stream order.
+constexpr int kPatchU64 = 96;
+void patch_u64(const int32_t* idx, const unsigned long long* val, int n, unsigned long long* dst, void* stream);
+
+/// A decode group's plan for the experts a device table holds (tab[e]: the expert's slot address, 0 when it is not on the
+/// card), in the layout of native_expert_grouped's arguments: per distinct held expert in first-routed order its address
+/// (ptr) and its first entry (start, start[ng] = entries), ng[0] the group count, and per entry the routed pair (dst = t * k + j)
+/// and its row (tok = t), pairs in routed order within a group. ids: n = rows * k routed ids (n <= 128; -1 or out of range: none).
+void window_plan(const int32_t* ids, const unsigned long long* tab, int n, int k, int n_expert, unsigned long long* ptr,
+                 int32_t* start, int32_t* ng, int32_t* dst, int32_t* tok, void* stream);
+
 }  // namespace basalt::kernels

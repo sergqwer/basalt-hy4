@@ -68,11 +68,22 @@ __global__ void put_words_kernel(const PutWords s, int* dst, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = s.w[i];
 }
 
-__global__ void wait_word_mark_kernel(const volatile uint32_t* word, uint32_t value, volatile uint32_t* mark) {
+__device__ __forceinline__ uint64_t global_ns() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// stamps (the decode profile, else null): when the card got here and when the word let it go on
+__global__ void wait_word_mark_kernel(const volatile uint32_t* word, uint32_t value, volatile uint32_t* mark, volatile uint64_t* stamps) {
+    if (stamps) stamps[0] = global_ns();
     while (*word != value) __nanosleep(100);
     __threadfence_system();
     *mark = value;
+    if (stamps) stamps[1] = global_ns();
 }
+
+__global__ void stamp_time_kernel(volatile uint64_t* dst) { *dst = global_ns(); }
 
 constexpr int kReadAheadBlocks = 32;              // blocks that request the ranges
 constexpr uint64_t kReadAheadStep = 128 << 10;    // bytes a block requests before it looks at the mark again
@@ -300,8 +311,38 @@ void put_words(const void* src, void* dst, int n_words, void* stream) {
     put_words_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(s, (int*) dst, n_words);
 }
 
-void wait_word_mark(const uint32_t* word, uint32_t value, uint32_t* mark, void* stream) {
-    wait_word_mark_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(word, value, mark);
+void wait_word_mark(const uint32_t* word, uint32_t value, uint32_t* mark, void* stream, uint64_t* stamps) {
+    wait_word_mark_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(word, value, mark, stamps);
+}
+void stamp_time(uint64_t* dst, void* stream) { stamp_time_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst); }
+
+// a thread a (token, column) row, its values in order with round-to-nearest operations and no contraction: the host's sums
+__global__ void engram_rows_kernel(const uint8_t* __restrict__ raw, const float* __restrict__ lut, const float* __restrict__ norm,
+                                   const float* __restrict__ valid, int n_rows, int n_cols, int w, float* __restrict__ out) {
+    __shared__ float s_lut[256];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = lut[i];
+    __syncthreads();
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const int t = row / n_cols, c = row % n_cols;
+    const uint8_t* src = raw + (size_t) row * w;
+    float* dst = out + (size_t) row * w;
+    float ss = 0.f;
+    for (int d = 0; d < w; ++d) {
+        const float v = s_lut[src[d]];
+        ss = __fadd_rn(ss, __fmul_rn(v, v));
+    }
+    const float r = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, (float) w), 1.1920929e-07f)));
+    const float vt = valid[t];
+    const float* nr = norm + (size_t) c * w;
+    for (int d = 0; d < w; ++d) dst[d] = __fmul_rn(__fmul_rn(__fmul_rn(s_lut[src[d]], r), nr[d]), vt);
+}
+
+void engram_rows(const uint8_t* raw, const float* lut, const float* norm, const float* valid, int n_tok, int n_cols, int w,
+                 float* out, void* stream) {
+    const int n = n_tok * n_cols;
+    if (n <= 0) return;
+    engram_rows_kernel<<<(n + 127) / 128, 128, 0, (cudaStream_t) stream>>>(raw, lut, norm, valid, n, n_cols, w, out);
 }
 
 void l2_read_ahead(const L2Ranges& r, uint32_t* mark, uint32_t value, void* stream) {

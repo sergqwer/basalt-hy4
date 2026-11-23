@@ -12,6 +12,7 @@
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -48,6 +50,17 @@ ExpertTier::~ExpertTier() {
     }
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (out_stream_) cudaStreamSynchronize(out_stream_);
+    if (d_tab_ || scratch_ || fetch_word_) {
+        cudaDeviceSynchronize();
+        if (fetch_word_) cudaFree(fetch_word_);
+        if (fetch_ring_) cudaFreeHost(fetch_ring_);
+        fetch_word_ = nullptr;
+        fetch_ring_ = nullptr;
+        if (d_tab_) cudaFree(d_tab_);
+        if (scratch_) cudaFree(scratch_);
+        d_tab_ = nullptr;
+        scratch_ = nullptr;
+    }
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
     for (cudaEvent_t e : out_events_) cudaEventDestroy(e);
@@ -213,6 +226,45 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     }
     if (!open_base(per_layer_, err)) return false;
     res_.assign((size_t) n_layers_ * n_expert_, -1);
+    inflight_.assign((size_t) n_layers_ * n_expert_, 0);
+    if (const char* e = std::getenv("BASALT_TIER_NOWAIT")) land_nowait_ = *e != '\0' && *e != '0';
+    if (const char* e = std::getenv("BASALT_FETCH_LATE")) fetch_late_ = *e != '\0' && *e != '0';
+    if (const char* e = std::getenv("BASALT_FETCH_SPIN"); e && *e && *e != '0') {
+        if (cudaMalloc((void**) &fetch_word_, 4) == cudaSuccess && cudaMemset(fetch_word_, 0, 4) == cudaSuccess &&
+            cudaHostAlloc((void**) &fetch_ring_, 64 * 4, cudaHostAllocPortable) == cudaSuccess) {
+            basalt::log::info(s_.area.c_str(), "bus fetches are awaited on a device word (BASALT_FETCH_SPIN)");
+        } else {
+            if (fetch_word_) cudaFree(fetch_word_);
+            fetch_word_ = nullptr;
+            fetch_ring_ = nullptr;
+            cudaGetLastError();
+        }
+    }
+    if (const char* e = std::getenv("BASALT_BUS_SCRATCH"); e && std::atoi(e) > 0 && peers_.empty()) {
+        uint64_t mb = 0;
+        for (const ExpertTierSpec::Layer& el : s_.layers) mb = std::max<uint64_t>(mb, (el.blob_bytes + 255) / 256 * 256);
+        const int n = std::min(std::atoi(e), (int) kMaxK);
+        if (cudaMalloc((void**) &scratch_, (size_t) n * mb) == cudaSuccess) {
+            scratch_n_ = n;
+            if (const char* f = std::getenv("BASALT_BUS_CPU")) bus_cpu_ = std::clamp(std::atof(f), 0.0, 1.0);
+            basalt::log::info(s_.area.c_str(), "bus share: up to %d misses a layer into scratch slots (%.1f MB), CPU share %.2f (BASALT_BUS_SCRATCH)",
+                              n, (double) n * mb / 1e6, bus_cpu_);
+        } else {
+            scratch_ = nullptr;
+            cudaGetLastError();
+        }
+    }
+    if (const char* e = std::getenv("BASALT_GPU_STEER"); e && *e && *e != '0' && peers_.empty()) {
+        const size_t n = (size_t) n_layers_ * n_expert_;
+        if (cudaMalloc((void**) &d_tab_, n * 8) == cudaSuccess && cudaMemset(d_tab_, 0, n * 8) == cudaSuccess) {
+            tab_.assign(n, 0);
+            basalt::log::info(s_.area.c_str(), "decode layers plan their card experts on the card (BASALT_GPU_STEER)");
+        } else {
+            if (d_tab_) cudaFree(d_tab_);
+            d_tab_ = nullptr;
+            cudaGetLastError();
+        }
+    }
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
     if (s_.victim_half_life > 0) looks_.assign((size_t) n_layers_ * n_expert_, 0);
     owner_.assign((size_t) base_slots(), -1);
@@ -714,6 +766,7 @@ const uint8_t* ExpertTier::slot_ptr(int32_t slot) const {
 void ExpertTier::apply(const Pending& p) {
     const size_t in = (size_t) p.layer * n_expert_ + p.expert;
     res_[in] = p.slot;
+    inflight_[in] = 0;
     busy_[(size_t) p.slot] = 0;
     free_events_.push_back(p.event);
     if (p.out >= 0) {   // the home that left has its RAM place, and the one that came gives its own up
@@ -736,11 +789,14 @@ void ExpertTier::apply(const PeerMove& m) {
 // A layer's copies were claimed after its last lookup and before anything else reads its places: they land together,
 // in the order they were claimed, before its next lookup.
 void ExpertTier::land(int layer) {
-    issue(layer, 0);
+    // BASALT_TIER_NOWAIT: the layer's copies still queued or in flight are not forced out and waited for at its lookup (the
+    // host would stall the layer's CPU share on the copy engine); such an expert stays a miss, computed from its pinned RAM
+    // copy, until a later lookup finds its copy done. A home's swap (its RAM place moves) still lands here.
+    issue(land_nowait_ ? -1 : layer, 0);
     size_t keep = 0;
     for (size_t i = 0; i < pending_.size(); ++i) {
         const Pending p = pending_[i];
-        if (p.layer != layer) {
+        if (p.layer != layer || (land_nowait_ && p.out < 0 && cudaEventQuery(events_[(size_t) p.event]) == cudaErrorNotReady)) {
             pending_[keep++] = p;
             continue;
         }
@@ -803,8 +859,52 @@ void ExpertTier::begin_token(int n_tokens) {
 
 void ExpertTier::forget_use() { std::fill(looks_.begin(), looks_.end(), (uint16_t) 0); }
 
+void ExpertTier::publish_table(int layer, cudaStream_t stream) {
+    if (!d_tab_) return;
+    if (layer < 0) {   // a window's start: every copy that is done lands first (they are hits from this window on)
+        for (int l = 0; l < n_layers_; ++l) {
+            size_t keep = 0;
+            for (size_t i = 0; i < pending_.size(); ++i) {
+                const Pending p = pending_[i];
+                if (p.layer != l || cudaEventQuery(events_[(size_t) p.event]) != cudaSuccess) {
+                    pending_[keep++] = p;
+                    continue;
+                }
+                apply(p);
+            }
+            pending_.resize(keep);
+        }
+        cudaGetLastError();   // a NotReady query is no error
+    }
+    const int l0 = layer < 0 ? 0 : layer, l1 = layer < 0 ? n_layers_ : layer + 1;
+    int32_t idx[kernels::kPatchU64];
+    unsigned long long val[kernels::kPatchU64];
+    int n = 0;
+    for (int l = l0; l < l1; ++l)
+        for (int e = 0; e < n_expert_; ++e) {
+            const size_t i = (size_t) l * n_expert_ + e;
+            const int32_t s = res_[i];
+            const unsigned long long v = s >= 0 ? (unsigned long long) slot_ptr(s) : 0ull;
+            if (v == tab_[i]) continue;
+            tab_[i] = v;
+            idx[n] = (int32_t) i;
+            val[n] = v;
+            if (++n == kernels::kPatchU64) {
+                kernels::patch_u64(idx, val, n, d_tab_, stream);
+                n = 0;
+            }
+        }
+    kernels::patch_u64(idx, val, n, d_tab_, stream);
+}
+
 bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err) {
-    land(layer);
+    // with the card's own plan the classification reads the residency the card planned with; the layer's copies land after
+    if (!d_tab_) land(layer);
+    struct LandAfter {
+        ExpertTier* t;
+        int l;
+        ~LandAfter() { if (t) t->land(l); }
+    } land_after{d_tab_ ? this : nullptr, layer};
     const uint64_t now = ++tick_;
     lk.k = k;
     if (reads_.is_open() && !read_misses(layer, ids, k, lk.reading, err)) return false;
@@ -1011,6 +1111,7 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     if (o >= 0) res_[(size_t) layer * n_expert_ + o] = -1;
     owner_[(size_t) slot] = e;
     busy_[(size_t) slot] = 1;
+    inflight_[(size_t) layer * n_expert_ + e] = 1;
     stamp_[(size_t) layer * n_expert_ + e] = tick_;
     const uint64_t bytes = s_.layers[(size_t) layer].blob_bytes;
     uint8_t* dst = const_cast<uint8_t*>(slot_ptr(slot));
@@ -1032,6 +1133,11 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     if (later) {
         Queued q{{layer, e, slot, ev, home ? o : -1, place}, dst, src, home ? ram_[(size_t) layer] + (size_t) place * bytes : nullptr, bytes};
         queue_.push_back(q);
+        return slot;
+    }
+    if (fetch_late_ && whole && !home && stream == fetch_stream_) {   // fetch(): issue_fetch() sends it
+        late_.push_back({dst, src, bytes, ev});
+        pending_.push_back({layer, e, slot, ev, -1, place});
         return slot;
     }
     if (home) pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
@@ -1135,7 +1241,11 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     if (s_.diag_tier_frozen || reads_.is_open()) return 0;
     int np = 0, nf = 0;
     // with an admission threshold only an expert that earned its slot goes over the bus; the others stay with the CPU
-    const auto eligible = [&](int i) { return !lk.dropped[i] && pinned(layer, lk.experts[i]) && (s_.admit_uses == 0 || lk.again[i]); };
+    const auto eligible = [&](int i) {
+        const size_t x = (size_t) layer * n_expert_ + lk.experts[i];
+        return !lk.dropped[i] && pinned(layer, lk.experts[i]) && (s_.admit_uses == 0 || lk.again[i]) &&
+               !inflight_[x] && res_[x] < 0;   // a claim not landed yet, or one that landed after the lookup: no second slot
+    };
     for (int i = 0; i < lk.k; ++i)
         if (!lk.dev[i] && !lk.peer[i] && !lk.dropped[i]) ++(eligible(i) ? np : nf);
     int left = core::policy::bus_count(np, nf);
@@ -1164,16 +1274,72 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
         --cpu_;
         ++fetched_;
     }
-    if (started) cudaEventRecord(fetch_ev_, fetch_stream_);
+    if (scratch_ && !pc) {   // the rest of the bus share: misses without a slot, computed from scratch slots
+        const int m = np + nf;
+        int bus = m - (int) std::ceil(bus_cpu_ * m - 1e-9);
+        for (int i = 0; i < lk.k; ++i) bus -= lk.fetched[i] ? 1 : 0;
+        uint64_t mb = 0;
+        for (const ExpertTierSpec::Layer& el : s_.layers) mb = std::max<uint64_t>(mb, (el.blob_bytes + 255) / 256 * 256);
+        int used = 0;
+        // the ones that earned no slot first (an earned one left to the CPU is promoted behind the layer); an earned one taken
+        // here crosses into a slot of its own, since its bytes cross the bus anyway
+        for (int pass = 0; pass < 2; ++pass)
+        for (int i = lk.k - 1; i >= 0 && bus > 0 && used < scratch_n_; --i) {
+            if (lk.dev[i] || lk.peer[i] || lk.dropped[i] || lk.fetched[i] || !pinned(layer, lk.experts[i])) continue;
+            if (eligible(i) != (pass == 1)) continue;
+            int32_t slot = pass == 1 ? claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true) : -1;
+            uint8_t* dst = slot >= 0 ? const_cast<uint8_t*>(slot_ptr(slot)) : scratch_ + (size_t) used++ * mb;
+            if (slot < 0) {
+                if (fetch_late_) late_.push_back({dst, lk.host[i], bytes, -1});
+                else cudaMemcpyAsync(dst, lk.host[i], bytes, cudaMemcpyHostToDevice, fetch_stream_);
+            }
+            lk.dev[i] = dst;
+            lk.host[i] = nullptr;
+            lk.fetched[i] = true;
+            --bus;
+            --cpu_;
+            ++fetched_;
+            ++started;
+        }
+    }
+    if (started) {
+        if (fetch_late_ && !late_.empty()) late_ev_ = true;
+        else record_fetch();
+    }
     return started;
 }
 
-void ExpertTier::await_fetch(cudaStream_t main) { cudaStreamWaitEvent(main, fetch_ev_, 0); }
+void ExpertTier::issue_fetch() {
+    for (const LateCopy& c : late_) {
+        cudaMemcpyAsync(c.dst, c.src, c.bytes, cudaMemcpyHostToDevice, fetch_stream_);
+        if (c.event >= 0) cudaEventRecord(events_[(size_t) c.event], fetch_stream_);   // -1: a scratch copy
+    }
+    late_.clear();
+    if (late_ev_) record_fetch();
+    late_ev_ = false;
+}
+
+void ExpertTier::record_fetch() {
+    if (!fetch_word_) {
+        cudaEventRecord(fetch_ev_, fetch_stream_);
+        return;
+    }
+    uint32_t* v = fetch_ring_ + (++fetch_seq_ & 63u);   // read when the copy runs: 64 layers later it is long done
+    *v = fetch_seq_;
+    cudaMemcpyAsync(fetch_word_, v, 4, cudaMemcpyHostToDevice, fetch_stream_);
+}
+
+void ExpertTier::await_fetch(cudaStream_t main) {
+    if (fetch_word_) kernels::wait_word(fetch_word_, fetch_seq_, main);
+    else cudaStreamWaitEvent(main, fetch_ev_, 0);
+}
 
 void ExpertTier::promote(int layer, const Lookup& lk) {
     if (s_.diag_tier_frozen) return;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || lk.fetched[i] || lk.dropped[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
+        if (inflight_[(size_t) layer * n_expert_ + lk.experts[i]]) continue;   // its copy is on the way
+        if (res_[(size_t) layer * n_expert_ + lk.experts[i]] >= 0) continue;   // landed after the lookup (BASALT_GPU_STEER)
         // with the RAM tier caching the file, the experts the CPU keeps computing; else a repeat miss
         if (reads_.is_open() && s_.admit_uses == 0 ? !core::policy::count_use(uses_[(size_t) layer * n_expert_ + lk.experts[i]]) : !lk.again[i]) continue;
         if (!move_to_peer(layer, lk.experts[i], lk.host[i]))

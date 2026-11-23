@@ -150,7 +150,9 @@ void weighted_sum_window(const float* const* rows, const float* w, int n_tok, in
 
 /// Holds the stream until *word (mapped host memory the host writes) equals `value`, fences, then stores `value` in mark[0]
 /// (device memory), which an l2_read_ahead on another stream stops at.
-void wait_word_mark(const uint32_t* word, uint32_t value, uint32_t* mark, void* stream);
+void wait_word_mark(const uint32_t* word, uint32_t value, uint32_t* mark, void* stream, uint64_t* stamps = nullptr);
+/// --decode-profile: %globaltimer into a mapped word (ns), from the stream's order.
+void stamp_time(uint64_t* dst, void* stream);
 /// Byte ranges of device memory (16-byte aligned, 16-byte multiples) in the order the kernels after a wait read them; empty
 /// ones last.
 constexpr int kL2Ranges = 4;
@@ -200,5 +202,10 @@ struct EngramArgs {
 /// x_i += rms(value) * pre_gamma * (gate_i + hc_scale[i]).
 void engram_apply(const float* kv, const float* kv_b, const float* gate_w, const float* pre_gamma, const float* hc_scale,
                   const float* valid, int n_tok, const EngramArgs& a, float* x, void* stream);
+
+/// The Engram rows of n_tok tokens from their E4M3 codes (raw[t][c][w], one byte a value), as the host step computes them,
+/// bit for bit: v = lut[code], r = 1 / sqrt(sum v^2 / w + FLT_EPSILON) summed in order, out = v * r * norm[c][w] * valid[t].
+void engram_rows(const uint8_t* raw, const float* lut, const float* norm, const float* valid, int n_tok, int n_cols, int w,
+                 float* out, void* stream);
 
 }  // namespace basalt::models::hy4flash

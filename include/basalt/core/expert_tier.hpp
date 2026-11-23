@@ -186,6 +186,14 @@ public:
     /// among them start reading into the RAM tier (`reading`). An id of -1 (route_tail_skip dropped it) is `dropped`: no
     /// source, no stamp, and fetch, promote and the CPU's share pass it by.
     bool lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err);
+    /// BASALT_GPU_STEER: a device table of every layer's slot addresses (0: not on the card), which a decode layer's own plan
+    /// kernel reads right after its router. The lookup then classifies against the table as the card saw it (the copies that
+    /// landed since are hits from the next window on), and publish_table puts every change in stream order before the next
+    /// plan of that layer reads it.
+    bool gpu_steer() const { return d_tab_ != nullptr; }
+    const unsigned long long* dev_table(int layer) const { return d_tab_ + (size_t) layer * n_expert_; }
+    /// The table's entries of `layer` (-1: all, after landing every copy that is done) that differ from what the card holds.
+    void publish_table(int layer, cudaStream_t stream);
     /// The reads the last lookup started have landed.
     bool await_reads(std::string& err);
     /// The CPU's share: the experts of `lk` without a device blob, over the activation `x` (n_embd floats, host).
@@ -213,6 +221,8 @@ public:
     /// `fetched`); their VRAM tier copies follow off the token path. How many the main card's link started; `await_fetch`
     /// makes `main` wait for them.
     int fetch(int layer, Lookup& lk);
+    /// BASALT_FETCH_LATE: fetch() only decides; the copies go out here, once the CPU's share has started.
+    void issue_fetch();
     void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
     /// VRAM tier (side stream, off the token path, in pieces).
@@ -276,6 +286,7 @@ public:
     void report(const char* tag) const;
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
     int64_t hits() const { return hits_; }
+    int64_t promoted() const { return promoted_; }   ///< slot copies claimed (bus fetches and promotions), ever
     int64_t lookups() const { return hits_ + cpu_; }
     int64_t offloaded() const { return fetched_ + peer_hits_; }
     /// Of the CPU's, those read from the file.
@@ -393,6 +404,27 @@ private:
     std::vector<uint16_t> looks_;           ///< [layer * n_expert + e] lookups, halved every victim_half_life tokens (empty when 0)
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
     std::vector<uint8_t> busy_;             ///< [slot] a promotion is copying into it
+    std::vector<uint8_t> inflight_;         ///< [layer * n_expert + e] claimed into a slot, not landed yet
+    unsigned long long* d_tab_ = nullptr;   ///< BASALT_GPU_STEER: device [layer * n_expert + e] slot address or 0
+    // BASALT_BUS_SCRATCH=N: up to N misses a layer that earned no slot cross the bus into scratch slots and the card computes
+    // them (no residency change), so the CPU's share is BASALT_BUS_CPU (default 0.6) of the layer's misses instead of every
+    // miss without a slot. One set serves every layer: a layer's copies are issued after its ids, so the previous layer's
+    // experts were computed from them already.
+    // BASALT_FETCH_SPIN: the main stream waits for a layer's bus fetches on a device word the fetch stream writes behind
+    // them (a 4-byte copy) instead of on an event (a cross-stream wait costs the card a bubble under WDDM)
+    uint32_t* fetch_word_ = nullptr;        ///< device
+    uint32_t* fetch_ring_ = nullptr;        ///< pinned: the values the word copies read
+    uint32_t fetch_seq_ = 0;
+    void record_fetch();
+    uint8_t* scratch_ = nullptr;
+    int scratch_n_ = 0;
+    double bus_cpu_ = 0.6;
+    std::vector<unsigned long long> tab_;   ///< what d_tab_ holds once the patches queued so far ran
+    bool land_nowait_ = false;              ///< BASALT_TIER_NOWAIT: a lookup lands only the copies that are done
+    bool fetch_late_ = false;               ///< BASALT_FETCH_LATE: fetch() queues its copies for issue_fetch()
+    struct LateCopy { uint8_t* dst; const uint8_t* src; uint64_t bytes; int event; };
+    std::vector<LateCopy> late_;            ///< fetch_late_: the bus copies fetch() decided, in order
+    bool late_ev_ = false;                  ///< fetch_late_: fetch_ev_ is to be recorded behind them
     std::vector<Pending> pending_;          ///< issued copies not landed yet
     std::vector<Queued> queue_;             ///< promotions not yet fully issued, oldest first
     std::vector<PeerMove> peer_moves_;      ///< second card exchanges not landed yet, oldest first

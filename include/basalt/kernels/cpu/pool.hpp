@@ -67,6 +67,11 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 /// program layer.
 int auto_pool_workers(int worker_cores, int p_cores, int e_cores, bool hybrid, double cpu_quota, PoolAffinity affinity);
 
+/// BASALT_POOL_PIN=1: the pool's workers each on one core, and pool_pin_host() puts the calling thread (the one that joins
+/// the drain) on the core the workers leave free.
+bool pool_pin_enabled();
+void pool_pin_host();
+
 class ExpertPool {
 public:
     /// `n_workers` is the worker count (at least 1); the caller sizes it (see auto_pool_workers).  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
@@ -165,6 +170,7 @@ private:
     void publish();
 
     int n_ = 0;
+    bool pin_ = false;   ///< BASALT_POOL_PIN: worker i runs on topo_.worker_cores[i] only
     /// Workers with id < active_ take work; written only while every worker is parked, before the next publish.
     std::atomic<int> active_{0};
     // ---- EACH ATOMIC GETS ITS OWN CACHE LINE.
