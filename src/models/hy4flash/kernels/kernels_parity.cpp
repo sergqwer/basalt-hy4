@@ -1671,6 +1671,86 @@ void test_prompt_vs_decode_nvfp4() {
 
 }  // namespace
 
+// HY4_Q_DIRECT: the k_b product of a chunk (MMQ, every head an "expert", rows head-major) written straight into the query rows
+// (row stride 576) must equal the q_abs buffer (stride 512) bit for bit, and mla_prepare with q_abs null must then give the same
+// query rows and cache rows as with q_abs.
+void test_q_direct() {
+    namespace mmq = basalt::prefill::mmq;
+    MlaArgs a;
+    a.heads = 32;
+    const int H = a.heads, R = 40, W = a.rank + a.rope, Q = a.nope + a.rope;
+    if (!mmq::built() || !mmq::fits(8, a.rank)) {
+        std::printf("%-30s skipped (no MMQ for Q8_0)\n", "q direct");
+        return;
+    }
+    std::vector<uint8_t> wb;
+    for (int h = 0; h < H; ++h) {   // k_b: [heads][rank][nope]
+        Q8 w = make_q8(a.rank, a.nope);
+        wb.insert(wb.end(), w.bytes.begin(), w.bytes.end());
+    }
+    std::vector<float> q = randn((size_t) R * H * Q), kvraw = randn((size_t) R * W, 2.f), norm = randn(a.rank, 0.5f);
+    for (auto& v : norm) v += 1.f;
+    uint8_t* dw = dev(wb);
+    float *dq = dev(q), *dkv = dev(kvraw), *dn = dev(norm);
+    float *dqa = devf((size_t) R * H * a.rank), *qc1 = devf((size_t) R * H * W), *qc2 = devf((size_t) R * H * W);
+    int32_t *ids = nullptr, *bounds = nullptr;
+    cudaMalloc(&ids, (size_t) H * R * 4);
+    cudaMalloc(&bounds, (H + 1) * 4);
+    head_major_ids(ids, bounds, H, R, nullptr);
+    void* xq = nullptr;
+    cudaMalloc(&xq, mmq::q8_bytes((int64_t) H * R, a.nope));
+    mmq::load(8, a.rank);
+    mmq::quantize(dq, ids, xq, 8, a.nope, Q, (int64_t) H * R, nullptr);
+    mmq::Context ctx;
+    mmq::Product p;
+    p.w = dw;
+    p.type = 8;
+    p.w_rows = a.rank;
+    p.w_cols = a.nope;
+    p.expert_bytes = mmq::matrix_bytes(8, a.rank, a.nope);
+    p.n = H;
+    p.xq = xq;
+    p.bounds = bounds;
+    p.ids = ids;
+    p.total_rows = (int64_t) H * R;
+    p.max_rows = R;
+    p.dst = dqa;
+    p.ld_dst = a.rank;
+    ctx.run(p, nullptr);
+    p.dst = qc2;
+    p.ld_dst = W;
+    ctx.run(p, nullptr);
+    cudaDeviceSynchronize();
+    const std::vector<float> qa = host(dqa, (size_t) R * H * a.rank), direct = host(qc2, (size_t) R * H * W);
+    bool same = true;
+    for (size_t r = 0; r < (size_t) R * H && same; ++r) same = std::memcmp(&qa[r * a.rank], &direct[r * W], a.rank * 4) == 0;
+    std::printf("%-30s %s\n", "q direct: k_b into rows", same ? "bitwise" : "FAIL");
+    failures += !same;
+    for (int ty = 0; ty < 2; ++ty) {   // the fp16 and the int8 rows
+        uint8_t *c1 = nullptr, *c2 = nullptr;
+        const size_t rb = ty == 0 ? (size_t) W * 2 : (size_t) kI8RowBytes;
+        cudaMalloc(&c1, R * rb);
+        cudaMalloc(&c2, R * rb);
+        if (ty == 0) {
+            mla_prepare(dq, dqa, dkv, dn, a, 7, R, 0, qc1, (uint16_t*) c1, nullptr);
+            mla_prepare(dq, nullptr, dkv, dn, a, 7, R, 0, qc2, (uint16_t*) c2, nullptr);
+        } else {
+            mla_prepare(dq, dqa, dkv, dn, a, 7, R, 0, qc1, (int8_t*) c1, nullptr);
+            mla_prepare(dq, nullptr, dkv, dn, a, 7, R, 0, qc2, (int8_t*) c2, nullptr);
+        }
+        cudaDeviceSynchronize();
+        const bool sq = host(qc1, (size_t) R * H * W) == host(qc2, (size_t) R * H * W);
+        const bool sc = host(c1, R * rb) == host(c2, R * rb);
+        std::printf("%-30s %s\n", ty == 0 ? "q direct: prepare fp16" : "q direct: prepare int8", sq && sc ? "bitwise" : "FAIL");
+        failures += !(sq && sc);
+        cudaFree(c1);
+        cudaFree(c2);
+    }
+    cudaFree(ids);
+    cudaFree(bounds);
+    cudaFree(xq);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) return 77;
@@ -1690,6 +1770,7 @@ int main() {
     test_i8_chunk();
     test_indexer_i8();
     test_mmq_dense();
+    test_q_direct();
     test_mmq_expert(12, "mmq experts Q4_K");
     test_mmq_expert(14, "mmq experts Q6_K");
     test_prompt_vs_decode_nvfp4();

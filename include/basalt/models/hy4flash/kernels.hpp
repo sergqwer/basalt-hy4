@@ -33,7 +33,7 @@ void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok
                      float* y, void* stream);
 
 /// The attention inputs of n_tok rows at pos0 + t. q: the query projection [t][heads][nope + rope]; q_abs: the absorbed nope
-/// part [t][heads][rank]; kv_raw: the key/value projection [t][rank + rope]. Writes qcur [t][heads][rank + rope] = q_abs then the
+/// part [t][heads][rank] (null: already in qcur's latent part, written there by the k_b product; only the rope part is written);kv_raw: the key/value projection [t][rank + rope]. Writes qcur [t][heads][rank + rope] = q_abs then the
 /// rotated rope part, and each row's cache row (the latent normed by kv_norm, then the rotated rope part) at cell pos0 + t
 /// (modulo `ring` when it is set).
 void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
