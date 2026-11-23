@@ -56,7 +56,7 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 }
 
 const char* const kUsage =
-    "usage: basalt-vision --model <model.basalt> [--gpu] [--threads N] [--max-tokens N]\n"
+    "usage: basalt-vision --model <model.basalt> [--gpu | --fp32] [--threads N] [--max-tokens N]\n"
     "  reads the projector in place from the model file's vision/mmproj section;\n"
     "  reads \"ENC <image> <output>\" lines on stdin and writes each image's embeddings to <output>,\n"
     "  and \"ENCV <video> <output> [fps=F] [max_frames=N] [max_tokens=N]\" lines, one record per group;\n"
@@ -67,6 +67,7 @@ const char* const kUsage =
 int main(int argc, char** argv) {
     std::string model;
     bool gpu = false;
+    bool fp32 = false;   // --fp32: the CPU encoder without the device's bf16 roundings, a reference for the GPU's output
     int threads = 0, max_tokens = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -80,6 +81,7 @@ int main(int argc, char** argv) {
         }
         if (a == "--model") model = next();
         else if (a == "--gpu") gpu = true;
+        else if (a == "--fp32") fp32 = true;
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
@@ -127,7 +129,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         return 1;
 #endif
-    } else if (!cpu.init(mp, threads, true, false, err)) {
+    } else if (!cpu.init(mp, threads, !fp32, false, err)) {
         std::printf("ERR cannot load the vision encoder: %s\n", err.c_str());
         std::fflush(stdout);
         return 1;
