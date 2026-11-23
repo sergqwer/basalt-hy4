@@ -1,6 +1,7 @@
 // src/models/hy4flash/dfly.cpp - the DFly2 drafter on the device: weights, the tap, and the block pass (dfly.hpp).
 #include "models/hy4flash/dfly.hpp"
 
+#include "basalt/core/bounds_check.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -243,6 +244,8 @@ int DflyTap::source_row(int64_t pos) const { return dfly_source_row(pos0_, hid_o
 
 struct DflyRunner::Impl {
     Env env;
+    const int64_t* bk_d = nullptr;   // HY4_BOUNDS_CHECK: the target's backed cells (null: off)
+    const int64_t* bk_h = nullptr;
     const DflyWeights* w = nullptr;
     DflyDims d;
     std::vector<void*> bufs;
@@ -453,6 +456,10 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
         for (int i = 0; i < d.layers; ++i) {
             const int cnt = tap.count(i, row);
             nctxs[i] = cnt < 0 ? (int) pos : cnt;
+            if (cnt < 0 && p.bk_h && nctxs[i] > *p.bk_h) {   // HY4_BOUNDS_CHECK: the positions gathered, cut to the backed cells
+                core::bounds::host_violation(core::bounds::kDraftPositions, i, nctxs[i] - 1, *p.bk_h);
+                nctxs[i] = (int) *p.bk_h;
+            }
             if (nctxs[i] + R > 4096 || nctxs[i] > p.env.sel_cap) {
                 err = "dfly: " + std::to_string(nctxs[i]) + " selected rows";
                 return false;
@@ -468,6 +475,8 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             // the target's rows this block reads: the cells its row selected (or every position before the anchor)
             const int cnt = tap.count(i, row), nctx = nctxs[i];
             const int32_t* cells = cnt < 0 ? nullptr : tap.cells(i, row);
+            if (cells && p.bk_d)   // HY4_BOUNDS_CHECK: the selected cells in [0, backed)
+                core::bounds::check_list(const_cast<int32_t*>(cells), nctx, p.bk_d, core::bounds::kDraftCells, i, st);
             if (p.env.fp8) dfly_gather_rows_fp8((const uint8_t*) cache[i], cells, nctx, p.ctx, st);
             else dfly_gather_rows((const uint16_t*) cache[i], cells, nctx, kDflyRowWidth, p.ctx, st);
 
@@ -536,6 +545,11 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
     p.anchor = anchor;
     p.pending = true;
     return true;
+}
+
+void DflyRunner::bounds(const int64_t* limit_dev, const int64_t* limit_host) {
+    p_->bk_d = limit_dev;
+    p_->bk_h = limit_host;
 }
 
 void DflyRunner::copy_block(float* host, int rows, void* stream) const {

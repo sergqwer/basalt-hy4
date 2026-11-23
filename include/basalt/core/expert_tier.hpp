@@ -228,6 +228,9 @@ public:
         const uint8_t* pinned = nullptr;
     };
     Source locate(int layer, int e) const;
+    /// HY4_BOUNDS_CHECK (core/bounds_check.hpp): [p, p + n) inside the slots the card maps at this moment (the base arena's
+    /// mapped part or the slots beside it); else the violation is recorded and false returned. Always true while off.
+    bool slot_ok(uint32_t site, int layer, const void* p, uint64_t n) const;
     /// The first second card (null without any): for "is there a second card" questions; per-layer work takes peer_for.
     core::PeerExperts* peer() const { return peers_.empty() ? nullptr : peers_[0].get(); }
     /// The second card that holds `layer`'s second-card homes (each card owns a block of layers), or null.
@@ -304,6 +307,7 @@ private:
         const uint8_t* src;
         uint8_t* home_to;
         uint64_t bytes, off = 0, home_off = 0;
+        int8_t chk = 0;   // HY4_BOUNDS_CHECK: dst not checked yet (0), inside the mapped slots (1), outside (-1: skipped)
     };
     /// `in` on its way into the second card's `slot`, its pieces waiting for an idle bus; `out`, which held it, on its
     /// way to RAM place `place`: the slot's bytes out to `to` first, then `from` in.

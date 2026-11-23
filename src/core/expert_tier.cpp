@@ -2,6 +2,7 @@
 #include "basalt/log.hpp"
 #include "basalt/core/expert_tier.hpp"
 
+#include "basalt/core/bounds_check.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/exact_slots.hpp"
 
@@ -705,6 +706,13 @@ const uint8_t* ExpertTier::blob_of(int layer, int e) const {
     return file_.data() + s_.range.offset + el.offset + (uint64_t) e * el.blob_bytes;
 }
 
+bool ExpertTier::slot_ok(uint32_t site, int layer, const void* p, uint64_t n) const {
+    if (!bounds::enabled()) return true;
+    const uintptr_t a = (uintptr_t) p, xb = (uintptr_t) ext_.base();
+    if (ext_.valid() && a >= xb && a - xb <= (uint64_t) ext_.mapped_bytes() && n <= (uint64_t) ext_.mapped_bytes() - (a - xb)) return true;
+    return bounds::host_range((bounds::Site) site, layer, p, n, cache_.base(), (uint64_t) std::max<int64_t>(cache_.mapped_bytes(), 0));
+}
+
 const uint8_t* ExpertTier::slot_ptr(int32_t slot) const {
     const int64_t nb = base_slots();
     if (slot < nb) return cache_.device_slot(phys_.empty() ? slot : phys_[(size_t) slot]);
@@ -1034,8 +1042,10 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
         queue_.push_back(q);
         return slot;
     }
-    if (home) pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
-    pieces(dst, src, cudaMemcpyHostToDevice);
+    if (slot_ok(stream == fetch_stream_ ? bounds::kTierFetch : bounds::kTierPromote, layer, dst, bytes)) {   // else skipped, reported
+        if (home) pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
+        pieces(dst, src, cudaMemcpyHostToDevice);
+    }
     cudaEventRecord(events_[(size_t) ev], stream);
     pending_.push_back({layer, e, slot, ev, home ? o : -1, place});
     return slot;
@@ -1087,8 +1097,17 @@ void ExpertTier::issue(int layer, int pieces) {
     // bus fetch, a window's rows, the drafter's result) would wait for every piece queued before it. A small operation
     // between two pieces lets it go first, after one piece at most. The home's bytes go out on a stream of their own, so
     // the pieces in do not wait for them, nor they for the copies in.
+    const auto ok_q = [&](Queued& q) {   // HY4_BOUNDS_CHECK: dst checked against the slots mapped now, once
+        if (q.chk == 0) q.chk = slot_ok(bounds::kTierPromote, q.p.layer, q.dst, q.bytes) ? 1 : -1;
+        return q.chk > 0;
+    };
     const auto out = [&](Queued& q) {   // every piece out of the home q replaces, and the event behind them
         if (!q.home_to || q.home_off >= q.bytes) return;
+        if (!ok_q(q)) {
+            q.home_off = q.bytes;
+            cudaEventRecord(out_events_[(size_t) q.p.event], out_stream_);
+            return;
+        }
         for (; q.home_off < q.bytes; q.home_off += P) {
             cudaMemcpyAsync(q.home_to + q.home_off, q.dst + q.home_off, std::min(P, q.bytes - q.home_off), cudaMemcpyDeviceToHost,
                             out_stream_);
@@ -1097,6 +1116,16 @@ void ExpertTier::issue(int layer, int pieces) {
         cudaEventRecord(out_events_[(size_t) q.p.event], out_stream_);
     };
     const auto piece = [&](Queued& q) {   // one piece in, the first once the home's bytes are out
+        if (q.off == 0 && !ok_q(q)) {   // skipped, reported
+            if (q.home_to && q.home_off < q.bytes) {
+                q.home_off = q.bytes;
+                cudaEventRecord(out_events_[(size_t) q.p.event], out_stream_);
+            }
+            q.off = q.bytes;
+            cudaEventRecord(events_[(size_t) q.p.event], copy_stream_);
+            pending_.push_back(q.p);
+            return;
+        }
         if (q.home_to && q.off == 0) {
             out(q);
             cudaStreamWaitEvent(copy_stream_, out_events_[(size_t) q.p.event], 0);
@@ -1372,8 +1401,10 @@ void ExpertTier::keep_hottest(const std::vector<int64_t>& keep) {
             while (owner_[(size_t) d] >= 0 && hot[(size_t) owner_[(size_t) d]]) ++d;
             const int e = owner_[(size_t) src];
             if (owner_[(size_t) d] >= 0) res_[base + owner_[(size_t) d]] = -1;
-            cudaMemcpyAsync(const_cast<uint8_t*>(slot_ptr((int32_t) d)), slot_ptr(src), s_.layers[(size_t) l].blob_bytes, cudaMemcpyDeviceToDevice,
-                            copy_stream_);
+            if (slot_ok(bounds::kTierMove, l, slot_ptr((int32_t) d), s_.layers[(size_t) l].blob_bytes) &&
+                slot_ok(bounds::kTierMove, l, slot_ptr(src), s_.layers[(size_t) l].blob_bytes))
+                cudaMemcpyAsync(const_cast<uint8_t*>(slot_ptr((int32_t) d)), slot_ptr(src), s_.layers[(size_t) l].blob_bytes, cudaMemcpyDeviceToDevice,
+                                copy_stream_);
             owner_[(size_t) d] = e;
             res_[base + e] = (int32_t) d;
             owner_[(size_t) src] = -1;
