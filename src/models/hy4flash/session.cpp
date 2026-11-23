@@ -1196,6 +1196,11 @@ private:
 
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
     void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
+        pt_begin(kPtDense);
+        gemm_inner(w, x, y, n_in, n_out, R);
+        pt_end(kPtDense);
+    }
+    void gemm_inner(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
         namespace mmq = basalt::prefill::mmq;
         if (w->type == kTypeNvfp4Planes) return gemm_planes(w, x, nullptr, y, n_in, n_out, R);
         if (R > kMaxWindow && mmq::built() && mmq::fits(w->type, n_out)) {   // a chunk: the tensor-core MMQ product, arows_ rows a time
@@ -1712,6 +1717,12 @@ private:
         const ExpertLayer& el = m_.pack().experts[(size_t) (tl + g_.n_dense)];
         uint8_t* base = ring_ + (size_t) slot * g_.n_expert * stride_;
         cudaStreamWaitEvent(copy_, ring_done_[slot], 0);
+        cudaEvent_t cp0 = nullptr, cp1 = nullptr;
+        if (progress()) {
+            cudaEventCreate(&cp0);
+            cudaEventCreate(&cp1);
+            cudaEventRecord(cp0, copy_);
+        }
         // runs of experts in RAM at an even spacing go in one strided copy
         const std::vector<uint8_t>* away = (size_t) tl < away_.size() && !away_[(size_t) tl].empty() ? &away_[(size_t) tl] : nullptr;
         auto gone = [&](int x) { return away && (*away)[(size_t) x]; };   // the second card computes it
@@ -1736,6 +1747,7 @@ private:
                     if (gap < (ptrdiff_t) el.blob_bytes) break;
                     ++n;
                 }
+                if (progress()) pt_h2d_bytes_ += (double) el.blob_bytes * n;
                 if (n > 1) {
                     cudaMemcpy2DAsync(dst, stride_, src.pinned, (size_t) gap, el.blob_bytes, (size_t) n, cudaMemcpyHostToDevice, copy_);
                 } else {
@@ -1745,6 +1757,7 @@ private:
                 continue;
             }
             if (src.dev) {
+                if (progress()) pt_d2d_bytes_ += (double) el.blob_bytes;
                 if (tier_->slot_ok(core::bounds::kTierSource, tl, src.dev, el.blob_bytes))   // HY4_BOUNDS_CHECK; else skipped, reported
                     cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
             } else if (src.peer) cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), el.blob_bytes, copy_);
@@ -1752,6 +1765,11 @@ private:
             ++e;
         }
         cudaEventRecord(ring_copied_[slot], copy_);
+        if (progress()) {
+            cudaEventRecord(cp1, copy_);
+            std::lock_guard<std::mutex> g(pt_copy_mu_);
+            pt_copy_ev_.push_back({cp0, cp1});
+        }
         return true;
     }
     // The copy is issued from a thread of its own: hundreds of copy calls can hold the caller until the bus has taken most of them.
@@ -1773,7 +1791,9 @@ private:
     bool ring_ready(int tl, int R) {
         const int slot = tl & 1;
         if (ring_layer_[slot] != tl) ring_start(tl, R);
+        const double tw = progress() ? now_ms() : 0;
         if (ring_thr_[slot].joinable()) ring_thr_[slot].join();
+        if (progress()) pt_ring_wait_ms_ += now_ms() - tw;
         return ring_ok_[slot];
     }
     // At the start of layer `l`: the next layer with routed experts starts its copy.
@@ -2270,6 +2290,7 @@ private:
         ra.gate = bk::RouterGate::Sigmoid;
         const bool prompt = R > kMaxWindow && basalt::prefill::mmq::built();
         moe_head(l, R, prompt);
+        tl_mark(kTlMoe);
         if (prompt) {
             pt_begin(kPtMoe);
             const bool moe_ok = moe_prompt(l, tl, R, lay, err);
@@ -2281,6 +2302,7 @@ private:
         }
         if (diag(l)) dump("moe_lat-" + std::to_string(l), lat_out_, (int64_t) R * L);
         if (diag(l)) dump("xlat-" + std::to_string(l), xlat_, (int64_t) R * L);
+        tl_mark(kTlMoeTail);
         moe_tail(l, R);
         return true;
     }
@@ -3115,18 +3137,22 @@ private:
         for (int l = 0; l < g_.n_layers; ++l) {
             basalt::core::progress_tick();   // a layer issued: the watchdog tells a slow window from a stopped one
             ring_ahead(l, R);
+            tl_mark(kTlEngram);
             if (!engram(l, pos0, R, tokens, err)) return false;
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             if (graphs_ && l >= g_.n_dense) {
                 if (!(bsegs_.empty() ? layer_replayed(l, pos0, R, hc, err) : layer_batched(l, pos0, R, hc, err))) return false;
                 continue;
             }
+            tl_mark(kTlHc);
             bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
             bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
             if (diag(l)) dump("attn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
+            tl_mark(kTlAttn);
             const double ta = now_ms();
             if (!attention(l, pos0, R, err)) return false;
             t_att_ms_ += now_ms() - ta;
+            tl_mark(kTlHc);
             bk::hc_post(attn_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
             std::swap(X_, Xn_);
             if (diag(l)) dump("hc_attn_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
@@ -3134,14 +3160,17 @@ private:
             bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
             if (diag(l)) dump("ffn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
             const double tf = now_ms();
+            tl_mark(l < g_.n_dense ? kTlDenseFfn : kTlMoeHead);
             if (!ffn(l, R, err)) return false;
             t_ffn_ms_ += now_ms() - tf;
+            tl_mark(kTlHc);
             bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, R, E, g_.rms_eps, stream_);
             if (diag(l)) dump("ffn_out-" + std::to_string(l), mlp2_, (int64_t) R * E);
             bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
             std::swap(X_, Xn_);
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
         }
+        tl_mark(kTlTail);
         if (!join_moe(err)) return false;
         if (tier_) tier_->pump(-1, core::ExpertTier::kAllPieces);
         if (head_rows > 0) {
@@ -3495,11 +3524,27 @@ private:
     // DIAG BASALT_PROMPT_PROGRESS=1: a line per prompt chunk - its rows, the cells so far, wall ms, and the GPU ms of its phases
     // from event pairs (the indexer, inside it the scores and the top-k select, the sparse and the window layers' attention, the
     // MoE; "rest" = wall - their sum). The events are read once at the chunk's end. Off by default; the output is unchanged.
-    enum { kPtIndexer, kPtScore, kPtSelect, kPtAttSparse, kPtAttWin, kPtMoe, kPtN };
+    enum { kPtIndexer, kPtScore, kPtSelect, kPtAttSparse, kPtAttWin, kPtMoe, kPtDense, kPtN };
+    // The stream's timeline in contiguous steps (each mark ends the step before it): every GPU ms of the chunk falls in one
+    // step, idle waits included. Steps: the Engram, the hyper-connections and norms, the attention (its projections, the
+    // indexer and the attention kernels), the dense layers' FFN, the MoE's head (router, routed_down, shared expert), the
+    // routed experts, the MoE's tail (routed_up) and the chunk's end.
+    enum { kTlEngram, kTlHc, kTlAttn, kTlDenseFfn, kTlMoeHead, kTlMoe, kTlMoeTail, kTlTail, kTlN };
+    std::vector<std::pair<int, int>> tl_marks_;   // (event index, step it starts)
+    double pt_ring_wait_ms_ = 0;
+    std::atomic<double> pt_h2d_bytes_{0}, pt_d2d_bytes_{0};
+    std::mutex pt_copy_mu_;
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> pt_copy_ev_;
+    void tl_mark(int step) {
+        if (!progress() || rows_ <= kMaxWindow) return;
+        const int i = pt_event();
+        cudaEventRecord(pt_ev_[(size_t) i], stream_);
+        tl_marks_.push_back({i, step});
+    }
     static bool progress() { static const bool on = [] { const char* e = std::getenv("BASALT_PROMPT_PROGRESS"); return e && *e && *e != '0'; }(); return on; }
     std::vector<cudaEvent_t> pt_ev_;
     std::vector<std::pair<int, int>> pt_open_[kPtN];   // (begin event index, end event index) per phase
-    int pt_used_ = 0, pt_chunk_ = 0, pt_cur_[kPtN] = {-1, -1, -1, -1, -1, -1};
+    int pt_used_ = 0, pt_chunk_ = 0, pt_cur_[kPtN] = {-1, -1, -1, -1, -1, -1, -1};
     int pt_event() {
         if (pt_used_ == (int) pt_ev_.size()) {
             cudaEvent_t e = nullptr;
@@ -3522,9 +3567,30 @@ private:
         pt_cur_[ph] = -1;
     }
     void progress_line(int rows, int64_t cells, double t0) {
+        tl_mark(kTlTail);   // closes the chunk's last step
         cudaStreamSynchronize(stream_);
         const double wall = now_ms() - t0;
-        double ms[kPtN] = {0, 0, 0, 0, 0, 0};
+        double ms[kPtN] = {0, 0, 0, 0, 0, 0, 0};
+        double tl[kTlN] = {}, tl_sum = 0;
+        for (size_t k = 0; k + 1 < tl_marks_.size(); ++k) {
+            float x = 0;
+            if (cudaEventElapsedTime(&x, pt_ev_[(size_t) tl_marks_[k].first], pt_ev_[(size_t) tl_marks_[k + 1].first]) == cudaSuccess) {
+                tl[tl_marks_[k].second] += x;
+                tl_sum += x;
+            }
+        }
+        tl_marks_.clear();
+        double cp_ms = 0;
+        {
+            std::lock_guard<std::mutex> g(pt_copy_mu_);
+            for (auto [a, b] : pt_copy_ev_) {
+                float x = 0;
+                if (cudaEventSynchronize(b) == cudaSuccess && cudaEventElapsedTime(&x, a, b) == cudaSuccess) cp_ms += x;
+                cudaEventDestroy(a);
+                cudaEventDestroy(b);
+            }
+            pt_copy_ev_.clear();
+        }
         for (int ph = 0; ph < kPtN; ++ph) {
             for (auto [b, e] : pt_open_[ph]) {
                 float x = 0;
@@ -3544,6 +3610,15 @@ private:
                           pt_chunk_++, rows, (long long) cells, wall, ms[kPtIndexer], ms[kPtScore], ms[kPtSelect], ms[kPtAttSparse], ms[kPtAttWin], ms[kPtMoe],
                           wall - ms[kPtIndexer] - ms[kPtAttSparse] - ms[kPtAttWin] - ms[kPtMoe], (long long) backed_, tier_ ? (long long) tier_->slots() : 0LL,
                           fr / 1073741824.0, lu / G, lb / G, nu / G, nb / G);
+        basalt::log::info("basalt hy4flash", "prompt chunk %d timeline: %.0f GPU ms of %.0f wall; engram %.0f, hc+norms %.0f, attention %.0f, "
+                          "dense FFN %.0f, MoE head %.0f, routed experts %.0f, MoE tail %.0f, end %.0f; dense products %.0f (nested); ring: "
+                          "H2D %.2f GB + D2D %.2f GB in %.0f ms of the copy stream (%.1f GB/s), host waited %.0f ms for its copy thread",
+                          pt_chunk_ - 1, tl_sum, wall, tl[kTlEngram], tl[kTlHc], tl[kTlAttn], tl[kTlDenseFfn], tl[kTlMoeHead], tl[kTlMoe],
+                          tl[kTlMoeTail], tl[kTlTail], ms[kPtDense], pt_h2d_bytes_.load() / 1e9, pt_d2d_bytes_.load() / 1e9, cp_ms,
+                          cp_ms > 0 ? pt_h2d_bytes_.load() / 1e6 / cp_ms : 0.0, pt_ring_wait_ms_);
+        pt_h2d_bytes_ = 0;
+        pt_d2d_bytes_ = 0;
+        pt_ring_wait_ms_ = 0;
     }
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
