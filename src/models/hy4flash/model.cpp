@@ -66,6 +66,13 @@ const DevTensor* Hy4Model::tensor(const std::string& name) const {
     return it == dev_.end() ? nullptr : &it->second;
 }
 
+std::vector<const DevTensor*> Hy4Model::planes_tensors() const {
+    std::vector<const DevTensor*> v;
+    for (const auto& [n, d] : dev_)
+        if (d.type == kTypeNvfp4Planes) v.push_back(&d);
+    return v;
+}
+
 bool Hy4Model::embedding_row(int32_t token, float* out) const {
     const uint64_t n = (uint64_t) geo().n_embd;
     if (token < 0 || (int64_t) token >= geo().n_vocab) return false;
@@ -188,6 +195,16 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         reads.add(it);
         dense += d.bytes;
         dev_.emplace(name, std::move(d));
+    }
+    // dense NVFP4 planes: each needs its FP32 scale `<name>.scale` and shapes both of its kernels take
+    for (auto& [name, d] : dev_) {
+        if (d.type != kTypeNvfp4Planes) continue;
+        auto s = dev_.find(name + ".scale");
+        if (s == dev_.end() || s->second.type != 0 || s->second.bytes != 4)
+            return {model::Status::Error, "hy4flash: " + name + " (NVFP4 planes) has no F32 scalar " + name + ".scale"};
+        if (d.shape.size() != 2 || d.shape[0] % 256 != 0 || d.shape[1] % 128 != 0 || d.bytes != d.shape[0] * d.shape[1] / 64 * 36)
+            return {model::Status::Error, "hy4flash: " + name + " (NVFP4 planes) is not [K % 256, rows % 128]"};
+        d.scale = (const float*) s->second.ptr;
     }
     fp8_ = req.kv == "fp8";
     f32_ = req.kv == "f32";

@@ -28,6 +28,8 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/prefill/cpu_split.hpp"
 #include "basalt/program/expert_spill.hpp"
+#include "basalt/kernels/window_gemm.hpp"
+#include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/log.hpp"
@@ -134,6 +136,8 @@ struct Scratch {
     void *xq1 = nullptr, *xq2 = nullptr;
     float* fp4_gs = nullptr;        // the FP4 prompt experts: token scales [kMaxChunk], then H's [scale_count]
     int32_t* fp4_plan = nullptr;    // their tile and block tables (2 x (kStageExperts + 1))
+    void *wact = nullptr, *wact_n = nullptr;            // dense NVFP4 planes in a window: bf16 rows of x, and of xn_
+    basalt::kernels::wgemm::Workspace wws;              // their split-K sums
     struct Staged {
         uint8_t* blobs = nullptr;
         int32_t *tok = nullptr, *bounds = nullptr;
@@ -327,6 +331,29 @@ public:
             sc.fp4_gs = f((int64_t) kMaxChunk + (int64_t) f4::scale_count(kLaunchRows, kStageExperts));
             sc.fp4_plan = (int32_t*) alloc((size_t) 2 * (kStageExperts + 1) * 4, ok);
         }
+        if (!m_.planes_tensors().empty()) {   // dense NVFP4: the window products' activations and split-K workspace
+            namespace wg = basalt::kernels::wgemm;
+            int64_t kmax = 0;
+            size_t pf = 0, tk = 0;
+            for (const DevTensor* t : m_.planes_tensors()) {
+                wg::Call c;
+                c.fmt = wg::Format::Nvfp4;
+                c.K = (int64_t) t->shape[0];
+                c.m[0].rows = (int64_t) t->shape[1];
+                size_t a = 0, b = 0;
+                wg::workspace_need(c, a, b);
+                pf = std::max(pf, a);
+                tk = std::max(tk, b);
+                kmax = std::max(kmax, c.K);
+            }
+            sc.wact = alloc(wg::act_bytes(kmax), ok);
+            sc.wact_n = alloc(wg::act_bytes(g_.n_embd), ok);
+            sc.wws.partial = f((int64_t) std::max<size_t>(pf, 4));
+            sc.wws.partial_floats = pf;
+            sc.wws.tickets = (int32_t*) alloc(std::max<size_t>(tk, 1) * 4, ok);
+            sc.wws.tickets_n = tk;
+            if (ok) cudaMemset(sc.wws.tickets, 0, std::max<size_t>(tk, 1) * 4);
+        }
         sc.heads_ids = (int32_t*) alloc(((size_t) max_heads_ * kAttRows + mmq::kIdsTail) * 4, ok);   // MMQ reads a tile past the last row
         sc.heads_bounds = (int32_t*) alloc((size_t) (max_heads_ + 1) * 4, ok);
         sc.rowptr_d = (const float**) alloc(kLookupK * sizeof(void*), ok);
@@ -362,7 +389,8 @@ public:
             stage_[i].tok = sc.stage[i].tok;
             stage_[i].bounds = sc.stage[i].bounds;
         }
-        xq1_ = sc.xq1; xq2_ = sc.xq2; fp4_gs_ = sc.fp4_gs; fp4_plan_ = sc.fp4_plan; heads_ids_ = sc.heads_ids; heads_bounds_ = sc.heads_bounds; rowptr_d_ = sc.rowptr_d;
+        xq1_ = sc.xq1; xq2_ = sc.xq2; fp4_gs_ = sc.fp4_gs; fp4_plan_ = sc.fp4_plan; wact_ = sc.wact; wact_n_ = sc.wact_n; wws_ = sc.wws;
+        heads_ids_ = sc.heads_ids; heads_bounds_ = sc.heads_bounds; rowptr_d_ = sc.rowptr_d;
         h_rowptr_ = sc.h_rowptr; bounds_tab_ = sc.bounds_tab; h_plan_ = (WindowPlan*) sc.h_plan;
     }
 
@@ -427,13 +455,13 @@ public:
         b.mmq_ident = (int32_t*) f(A + basalt::prefill::mmq::kIdsTail);
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
         if (count) {
-            f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
+            f((int64_t) (xq_bytes(A) + 3) / 4);
             b = Bufs();
             return true;
         }
         if (ok) {
             void* q = nullptr;
-            if (cudaMalloc(&q, std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim)))) != cudaSuccess) ok = false;
+            if (cudaMalloc(&q, xq_bytes(A)) != cudaSuccess) ok = false;
             else {
                 b.dev.push_back(q);
                 b.mmq_xq = q;
@@ -453,6 +481,13 @@ public:
         return true;
     }
 
+    // mmq_xq_: a chunk step's quantised rows for MMQ (16384 columns at most, or every head's), or a planes product's FP4
+    // activations (token tiles padded to 256) and token scales
+    size_t xq_bytes(int64_t A) const {
+        namespace mmq = basalt::prefill::mmq;
+        return std::max({mmq::q8_bytes(A, 16384), mmq::q8_bytes(A * max_heads_, std::max(g_.kv_lora, g_.qk_dim)),
+                         basalt::prefill::fp4_dense::act_bytes(A, 16384) + 256 + (size_t) A * 4});
+    }
     // The session's row buffers are `b`'s from here on.
     void use(const Bufs& b) {
         rows_ = b.rows;
@@ -1119,6 +1154,7 @@ private:
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
     void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
         namespace mmq = basalt::prefill::mmq;
+        if (w->type == kTypeNvfp4Planes) return gemm_planes(w, x, nullptr, y, n_in, n_out, R);
         if (R > kMaxWindow && mmq::built() && mmq::fits(w->type, n_out)) {   // a chunk: the tensor-core MMQ product, arows_ rows a time
             if (loaded_.insert({w->type, n_out}).second) mmq::load(w->type, n_out);
             for (int r0 = 0; r0 < R; r0 += arows_) {
@@ -1146,6 +1182,79 @@ private:
             const int nc = std::min(kMaxWindow, R - c0);
             bk::native_quantize_q8_1(x + (size_t) c0 * n_in, q8_, n_in, nc, stream_);
             bk::native_mmvq(w->type, w->ptr, q8_, y + (size_t) c0 * n_out, n_in, n_out, nc, stream_);
+        }
+    }
+    // Products of one input: a chunk quantises each arows_ block of x once for all of them (MMQ's q8_1 rows depend on the
+    // weight type, so only products of one type share; the rest, and NVFP4 planes, run as gemm). Each product's rows are
+    // gemm's, the same bits. A window runs gemm_n / gemm per product.
+    struct Out {
+        const DevTensor* w;
+        float* y;
+        int n_out;
+    };
+    void gemm_shared(const float* x, int n_in, std::initializer_list<Out> outs, int R) {
+        namespace mmq = basalt::prefill::mmq;
+        const Out& o0 = *outs.begin();
+        bool share = R > kMaxWindow && mmq::built() && o0.w->type != kTypeNvfp4Planes;
+        for (const Out& o : outs) share = share && o.w->type == o0.w->type && mmq::fits(o.w->type, o.n_out);
+        if (!share) {
+            for (const Out& o : outs)
+                if (x == xn_ && n_in == g_.n_embd) gemm_n(o.w, o.y, o.n_out, R);
+                else gemm(o.w, x, o.y, n_in, o.n_out, R);
+            return;
+        }
+        for (const Out& o : outs)
+            if (loaded_.insert({o.w->type, o.n_out}).second) mmq::load(o.w->type, o.n_out);
+        for (int r0 = 0; r0 < R; r0 += arows_) {
+            const int nb = std::min(arows_, R - r0);
+            mmq::quantize(x + (size_t) r0 * n_in, nullptr, mmq_xq_, o0.w->type, n_in, n_in, nb, stream_);
+            for (const Out& o : outs) {
+                mmq::Product p;
+                p.w = o.w->ptr;
+                p.type = o.w->type;
+                p.w_rows = o.n_out;
+                p.w_cols = n_in;
+                p.expert_bytes = mmq::matrix_bytes(o.w->type, o.n_out, n_in);
+                p.n = 1;
+                p.xq = mmq_xq_;
+                p.bounds = bounds_tab_ + 2 * nb;
+                p.ids = mmq_ident_;
+                p.total_rows = nb;
+                p.max_rows = nb;
+                p.dst = o.y + (size_t) r0 * o.n_out;
+                p.ld_dst = o.n_out;
+                mmq_.run(p, stream_);
+            }
+        }
+    }
+    // A dense NVFP4 matrix in planes: a window's rows as bf16 against the FP4 codes (wgemm; `act` already packed, or packed
+    // here), a chunk's rows rounded to FP4 per token on the block-scaled tensor cores (fp4_dense, W4A4), arows_ rows a time;
+    // the activation planes and token scales go in mmq_xq_.
+    void gemm_planes(const DevTensor* w, const float* x, const void* act, float* y, int n_in, int n_out, int R) {
+        namespace wg = basalt::kernels::wgemm;
+        namespace fd = basalt::prefill::fp4_dense;
+        if (R <= kMaxWindow) {
+            if (!act) {
+                wg::pack(x, n_in, n_in, R, wact_, stream_);
+                act = wact_;
+            }
+            wg::Call c;
+            c.fmt = wg::Format::Nvfp4;
+            c.K = n_in;
+            c.m[0].w = (const uint8_t*) w->ptr;
+            c.m[0].rows = n_out;
+            c.m[0].scale = w->scale;
+            c.m[0].y = y;
+            c.m[0].ld_y = n_out;
+            wg::gemm(c, act, R, wws_, stream_);
+            return;
+        }
+        const size_t gs_at = (fd::act_bytes(arows_, n_in) + 255) & ~(size_t) 255;
+        float* gs = (float*) ((uint8_t*) mmq_xq_ + gs_at);
+        for (int r0 = 0; r0 < R; r0 += arows_) {
+            const int nb = std::min(arows_, R - r0);
+            fd::quantize(x + (size_t) r0 * n_in, nb, n_in, n_in, mmq_xq_, gs, stream_);
+            fd::product(w->ptr, w->scale, n_out, n_in, mmq_xq_, gs, nb, y + (size_t) r0 * n_out, n_out, false, stream_);
         }
     }
     // The per-head products of the absorbed attention (k_b: 192 -> 512, v_b: 512 -> 256 per head): a chunk takes MMQ, a head at a time
@@ -1181,9 +1290,11 @@ private:
     // bits, fewer launches. A chunk keeps gemm.
     void quant_n(int R) {
         if (R <= kMaxWindow) bk::native_quantize_q8_1(xn_, xq_n_, g_.n_embd, R, stream_);
+        if (R <= kMaxWindow && wact_n_) basalt::kernels::wgemm::pack(xn_, g_.n_embd, g_.n_embd, R, wact_n_, stream_);
     }
     void gemm_n(const DevTensor* w, float* y, int n_out, int R) {
         if (R > kMaxWindow) return gemm(w, xn_, y, g_.n_embd, n_out, R);
+        if (w->type == kTypeNvfp4Planes) return gemm_planes(w, xn_, wact_n_, y, g_.n_embd, n_out, R);
         bk::native_mmvq(w->type, w->ptr, xq_n_, y, g_.n_embd, n_out, R, stream_);
     }
     const DevTensor* T(int l, const char* s) const { return m_.tensor(l, s); }
@@ -3112,6 +3223,8 @@ private:
     void *xq1_ = nullptr, *xq2_ = nullptr;
     float* fp4_gs_ = nullptr;
     int32_t* fp4_plan_ = nullptr;
+    void *wact_ = nullptr, *wact_n_ = nullptr;
+    basalt::kernels::wgemm::Workspace wws_;
     basalt::prefill::mmq::Context mmq_;
     std::set<std::pair<int, int>> loaded_;   // (type, rows) the MMQ tiles are loaded for
     void *mmq_xq_ = nullptr;
