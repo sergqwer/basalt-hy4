@@ -43,6 +43,11 @@ void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64
 /// bytes `quantize` writes when given those ids.
 void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream);
 
+/// Entries an `ids` table needs past the last row a product reads: each expert's tile reads a whole tile width (up to 128)
+/// of ids from its first row and ignores the ones past its rows, so the last expert's tile reads up to 127 entries past the
+/// table's end (an illegal access when the allocation ends a mapped range).
+inline constexpr int64_t kIdsTail = 128;
+
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
 /// dst rows of the same indices (`ld_dst` floats apart, via `ids`: dst row = ids[row], an identity table works).
