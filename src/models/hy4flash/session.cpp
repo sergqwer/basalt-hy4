@@ -3106,6 +3106,11 @@ private:
         }
         tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
         if (!await_ids(l, g0, err)) return false;
+        if (std::FILE* tf = route_trace()) {   // DIAG HY4_ROUTE_TRACE: int32 records {layer, rows, ids[rows * K]} of every decode group
+            const int32_t hd[2] = {tl, G};
+            std::fwrite(hd, 4, 2, tf);
+            std::fwrite(h_ids_, 4, (size_t) G * K, tf);
+        }
         int32_t uniq[kLookupK];
         int uidx[kLookupK], nu = 0;
         core::ExpertTier::Use* use = pd.use;
@@ -3879,6 +3884,11 @@ private:
     // Re-seed (default; HY4_RESEED=0 turns it off): the take-back after a lending prompt refills the returned slots with that
     // prompt's most routed experts per layer (descending count) instead of the experts the lends evicted. Placement only: the
     // outputs do not change. Measured at 128K (agent text): routed experts 61.3 -> 56.4 ms a window, decode 37.2 -> 39.5 tok/s.
+    // DIAG HY4_ROUTE_TRACE=FILE: the decode routing, appended (the format of the tier simulator, hy4-data/e3/sim_hy4_tier.py).
+    static std::FILE* route_trace() {
+        static std::FILE* f = [] { const char* e = std::getenv("HY4_ROUTE_TRACE"); return e && *e ? std::fopen(e, "ab") : nullptr; }();
+        return f;
+    }
     static const char* route_count_file() { static const char* f = std::getenv("HY4_ROUTE_COUNTS"); return f; }
     static bool reseed_on() { static const bool on = [] { const char* e = std::getenv("HY4_RESEED"); return !(e && *e == '0'); }(); return on; }
     static bool route_count_on() { return route_count_file() != nullptr || reseed_on(); }

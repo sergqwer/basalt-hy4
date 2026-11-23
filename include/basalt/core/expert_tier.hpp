@@ -364,6 +364,8 @@ private:
     /// least looked up, skipping experts this very lookup uses), or -1; `best` gets its last use (the current tick when
     /// every slot is in use by this lookup).
     int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
+    /// BASALT_TIER_ADMIT_FILTER (opt-in, victims picked by use): whether `e` may take the slot `oldest_slot` would give it.
+    bool admits(int layer, int e, bool homes_too);
     /// Moves (layer, e) into the second card when the expert it replaces there was last used core::policy::kPeerMoveAge
     /// lookups before the main card's oldest.
     bool move_to_peer(int layer, int e, const uint8_t* src);
@@ -475,6 +477,7 @@ private:
 
     core::ExpertMapTally map_;              ///< the expert map's sample, counted from the first expert_map()
     int64_t hits_ = 0, cpu_ = 0, ram_hits_ = 0, promoted_ = 0, fetched_ = 0, dropped_ = 0, peer_hits_ = 0, file_hits_ = 0;
+    int64_t declined_ = 0;   ///< copies the admission filter refused
 };
 
 }  // namespace basalt::core

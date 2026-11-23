@@ -34,6 +34,12 @@
 
 namespace basalt::core {
 namespace {
+// BASALT_TIER_ADMIT_FILTER (opt-in): 1 = a promotion takes a slot only from an expert looked up less lately than itself
+// (policy::admits_over), 2 = the bus fetches too; 0 / unset: every admitted miss takes the victim's slot.
+int admit_filter() {
+    static const int v = [] { const char* e = std::getenv("BASALT_TIER_ADMIT_FILTER"); return e ? std::atoi(e) : 0; }();
+    return v;
+}
 
 constexpr size_t kMaxPending = 128;              // copies claimed a window
 constexpr size_t kEvents = 2 * kMaxPending;      // a window's and the last one's copies
@@ -1138,6 +1144,18 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
     return slot;
 }
 
+bool ExpertTier::admits(int layer, int e, bool homes_too) {
+    if (looks_.empty()) return true;
+    uint64_t best = 0;
+    const int32_t slot = oldest_slot(layer, homes_too, best);
+    const int32_t o = slot < 0 ? -1 : owner_[(size_t) slot];
+    if (o < 0) return true;   // an empty slot, or none (claim refuses that)
+    const size_t base = (size_t) layer * n_expert_;
+    if (core::policy::admits_over(looks_[base + e], looks_[base + o])) return true;
+    ++declined_;
+    return false;
+}
+
 bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     if (homes_.peer == 0 || spare_[(size_t) layer] < 0) return false;
     const size_t base = (size_t) layer * n_expert_;
@@ -1336,6 +1354,7 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     int started = 0;
     for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
         if (lk.dev[i] || !eligible(i)) continue;   // pinned sources only
+        if (admit_filter() >= 2 && !admits(layer, lk.experts[i], false)) continue;   // stays with the CPU
         --left;
         const int32_t slot = far > 0 ? claim(layer, lk.experts[i], lk.host[i], copy_stream_, false, false, /*later=*/true)
                                      : claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true);
@@ -1364,6 +1383,7 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
         if (lk.dev[i] || lk.fetched[i] || lk.dropped[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         // with the RAM tier caching the file, the experts the CPU keeps computing; else a repeat miss
         if (reads_.is_open() && s_.admit_uses == 0 ? !core::policy::count_use(uses_[(size_t) layer * n_expert_ + lk.experts[i]]) : !lk.again[i]) continue;
+        if (admit_filter() >= 1 && !admits(layer, lk.experts[i], true)) continue;
         if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
             claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true, /*whole=*/false, /*later=*/true);
     }
@@ -1796,6 +1816,9 @@ void ExpertTier::report(const char* tag) const {
     basalt::log::info(s_.area.c_str(), "TIER %s: %lld lookups: %.1f%% VRAM, %.1f%% second card, %.1f%% bus copy, %.1f%% CPU (file %.1f%%); promoted %lld, dropped %lld", tag,
                  (long long) n, 100.0 * (double) hits_ / (double) n, 100.0 * (double) peer_hits_ / (double) n, 100.0 * (double) fetched_ / (double) n,
                  100.0 * (double) cpu_ / (double) n, 100.0 * (double) file_hits_ / (double) n, (long long) promoted_, (long long) dropped_);
+    if (admit_filter() > 0)
+        basalt::log::info(s_.area.c_str(), "TIER %s: the admission filter (BASALT_TIER_ADMIT_FILTER=%d) declined %lld copies", tag, admit_filter(),
+                          (long long) declined_);
     if (reads_.is_open())
         basalt::log::info(s_.area.c_str(), "TIER %s: %lld experts read into the RAM tier (%s)", tag, (long long) read_,
                           reads_.unbuffered() ? "unbuffered" : "through the file cache");
