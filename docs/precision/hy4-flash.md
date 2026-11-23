@@ -72,7 +72,15 @@ A decode row's arithmetic does not depend on how many rows share its window.
 - **`--kv int8` against fp16 rows, per answer:** a greedy fp16 answer is teacher-forced through each format, with the tier
   pinned (`--expert-cache 4800`). A 32,768-token agent prompt (355 answer tokens) reads mean KLD 0.0044, p99 0.040, same
   top-1 97.18%. A short chat (512 tokens) reads 0.0073, p99 0.137, top-1 98.24%. A second fp16 run reads exactly 0: the
-  engine is deterministic with a pinned tier.
+  engine is deterministic with a pinned tier. Those bases and arms ran on one build. After the 700 MiB VRAM reserve changed the
+  tier's start plan, an fp16 run scores 0.0053 against the old 32K base. Re-runs of int8 against that base (0.0053-0.0054)
+  measure that drift, not int8. Compare only arms run on the base's own build.
+- **`--kv int8` at 128K, per answer:** a 128,000-token coding-agent prompt (94 answer tokens), with base and arms on one
+  build, reads mean KLD 0.0151, p99 0.188, top-1 94.68%. The tier-shift noise arm (fp16, `--expert-cache 4000`) reads
+  0.0019, top-1 98.94%, so int8 costs about 8 times the noise at that depth, against about 2 times at 32K.
+  `HY4_I8_MMA=1` scores the int8 rows on the fp16 kernel with an unsplit query, and reads 0.0128. The error is the rows', not
+  the query split's. On real rows the int8 row error is about 0.65% (the floor of 8-bit amax scaling over 128 values). A
+  Hadamard rotation lowers it only in layer 0 (1.14% to 0.59%), so it was not built. fp16 stays the default.
 - Needles in a 253,410-token prompt are found with fp16 and fp8.
 - Pin the tier when comparing formats: this model declares no `quality_flags` for the gate, so pass `--expert-cache N` (and the
   same count) to both runs. Without it the freer VRAM of fp8 moves experts onto the card and the two runs are not comparable: an
