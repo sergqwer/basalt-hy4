@@ -180,6 +180,10 @@ if(BUILD_TESTING)
   target_include_directories(hy4flash_kernels_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(hy4flash_kernels_parity PRIVATE hy4flash_kernels mmq kernels ggml_quants core ${_gpu_runtime_target})
   basalt_gpu_test(NAME hy4flash_kernels_parity COMMAND hy4flash_kernels_parity)
+  add_executable(hc_fused_parity tests/kernels/hc_fused_parity.cpp)
+  target_include_directories(hc_fused_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(hc_fused_parity PRIVATE kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME hc_fused_parity COMMAND hc_fused_parity)
   add_executable(hy4flash_context_policy_test src/models/hy4flash/context_policy_test.cpp)
   target_include_directories(hy4flash_context_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_cpu_test(NAME hy4flash_context_policy_test COMMAND hy4flash_context_policy_test)
@@ -330,6 +334,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/nvfp4_planes.cu
                         src/kernels/cuda/mhc.cu
                         src/kernels/cuda/mhc_plain.cu
+                        src/kernels/cuda/hc_fused.cu
                         src/kernels/cuda/router.cu
                         src/kernels/cuda/router_tc.cu
                         src/kernels/cuda/route_tail_skip.cu
