@@ -2227,7 +2227,7 @@ private:
 
     void prefetch_engram(int64_t pos0, int R) {
         const EngramInfo& en = m_.pack().engram;
-        const int n_cols = en.n_cols(), W = en.row_values;
+        const int n_cols = en.n_cols();
         early_of_.assign((size_t) R, -1);
         std::vector<int> own;   // the rows not asked for early
         for (int t = 0; t < R; ++t) {
@@ -2255,7 +2255,7 @@ private:
                 p.at[(size_t) t] = (int) i;
             }
             if (own.empty()) continue;
-            p.raw.resize(own.size() * n_cols * W);
+            p.raw.resize(own.size() * n_cols * en.row_bytes);
             p.tk = m_.engram_reader().issue(ids.data(), ids.size(), p.raw.data());
             p.issued = true;
         }
@@ -2272,7 +2272,7 @@ private:
     void issue_early(int64_t pos, int32_t tok, int32_t p1, int32_t p2) {
         const EngramInfo& en = m_.pack().engram;
         if (en.layers.empty() || early_.size() >= (size_t) kMaxWindow) return;
-        const int n_cols = en.n_cols(), W = en.row_values, ne = (int) en.layers.size();
+        const int n_cols = en.n_cols(), ne = (int) en.layers.size();
         EarlyRow r;
         r.pos = pos;
         r.tok = tok;
@@ -2280,7 +2280,7 @@ private:
         r.p2 = p2;
         std::vector<uint32_t> ids((size_t) ne * n_cols);
         for (int e = 0; e < ne; ++e) engram_ids(en, e, tok, p1, p2, pos, false, ids.data() + (size_t) e * n_cols, r.valid);
-        r.raw.resize((size_t) ne * n_cols * W);
+        r.raw.resize((size_t) ne * n_cols * en.row_bytes);
         r.tk = m_.engram_reader().issue(ids.data(), ids.size(), r.raw.data());
         early_.push_back(std::move(r));
     }
@@ -2326,12 +2326,19 @@ private:
             Lap wait{time_prompt ? &t_eng_read_ms_ : nullptr, time_prompt ? now_ms() : 0};
             return m_.engram_reader().collect(ticket, err);
         };
-        const int n_cols = en.n_cols(), W = en.row_values;
-        static const std::vector<float> lut = [] {
+        const int n_cols = en.n_cols(), W = en.row_values, RB = (int) en.row_bytes;   // a row's values, its stored bytes
+        const bool scaled = en.scaled();                                                  // int8 values times the row's fp16 scale
+        static const std::vector<float> lut_e4m3 = [] {
             std::vector<float> t(256);
-            for (int i = 0; i < 256; ++i) t[(size_t) i] = e4m3_to_f32((uint8_t) i);
+            for (int i = 0; i < 256; ++i) t[(size_t) i] = engram_code_to_f32((uint8_t) i, false);
             return t;
         }();
+        static const std::vector<float> lut_i8 = [] {
+            std::vector<float> t(256);
+            for (int i = 0; i < 256; ++i) t[(size_t) i] = engram_code_to_f32((uint8_t) i, true);
+            return t;
+        }();
+        const std::vector<float>& lut = scaled ? lut_i8 : lut_e4m3;
         if (eng_ev_) cudaEventSynchronize(eng_ev_);   // the last Engram layer's copies out of these host rows have landed
         Prefetch* pf = (size_t) e < pf_.size() ? &pf_[(size_t) e] : nullptr;
         std::vector<uint8_t> own_raw;
@@ -2359,7 +2366,7 @@ private:
                 engram_ids(en, e, tokens[t], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, valid);
                 h_evalid_[t] = valid;
             }
-            own_raw.resize((size_t) R * n_cols * W);
+            own_raw.resize((size_t) R * n_cols * RB);
             ngram::PleReader& rd = m_.engram_reader();
             const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), own_raw.data());
             if (!collect(tk)) return false;
@@ -2374,26 +2381,29 @@ private:
         }
         // row t's n_cols rows: from the window's own reads or from its early ones
         const auto rows_of = [&](int t) -> const uint8_t* {
-            if (!pf) return raw + (size_t) t * n_cols * W;
+            if (!pf) return raw + (size_t) t * n_cols * RB;
             const int k = early_of_[(size_t) (off + t)];
-            return k >= 0 ? early_[(size_t) k].raw.data() + (size_t) e * n_cols * W : pf->raw.data() + (size_t) pf->at[(size_t) (off + t)] * n_cols * W;
+            return k >= 0 ? early_[(size_t) k].raw.data() + (size_t) e * n_cols * RB : pf->raw.data() + (size_t) pf->at[(size_t) (off + t)] * n_cols * RB;
         };
         const double norm_start = time_prompt ? now_ms() : 0;
-        // the codes need a fifth more room in the rows' buffer (arows_ rows of n_embd floats) than the rows themselves
-        if (engram_gpu_ && (int64_t) R * n_cols * W * 5 <= (int64_t) arows_ * g_.n_embd * 4) {   // the card decodes and norms the codes
+        // the codes ride after the rows in the rows' buffer (arows_ rows of n_embd floats): R * n_cols * (4 W + RB) bytes in all
+        if (engram_gpu_ && (int64_t) R * n_cols * (4 * W + RB) <= (int64_t) arows_ * g_.n_embd * 4) {   // the card decodes and norms the codes
             if (!d_elut_) {
                 if (cudaMalloc((void**) &d_elut_, 256 * 4) != cudaSuccess) { err = "no device memory for the Engram table"; return false; }
                 bufs_.push_back(d_elut_);
-                cudaMemcpy(d_elut_, lut.data(), 256 * 4, cudaMemcpyHostToDevice);
             }
-            const size_t rb = (size_t) n_cols * W;   // a token's code bytes
+            if (d_elut_type_ != en.type) {   // the decode table of the pack's format
+                cudaMemcpy(d_elut_, lut.data(), 256 * 4, cudaMemcpyHostToDevice);
+                d_elut_type_ = en.type;
+            }
+            const size_t rb = (size_t) n_cols * RB;   // a token's stored bytes
             uint8_t* hraw = (uint8_t*) h_erows_;
             for (int t = 0; t < R; ++t) std::memcpy(hraw + (size_t) t * rb, rows_of(t), rb);
             // the codes ride after the rows in their device buffer (it is sized for n_embd floats a row, the rows take n_cols * W)
-            uint8_t* draw = (uint8_t*) (erows_ + (size_t) R * rb);
+            uint8_t* draw = (uint8_t*) (erows_ + (size_t) R * n_cols * W);
             put_f32((float*) draw, (const float*) hraw, (int64_t) ((R * rb + 3) / 4));
             put_f32(evalid_, h_evalid_, R);
-            engram_rows(draw, d_elut_, (const float*) T(l, "engram_lookup_norm.weight")->ptr, evalid_, R, n_cols, W, erows_, stream_);
+            engram_rows(draw, d_elut_, (const float*) T(l, "engram_lookup_norm.weight")->ptr, evalid_, R, n_cols, W, RB, scaled, erows_, stream_);
             if (time_prompt) t_eng_norm_ms_ += now_ms() - norm_start;
             if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
             cudaEventRecord(eng_ev_, stream_);
@@ -2409,10 +2419,11 @@ private:
             const uint8_t* trow = rows_of(t);
             for (int c = 0; c < n_cols; ++c) {
                 float* row = h_erows_ + ((size_t) t * n_cols + c) * W;
-                const uint8_t* src = trow + (size_t) c * W;
+                const uint8_t* src = trow + (size_t) c * RB;
+                const float sc = scaled ? engram_row_scale(src, W) : 1.f;   // x 1 keeps an E4M3 value's bits
                 float ss = 0.f;
                 for (int d = 0; d < W; ++d) {
-                    row[d] = lut[src[d]];
+                    row[d] = lut[src[d]] * sc;
                     ss += row[d] * row[d];
                 }
                 const float r = 1.0f / std::sqrt(ss / (float) W + 1.1920929e-07f);
@@ -3827,7 +3838,8 @@ private:
     std::shared_ptr<core::ExpertTier> tier_;
     // the Engram rows' E4M3 decode and norm on the card (bit for bit the host loop's); BASALT_ENGRAM_GPU=0 keeps the host loop
     const bool engram_gpu_ = [] { const char* e = std::getenv("BASALT_ENGRAM_GPU"); return !(e && *e == '0'); }();
-    float* d_elut_ = nullptr;   // engram_gpu_: the E4M3 decode table on the card
+    float* d_elut_ = nullptr;   // engram_gpu_: the decode table on the card (E4M3 codes, or int8 values)
+    int d_elut_type_ = -1;      // the Engram type d_elut_ holds
     std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;
     std::vector<uint8_t*> cache_;   // a sparse layer's rows in the --kv format, a window layer's fp16

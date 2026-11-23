@@ -2,6 +2,7 @@
 // Hy4-flash.
 #include "basalt/models/hy4flash/kernels.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstring>
@@ -335,31 +336,34 @@ void engram_apply(const float* kv, const float* kv_b, const float* gate_w, const
 
 // a thread a (token, column) row, its values in order with round-to-nearest operations and no contraction: the host's sums
 __global__ void engram_rows_kernel(const uint8_t* __restrict__ raw, const float* __restrict__ lut, const float* __restrict__ norm,
-                                   const float* __restrict__ valid, int n_rows, int n_cols, int w, float* __restrict__ out) {
+                                   const float* __restrict__ valid, int n_rows, int n_cols, int w, int row_bytes, bool scaled,
+                                   float* __restrict__ out) {
     __shared__ float s_lut[256];
     for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = lut[i];
     __syncthreads();
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
     const int t = row / n_cols, c = row % n_cols;
-    const uint8_t* src = raw + (size_t) row * w;
+    const uint8_t* src = raw + (size_t) row * row_bytes;
     float* dst = out + (size_t) row * w;
+    float sc = 1.f;   // x 1 keeps an E4M3 value's bits
+    if (scaled) sc = __half2float(__ushort_as_half((unsigned short) (src[w] | (src[w + 1] << 8))));
     float ss = 0.f;
     for (int d = 0; d < w; ++d) {
-        const float v = s_lut[src[d]];
+        const float v = __fmul_rn(s_lut[src[d]], sc);
         ss = __fadd_rn(ss, __fmul_rn(v, v));
     }
     const float r = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, (float) w), 1.1920929e-07f)));
     const float vt = valid[t];
     const float* nr = norm + (size_t) c * w;
-    for (int d = 0; d < w; ++d) dst[d] = __fmul_rn(__fmul_rn(__fmul_rn(s_lut[src[d]], r), nr[d]), vt);
+    for (int d = 0; d < w; ++d) dst[d] = __fmul_rn(__fmul_rn(__fmul_rn(__fmul_rn(s_lut[src[d]], sc), r), nr[d]), vt);
 }
 
 void engram_rows(const uint8_t* raw, const float* lut, const float* norm, const float* valid, int n_tok, int n_cols, int w,
-                 float* out, void* stream) {
+                 int row_bytes, bool scaled, float* out, void* stream) {
     const int n = n_tok * n_cols;
     if (n <= 0) return;
-    engram_rows_kernel<<<(n + 127) / 128, 128, 0, (cudaStream_t) stream>>>(raw, lut, norm, valid, n, n_cols, w, out);
+    engram_rows_kernel<<<(n + 127) / 128, 128, 0, (cudaStream_t) stream>>>(raw, lut, norm, valid, n, n_cols, w, row_bytes, scaled, out);
 }
 
 }  // namespace basalt::models::hy4flash
