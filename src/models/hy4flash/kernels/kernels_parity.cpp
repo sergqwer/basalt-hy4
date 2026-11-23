@@ -1734,11 +1734,11 @@ void test_q_direct() {
         cudaMalloc(&c1, R * rb);
         cudaMalloc(&c2, R * rb);
         if (ty == 0) {
-            mla_prepare(dq, dqa, dkv, dn, a, 7, R, 0, qc1, (uint16_t*) c1, nullptr);
-            mla_prepare(dq, nullptr, dkv, dn, a, 7, R, 0, qc2, (uint16_t*) c2, nullptr);
+            mla_prepare(dq, dqa, dkv, dn, a, 0, R, 0, qc1, (uint16_t*) c1, nullptr);
+            mla_prepare(dq, nullptr, dkv, dn, a, 0, R, 0, qc2, (uint16_t*) c2, nullptr);
         } else {
-            mla_prepare(dq, dqa, dkv, dn, a, 7, R, 0, qc1, (int8_t*) c1, nullptr);
-            mla_prepare(dq, nullptr, dkv, dn, a, 7, R, 0, qc2, (int8_t*) c2, nullptr);
+            mla_prepare(dq, dqa, dkv, dn, a, 0, R, 0, qc1, (int8_t*) c1, nullptr);
+            mla_prepare(dq, nullptr, dkv, dn, a, 0, R, 0, qc2, (int8_t*) c2, nullptr);
         }
         cudaDeviceSynchronize();
         const bool sq = host(qc1, (size_t) R * H * W) == host(qc2, (size_t) R * H * W);
