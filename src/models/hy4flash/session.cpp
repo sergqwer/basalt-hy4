@@ -48,6 +48,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <numeric>
 #include <cstring>
 #include <memory>
@@ -1968,6 +1969,31 @@ private:
             return k >= 0 ? early_[(size_t) k].raw.data() + (size_t) e * n_cols * W : pf->raw.data() + (size_t) pf->at[(size_t) (off + t)] * n_cols * W;
         };
         const double norm_start = time_prompt ? now_ms() : 0;
+        // the codes need a fifth more room in the rows' buffer (arows_ rows of n_embd floats) than the rows themselves
+        if (engram_gpu_ && (int64_t) R * n_cols * W * 5 <= (int64_t) arows_ * g_.n_embd * 4) {   // the card decodes and norms the codes
+            if (!d_elut_) {
+                if (cudaMalloc((void**) &d_elut_, 256 * 4) != cudaSuccess) { err = "no device memory for the Engram table"; return false; }
+                bufs_.push_back(d_elut_);
+                cudaMemcpy(d_elut_, lut.data(), 256 * 4, cudaMemcpyHostToDevice);
+            }
+            const size_t rb = (size_t) n_cols * W;   // a token's code bytes
+            uint8_t* hraw = (uint8_t*) h_erows_;
+            for (int t = 0; t < R; ++t) std::memcpy(hraw + (size_t) t * rb, rows_of(t), rb);
+            // the codes ride after the rows in their device buffer (it is sized for n_embd floats a row, the rows take n_cols * W)
+            uint8_t* draw = (uint8_t*) (erows_ + (size_t) R * rb);
+            put_f32((float*) draw, (const float*) hraw, (int64_t) ((R * rb + 3) / 4));
+            put_f32(evalid_, h_evalid_, R);
+            engram_rows(draw, d_elut_, (const float*) T(l, "engram_lookup_norm.weight")->ptr, evalid_, R, n_cols, W, erows_, stream_);
+            if (time_prompt) t_eng_norm_ms_ += now_ms() - norm_start;
+            if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
+            cudaEventRecord(eng_ev_, stream_);
+            gemm(T(l, "engram_kv.weight"), erows_, ekv_, n_cols * W, 5 * g_.n_embd, R);
+            EngramArgs a;
+            a.n_embd = g_.n_embd;
+            engram_apply(ekv_, F(l, "engram_kv_b.weight"), F(l, "engram_gate.weight"), F(l, "engram_pre_gamma.weight"),
+                         F(l, "engram_hc_scale.weight"), evalid_, R, a, X_, stream_);
+            return true;
+        }
         for (int t = 0; t < R; ++t) {
             const float valid = h_evalid_[t];
             const uint8_t* trow = rows_of(t);
@@ -3164,6 +3190,9 @@ private:
         core::ExpertTier::Use use[kLookupK];
     } pend_;
     std::shared_ptr<core::ExpertTier> tier_;
+    // the Engram rows' E4M3 decode and norm on the card (bit for bit the host loop's); BASALT_ENGRAM_GPU=0 keeps the host loop
+    const bool engram_gpu_ = [] { const char* e = std::getenv("BASALT_ENGRAM_GPU"); return !(e && *e == '0'); }();
+    float* d_elut_ = nullptr;   // engram_gpu_: the E4M3 decode table on the card
     std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;
     std::vector<uint8_t*> cache_;   // a sparse layer's rows in the --kv format, a window layer's fp16
