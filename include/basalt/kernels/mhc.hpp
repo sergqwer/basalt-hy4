@@ -67,4 +67,15 @@ inline size_t hc_plain_workspace_floats(int n_tokens, int n_mix = 8) { return (s
 void hc_mixes_plain(const float* x, const float* hc_fn, const float* hc_scale, const float* hc_base, int n_tokens,
                     int n_mix, const HcPlainArgs& a, float* workspace, float* coef, void* stream);
 
+/// One pass at a sublayer boundary, bit-identical to hc_post(f, x, coef, kHcCoef, ..., x_out), then
+/// hc_mixes_plain(x_out, hc_fn, hc_scale, hc_base, n_tokens, 8, a, ..., coef) and hc_pre_rms_norm(x_out, coef, kHcCoef,
+/// norm_w, n_tokens, n_embd, eps, cur, out): a token's new streams stay in shared memory. coef (stride kHcCoef) holds this
+/// sublayer's coefficients on entry and the next one's on return.
+bool hc_post_mix_norm_fits(int n_embd);
+/// Launches of hc_post_mix_norm in this process (a check that the fused path ran).
+long long hc_post_mix_norm_launches();
+void hc_post_mix_norm(const float* f, const float* x, float* coef, int n_tokens, int n_embd, const float* hc_fn,
+                      const float* hc_scale, const float* hc_base, const HcPlainArgs& a, const float* norm_w, float eps,
+                      float* x_out, float* cur, float* out, void* stream);
+
 }  // namespace basalt::kernels

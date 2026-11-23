@@ -3308,6 +3308,8 @@ private:
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
         ring_join();
         ring_layer_[0] = ring_layer_[1] = -1;
+        const bool fused = hc_fused(E);
+        bool pre_done = false;   // the fused pass at the last layer's end already collapsed and normed this one's input
         for (int l = 0; l < g_.n_layers; ++l) {
             basalt::core::progress_tick();   // a layer issued: the watchdog tells a slow window from a stopped one
             ring_ahead(l, R);
@@ -3319,19 +3321,28 @@ private:
                 continue;
             }
             tl_mark(kTlHc);
-            bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
-            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+            if (!pre_done) {
+                bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+                bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+            }
+            pre_done = false;
             if (diag(l)) dump("attn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
             tl_mark(kTlAttn);
             const double ta = now_ms();
             if (!attention(l, pos0, R, err)) return false;
             t_att_ms_ += now_ms() - ta;
             tl_mark(kTlHc);
-            bk::hc_post(attn_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
-            std::swap(X_, Xn_);
-            if (diag(l)) dump("hc_attn_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
-            bk::hc_mixes_plain(X_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
-            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+            if (fused) {
+                bk::hc_post_mix_norm(attn_, X_, coef_, R, E, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), hc,
+                                     F(l, "ffn_norm.weight"), g_.rms_eps, Xn_, cur_, xn_, stream_);
+                std::swap(X_, Xn_);
+            } else {
+                bk::hc_post(attn_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
+                std::swap(X_, Xn_);
+                if (diag(l)) dump("hc_attn_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
+                bk::hc_mixes_plain(X_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+                bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+            }
             if (diag(l)) dump("ffn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
             const double tf = now_ms();
             tl_mark(l < g_.n_dense ? kTlDenseFfn : kTlMoeHead);
@@ -3340,9 +3351,22 @@ private:
             tl_mark(kTlHc);
             bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, R, E, g_.rms_eps, stream_);
             if (diag(l)) dump("ffn_out-" + std::to_string(l), mlp2_, (int64_t) R * E);
-            bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
+            // the next layer's collapse and norm in the same pass, when nothing comes between (no Engram, no graph layer)
+            const int ln = l + 1;
+            if (fused && ln < g_.n_layers && !engram_layer(ln) && !(graphs_ && ln >= g_.n_dense)) {
+                bk::hc_post_mix_norm(mlp2_, X_, coef_, R, E, F(ln, "hc_attn_fn.weight"), F(ln, "hc_attn_scale.weight"), F(ln, "hc_attn_base.weight"),
+                                     hc, F(ln, "attn_norm.weight"), g_.rms_eps, Xn_, cur_, xn_, stream_);
+                pre_done = true;
+            } else {
+                bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
+            }
             std::swap(X_, Xn_);
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
+        }
+        if (fused) {   // once a process: shows the fused boundaries ran
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true))
+                basalt::log::info("basalt hy4flash", "hc_post_mix_norm: %lld launches after the first %d-row window", bk::hc_post_mix_norm_launches(), R);
         }
         tl_mark(kTlTail);
         if (!join_moe(err)) return false;
@@ -3467,6 +3491,16 @@ private:
 
     // diagnostic: a layer whose inner tensors are dumped (the first three)
     bool diag(int l) const { return !m_.diag_dump().empty() && l < 3; }
+    // hc_post_mix_norm at the sublayer boundaries (bit-identical to the three kernels); BASALT_HY4_HC_FUSED=0 turns it off
+    bool hc_fused(int E) const {
+        static const bool on = [] { const char* v = std::getenv("BASALT_HY4_HC_FUSED"); return !v || !*v || *v != '0'; }();
+        return on && m_.diag_dump().empty() && bk::hc_post_mix_norm_fits(E);
+    }
+    bool engram_layer(int l) const {
+        for (int x : m_.pack().engram.layers)
+            if (x == l) return true;
+        return false;
+    }
 
     // DIAG HY4_KV_DUMP=DIR (with --kv f32): a prompt chunk's cache rows (the sparse layers and window layers 2/14/26/38), every
     // 256th row's query rows, cells and indexer query, the pooled keys and the sinks, appended to DIR/<what>-<layer>.bin.
