@@ -815,6 +815,7 @@ public:
         dfly_.invalidate();   // DFLY HOOK
         if (dp_on_ || dp_windows_ > 0) dp_reset();   // a request's decode profile ends with its next prompt
         if (!big_.rows) {   // a prompt starts
+            pcount_.clear();   // the re-seed counts this prompt's routing alone
             turn_report();
             if (tier_) tier_->forget_use();
         }
@@ -2764,7 +2765,7 @@ private:
             }
             by[(size_t) hid[(size_t) p]].push_back(p);
         }
-        if (route_count_on()) {   // DIAG HY4_ROUTE_COUNTS / HY4_RESEED: the prompt's routing per (layer, expert)
+        if (route_count_on()) {   // the prompt's routing per (layer, expert): the re-seed, DIAG HY4_ROUTE_COUNTS
             if (pcount_.empty()) pcount_.assign((size_t) (g_.n_layers - g_.n_dense) * g_.n_expert, 0);
             for (int e = 0; e < g_.n_expert; ++e) pcount_[(size_t) tl * g_.n_expert + e] += (int64_t) by[(size_t) e].size();
         }
@@ -3875,10 +3876,11 @@ private:
     // MoE; "rest" = wall - their sum). The events are read once at the chunk's end. Off by default; the output is unchanged.
     enum { kPtIndexer, kPtScore, kPtSelect, kPtAttSparse, kPtAttWin, kPtMoe, kPtDense, kPtAQkv, kPtAMeta, kPtAKb, kPtAPrep, kPtAVb, kPtAOut, kPtN };
     // DIAG HY4_ROUTE_COUNTS=FILE: at a prompt's end, its routing counts (int64, MoE layers x experts) are written to FILE.
-    // HY4_RESEED=1: the take-back after a lending prompt refills the returned slots with that prompt's most routed experts per
-    // layer (descending count) instead of the experts the lends evicted. Placement only: the outputs do not change.
+    // Re-seed (default; HY4_RESEED=0 turns it off): the take-back after a lending prompt refills the returned slots with that
+    // prompt's most routed experts per layer (descending count) instead of the experts the lends evicted. Placement only: the
+    // outputs do not change. Measured at 128K (agent text): routed experts 61.3 -> 56.4 ms a window, decode 37.2 -> 39.5 tok/s.
     static const char* route_count_file() { static const char* f = std::getenv("HY4_ROUTE_COUNTS"); return f; }
-    static bool reseed_on() { static const bool on = [] { const char* e = std::getenv("HY4_RESEED"); return e && *e == '1'; }(); return on; }
+    static bool reseed_on() { static const bool on = [] { const char* e = std::getenv("HY4_RESEED"); return !(e && *e == '0'); }(); return on; }
     static bool route_count_on() { return route_count_file() != nullptr || reseed_on(); }
     std::vector<int64_t> pcount_;
     void route_counts_end() {
@@ -3890,7 +3892,7 @@ private:
                 std::fclose(fp);
             }
         }
-        if (reseed_on() && tier_) {
+        if (reseed_on() && tier_ && lent_) {   // only a lending prompt's take-back refills
             int64_t placed = 0;
             for (int l = 0; l < nl; ++l) {
                 std::vector<int32_t> order;
