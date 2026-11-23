@@ -6,6 +6,7 @@
 #include "basalt/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdio>
@@ -295,6 +296,34 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
     copy_from_mapped_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src, n4);
     check_launch("copy_from_mapped");
+}
+
+// block = row; a thread per value
+__global__ void embed_rows_kernel(float* __restrict__ dst, const volatile uint8_t* src, int width, int type) {
+    const int r = blockIdx.x;
+    if (type == 8) {
+        const volatile uint8_t* row = src + (int64_t) r * (width / 32) * 34;
+        for (int i = threadIdx.x; i < width; i += blockDim.x) {
+            const volatile uint8_t* b = row + (i >> 5) * 34;
+            const unsigned short bits = (unsigned short) (b[0] | (b[1] << 8));
+            const float d = __half2float(__ushort_as_half(bits));
+            dst[(int64_t) r * width + i] = (float) (int8_t) b[2 + (i & 31)] * d;
+        }
+    } else {
+        const volatile uint16_t* row = (const volatile uint16_t*) src + (int64_t) r * width;
+        for (int i = threadIdx.x; i < width; i += blockDim.x)
+            dst[(int64_t) r * width + i] = __uint_as_float((unsigned) row[i] << 16);
+    }
+}
+
+void embed_rows_from_mapped(float* dst, const uint8_t* src, int rows, int width, int type, void* stream) {
+    if (rows <= 0) return;
+    if ((type != 8 && type != 30) || (type == 8 && width % 32 != 0)) {
+        basalt::log::error("basalt", "embed_rows_from_mapped: type %d with width %d", type, width);
+        std::exit(1);
+    }
+    embed_rows_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(dst, (const volatile uint8_t*) src, width, type);
+    check_launch("embed_rows_from_mapped");
 }
 
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,

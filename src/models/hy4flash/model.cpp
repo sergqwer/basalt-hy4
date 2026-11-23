@@ -7,6 +7,8 @@
 #include "basalt/core/loader.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
+#include <cstdlib>
+#include <cstring>
 #include "basalt/platform/memory.hpp"
 #include "models/hy4flash/context_policy.hpp"
 
@@ -66,9 +68,27 @@ const DevTensor* Hy4Model::tensor(const std::string& name) const {
     return it == dev_.end() ? nullptr : &it->second;
 }
 
+uint64_t Hy4Model::embedding_row_bytes() const {
+    const uint64_t n = (uint64_t) geo().n_embd;
+    return embd_bf16_ ? n * 2 : n / 32 * 34;
+}
+
+const uint8_t* Hy4Model::embedding_raw(int32_t token) const {
+    if (token < 0 || (int64_t) token >= geo().n_vocab) return nullptr;
+    return embd_.data() + (uint64_t) token * embedding_row_bytes();
+}
+
 bool Hy4Model::embedding_row(int32_t token, float* out) const {
     const uint64_t n = (uint64_t) geo().n_embd;
     if (token < 0 || (int64_t) token >= geo().n_vocab) return false;
+    if (embd_bf16_) {
+        const uint16_t* row = (const uint16_t*) embd_.data() + (uint64_t) token * n;
+        for (uint64_t i = 0; i < n; ++i) {
+            const uint32_t u = (uint32_t) row[i] << 16;
+            std::memcpy(out + i, &u, 4);
+        }
+        return true;
+    }
     const uint8_t* row = embd_.data() + (uint64_t) token * (n / 32) * 34;
     for (uint64_t b = 0; b < n / 32; ++b) dequantize_q8_0(row + b * 34, out + b * 32);
     return true;
@@ -148,8 +168,26 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     bool head_converts = false;   // an older pack's BF16 head, rounded as it loads
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight") {
-            if (t.type != kTypeQ8_0 || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd) {
-                return {model::Status::Error, "hy4flash: token_embd.weight is not Q8_0 [n_embd][vocab]"};
+            if ((t.type != kTypeQ8_0 && t.type != kTypeBF16) || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd) {
+                return {model::Status::Error, "hy4flash: token_embd.weight is not Q8_0 or BF16 [n_embd][vocab]"};
+            }
+            embd_bf16_ = t.type == kTypeBF16;   // BF16 rows (an option): widened exactly, no rounding
+            // BASALT_HY4_EMBD_BF16=FILE (a measurement knob): the table as BF16 rows [vocab][n_embd] from a raw file instead
+            // of the pack's, e.g. the checkpoint's model.embed_tokens.weight; +0.35 GB of host RAM against Q8_0
+            if (const char* side = std::getenv("BASALT_HY4_EMBD_BF16"); side != nullptr && *side != '\0') {
+                const uint64_t want = (uint64_t) g.n_vocab * (uint64_t) g.n_embd * 2;
+                uint64_t have = 0;
+                const int sfd = platform::file_size(side, have) && have == want ? platform::open_fd_utf8(side) : -1;
+                if (sfd < 0)
+                    return {model::Status::Error, std::string("hy4flash: BASALT_HY4_EMBD_BF16 is not a ") + std::to_string(want) +
+                                                      "-byte BF16 table: " + side};
+                embd_.resize(want);
+                const bool ok = platform::pread_all(sfd, embd_.data(), want, 0);
+                platform::close_fd(sfd);
+                if (!ok) return {model::Status::Error, std::string("hy4flash: cannot read ") + side};
+                embd_bf16_ = true;
+                basalt::log::info("basalt hy4flash", "token embedding: BF16 rows from %s (BASALT_HY4_EMBD_BF16)", side);
+                continue;
             }
             embd_.resize(t.bytes);
             core::LoadItem it;

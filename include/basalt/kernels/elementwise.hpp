@@ -100,6 +100,10 @@ void signal_flag(uint32_t* flag, uint32_t value, void* stream);
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
 /// operation, which is submitted separately and costs a flush per node).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
+/// Token embeddings on the card from the stored rows: `rows` rows of `width` values in MAPPED pinned host memory (`src`,
+/// one row after the other as the pack stores them) into f32 `dst`.  `type` 8 = Q8_0 (34-byte blocks of 32: an FP16
+/// scale and 32 int8; value = (float) q * scale, as artifact/dequant.hpp's dequantize_q8_0), 30 = BF16 (widened exactly).
+void embed_rows_from_mapped(float* dst, const uint8_t* src, int rows, int width, int type, void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).  With
