@@ -33,7 +33,7 @@ down on 19 layers).
 
 | Stage | Format | Arithmetic |
 | --- | --- | --- |
-| Routed experts | NVFP4 | q8_1 activations on the GPU, Q8_0 on the CPU; prompt chunks MMQ (int8 mma) with each matrix's FP32 scale applied after |
+| Routed experts | NVFP4 | q8_1 activations on the GPU, Q8_0 on the CPU; prompt chunks FP4 tensor cores (W4A4, two-term gate/up input) with each matrix's FP32 scale applied after |
 | Q8_0 projections | Q8_0 | q8_1 activations (decode); MMQ (prompt) |
 | Output head | Q8_0 | q8_1 activations, fp32 logits |
 | Engram rows | E4M3 | decoded to fp32; the per-head norms and everything after in fp32 |
@@ -76,8 +76,23 @@ A decode row's arithmetic does not depend on how many rows share its window.
 
 ## Prompt path
 
-Prompt chunks run the dense and expert products as MMQ (q8_1 rows, int8 mma, fp32 accumulation) and the attention on fp16
-tensor cores, so their rows round differently from decoded ones. The chunk size moves the rounding too: a 4,500-row prompt read
+Prompt chunks run the routed experts on the FP4 tensor cores (W4A4: the gate/up input as two FP4 terms, about 8 bits; H as one
+FP4 term), the dense products as MMQ (q8_1 rows, int8 mma, fp32 accumulation) and the attention on fp16 tensor cores, so their
+rows round differently from decoded ones. `BASALT_HY4_PROMPT_FP4=0` puts the experts back on MMQ (int8), which costs about
+14% of the prompt speed at 64K.
+
+The FP4 experts against MMQ (2026-11-23). Each long prompt is a Claude Code session, answered greedily by the MMQ engine and
+scored teacher-forced against that engine's own logits. The noise arm is MMQ with a different expert tier (`--expert-cache
+4000`), whose CPU and GPU split rounds the same experts differently. The CI comes from a bootstrap over 32-row blocks.
+
+| Prompt | Rows | FP4 KLD / top-1 | Tier-shift noise KLD / top-1 | FP4 minus noise (95% CI) |
+| --- | --- | --- | --- | --- |
+| 32K | 355 | 0.0051 / 96.1% | 0.0019 / 96.9% | +0.0032 [+0.0016, +0.0050] |
+| 64K | 399 | 0.0034 / 98.5% | 0.0015 / 98.75% | +0.0019 [+0.0007, +0.0033] |
+| wikitext, 20 x 512, vs BF16 | 5,100 | 0.2527 (MMQ 0.2488) | | +0.0039 [-0.0165, +0.0233] vs MMQ |
+
+So FP4 costs about 2.5 times the tier-shift noise on long prompts, about 1-2% of the pack's own KLD against BF16. One FP4 term
+for the gate/up input (`BASALT_HY4_FP4_TWO=0`) costs more: 0.0062 on the 32K prompt and +0.022 on wikitext. The chunk size moves the rounding too: a 4,500-row prompt read
 in one chunk against 1,024-row chunks gives last-row KL 0.0032.
 
 ## Drafting
