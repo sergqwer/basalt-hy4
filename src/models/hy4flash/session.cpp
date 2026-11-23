@@ -602,6 +602,13 @@ public:
                           t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
         basalt::log::info("basalt hy4flash", "prompt experts: staged from the card %lld, from RAM over the bus %lld, from the second card %lld, on the CPU %lld (its thread %.0f ms, waited for %.0f ms), second card's share waited for %.0f ms, the stream after the launches %.0f ms",
                           (long long) n_stage_dev_, (long long) n_stage_bus_, (long long) n_stage_peer_, (long long) n_cpu_exp_, t_cpu_run_ms_.load(), t_cpu_wait_ms_, t_peer_wait_ms_, t_gpu_wait_ms_);
+        if (sync_profile() && sp_n_ > 0) {
+            basalt::log::info("basalt hy4flash", "prompt MoE syncs: %lld, %.0f ms waiting for the stream, %.1f ms reading the routing back, "
+                              "%.1f ms from the sync's return to the next work queued (the card idle)", (long long) sp_n_, sp_sync_ms_, sp_rb_ms_, sp_gap_ms_);
+            sp_n_ = 0;
+            sp_sync_ms_ = sp_rb_ms_ = sp_gap_ms_ = 0;
+            sp_t1_ = -1;
+        }
         use(sc_->dec);
         ring_close();
         big_.release();
@@ -2496,11 +2503,18 @@ private:
         if (mapped) put_i32_mapped(route_dev_, ids_, (int64_t) R * K, st);
         const double t0 = now_ms();
         cudaStreamSynchronize(st);
+        const double ts = now_ms();
         stage_at_ = 0;   // the stream has drained: what was staged is read
         if (mapped) std::memcpy(hid.data(), route_h_, hid.size() * 4);
         else cudaMemcpy(hid.data(), ids_, hid.size() * 4, cudaMemcpyDeviceToHost);
         const double t1 = now_ms();
         t_pre_ms_ += t1 - t0;
+        if (sync_profile()) {   // DIAG HY4_PROMPT_SYNC_TIME: the wait, the read-back, and (at the next enqueue) the card's idle gap
+            sp_sync_ms_ += ts - t0;
+            sp_rb_ms_ += t1 - ts;
+            ++sp_n_;
+            sp_t1_ = t1;
+        }
         std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot
         for (int p = 0; p < R * K; ++p) {
             if (hid[(size_t) p] < 0 || hid[(size_t) p] >= g_.n_expert) {
@@ -2565,6 +2579,7 @@ private:
         if (ringed && tl + 1 < g_.n_layers - g_.n_dense && ring_layer_[(tl + 1) & 1] == tl + 1) stage_away(tl + 1);
         auto launch = [&](Stage& B, const uint8_t* blobs, int nb, int64_t rows, int64_t max_rows, const std::vector<int32_t>& tok,
                           const std::vector<int32_t>& bounds) {
+            sync_gap_end();
             put_i32(B.tok, tok.data(), tok.size());
             put_i32(B.bounds, bounds.data(), bounds.size());
             if (fp4) {   // gate/up with the clamped SwiGLU in its epilogue, H rounded to FP4 per expert tile, then down
@@ -2652,6 +2667,7 @@ private:
         };
         if (ringed) {
             const int slot = tl & 1;
+            sync_gap_end();
             cudaStreamWaitEvent(st, ring_copied_[slot], 0);
             const uint8_t* base = ring_ + (size_t) slot * g_.n_expert * stride_;
             for (size_t b0 = 0; b0 < used.size();) {
@@ -3448,6 +3464,14 @@ private:
         }
         route_n_ = n;
         return true;
+    }
+    static bool sync_profile() { static const bool on = std::getenv("HY4_PROMPT_SYNC_TIME") != nullptr; return on; }
+    double sp_sync_ms_ = 0, sp_rb_ms_ = 0, sp_gap_ms_ = 0, sp_t1_ = -1;
+    int64_t sp_n_ = 0;
+    void sync_gap_end() {
+        if (sp_t1_ < 0) return;
+        sp_gap_ms_ += now_ms() - sp_t1_;
+        sp_t1_ = -1;
     }
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
