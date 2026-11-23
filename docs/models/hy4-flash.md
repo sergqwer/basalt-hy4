@@ -99,6 +99,10 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 ## Long prompts
 
 - Chunks are up to 16,384 tokens, halved to fit memory. Inside a chunk the attention runs in steps of 2,048 rows.
+- A chunk's routed experts run on the FP4 tensor cores (W4A4, the gate/up input in two FP4 terms). At 64K that is 4,295 tok/s
+  against 3,766 tok/s on MMQ (+14%; RTX 5090 at 600 W, `--expert-cache 5000`), and the experts' share drops from 3.73 s to 1.88 s.
+  The rounding cost is about 2.5 times the noise of a tier change ([precision](../precision/hy4-flash.md#prompt-path)).
+  `BASALT_HY4_PROMPT_FP4=0` keeps the int8 MMQ products.
 - A prompt of 1,024 tokens or more borrows only the tier slots its buffers and the expert ring need; the ring copies the next
   layer's experts to the card while a layer computes. The slots it leaves keep their experts, and the next turn finds them. A
   shorter prompt keeps the card's slots and puts its buffers beside them; the CPU takes RAM experts of 8 rows or fewer.
