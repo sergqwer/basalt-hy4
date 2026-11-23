@@ -14,6 +14,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const CAPACITY: usize = 2000;
 pub const MAX_LINE: usize = 2000;
 pub const SERVER_PREFIX: &str = "[server] ";
+/// How many memory and load lines are kept after the ring has moved past them (GET /v1/stats).
+pub const FACT_LINES: usize = 32;
+
+/// A line that says how the engine's memory came up - large pages or 4 KB pages, the RAM copy of the experts and its
+/// pinning, the load's timed steps. Those are printed once at start, so the ring alone loses them on a long run.
+pub fn is_memory_fact(msg: &str) -> bool {
+    const KEYS: [&str; 6] =
+        ["large pages", "4 KB pages", "hugetlb", "MAP_HUGETLB", "cache complement", "share is read ("];
+    KEYS.iter().any(|k| msg.contains(k))
+}
 
 /// The ANSI escape pattern the buffer and the colorer strip.
 pub fn ansi() -> &'static Regex {
@@ -51,6 +61,7 @@ impl Line {
 
 struct Ring {
     lines: VecDeque<Line>,
+    facts: VecDeque<Line>,
     last: u64,
     readers: HashMap<String, LevelReader>,      // per source: a traceback spans lines
 }
@@ -73,7 +84,7 @@ impl LogBuffer {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        LogBuffer { capacity, ring: Mutex::new(Ring { lines: VecDeque::new(), last: 0, readers: HashMap::new() }) }
+        LogBuffer { capacity, ring: Mutex::new(Ring { lines: VecDeque::new(), facts: VecDeque::new(), last: 0, readers: HashMap::new() }) }
     }
 
     /// Add each non-empty line of `text` (ANSI removed, long lines cut) from `src`; the level comes from its marker and
@@ -90,14 +101,21 @@ impl LogBuffer {
             let lvl = r.readers.entry(src.to_string()).or_default().read(msg);
             r.last += 1;
             let id = r.last;
+            let line = Line { id, t: now, src: src.to_string(), lvl,
+                              msg: msg.strip_prefix(SERVER_PREFIX).unwrap_or(msg).to_string() };
+            if is_memory_fact(&line.msg) {
+                if r.facts.len() == FACT_LINES {
+                    r.facts.pop_front();
+                }
+                r.facts.push_back(line.clone());
+            }
             if self.capacity == 0 {
                 continue;
             }
             if r.lines.len() == self.capacity {
                 r.lines.pop_front();
             }
-            r.lines.push_back(Line { id, t: now, src: src.to_string(), lvl,
-                                     msg: msg.strip_prefix(SERVER_PREFIX).unwrap_or(msg).to_string() });
+            r.lines.push_back(line);
         }
     }
 
@@ -111,6 +129,13 @@ impl LogBuffer {
         }
         let skip = fresh.len().saturating_sub(limit as usize);
         (fresh[skip..].iter().map(|x| x.to_map()).collect(), last)
+    }
+}
+
+impl LogBuffer {
+    /// The kept memory and load lines (see `is_memory_fact`), oldest first.
+    pub fn facts(&self) -> Vec<Map<String, Value>> {
+        self.ring.lock().unwrap().facts.iter().map(|x| x.to_map()).collect()
     }
 }
 
@@ -299,6 +324,27 @@ mod tests {
 
     fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
         v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn memory_lines_outlive_the_ring() {
+        let b = LogBuffer::with_capacity(4);
+        b.add("engine", "basalt: FileExpertSource: mapped pinned cache complement ready: resident 80.00 GiB; large pages (2097152 B)");
+        for i in 0..50 {
+            b.add("engine", &format!("request line {i}"));
+        }
+        assert_eq!(b.since(0, 500).0.len(), 4);
+        let f = b.facts();
+        assert_eq!(f.len(), 1);
+        assert!(f[0]["msg"].as_str().unwrap().contains("large pages (2097152 B)"));
+        assert_eq!(f[0]["src"], "engine");
+        for i in 0..(FACT_LINES + 5) {
+            b.add("engine", &format!("x {i}; using 4 KB pages"));
+        }
+        let f = b.facts();
+        assert_eq!(f.len(), FACT_LINES);
+        assert!(f.last().unwrap()["msg"].as_str().unwrap().starts_with(&format!("x {}", FACT_LINES + 4)));
+        assert!(!is_memory_fact("an ordinary line"));
     }
 
     #[test]

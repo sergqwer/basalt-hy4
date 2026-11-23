@@ -99,6 +99,26 @@ The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) whil
 figures come from the engine's `conversation cache:` lines and clear when the engine unloads, sleeps or restarts; a model that prints
 no line when it parks shows them after its first restore, without evictions.
 
+### `GET /v1/stats`
+
+One JSON document for a stats window (the tray's `Statistics...`), with the same key as every other endpoint; `basalt-serve`
+(the Rust server) only, the Python server answers 404. It holds only what the engine reports, and `null` where it reports
+nothing:
+
+- the engine: `state` (as `/metrics` `live.state`), `model`, `engine_version`, `quant`, `gpus`, `kv`, `uptime_s`;
+  `context` (`max`, `in_use` summed over the slots, `largest_slot`); `slots` (`summary`, per-slot `rows`, `queue`);
+  `vram` (as `/v1/status`); `experts` (`slots`, `slots_primary`, `ram_mib`, `total`, `spill`, from the engine's INFO line);
+  `conversation` (the conversation cache, as `/metrics`); `totals`, `best` and `machine` (GPU and RAM).
+- `large_pages`: `state` `"yes"` or `"no"` from the newest of the engine's own memory lines that says (large pages, or 4 KB
+  pages), with that `line`; `null` when no line said.
+- `load`: `in_progress` while loading, `last` (`kind` weights or wake, `seconds`, `at`: the last load the server waited
+  for) and `memory_lines`, the engine's memory and load lines (large pages, the RAM copy of the experts, the cards' share),
+  kept after the log ring moves past them (the last 32).
+- `requests`: the last `n` finished requests, newest first (`?n=`, 50 by default, at most 500): `prompt_tokens`, `reused`,
+  `read_tokens`, `output_tokens`, `prompt_ms`, `prefill_tok_s` (read tokens over `prompt_ms`), `decode_tok_s`, `ttft_s`,
+  `drafts_offered`, `drafts_accepted`, `draft_acceptance` (accepted over offered), `draft_len`, `expert_hit_rate`,
+  `pcie_share`, `ssd_share`, `end_reason`, `duration_s`, `slot`, `path`, `time`.
+
 ## Conversations on disk: `--conversation-cache-disk-mib`
 
 Off at 0. With a budget, conversations of at least 8,192 tokens are written to `conversations` in the model's cache folder when they leave

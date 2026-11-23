@@ -20,3 +20,6 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.12"

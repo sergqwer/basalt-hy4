@@ -522,3 +522,150 @@ pub fn rate_of(s: &Obj, rate: &[(f64, i64)]) -> f64 {
     }
     ival(s.get("generated")) as f64 / RATE_MIN_SPAN_S.max(t - fval(s.get("first_token")).unwrap())
 }
+
+/// GET /v1/stats: how many recent requests by default, and at most.
+pub const STATS_REQUESTS_DEFAULT: usize = 50;
+pub const STATS_REQUESTS_MAX: usize = 500;
+
+/// Large pages as the engine's own memory lines say: {"state": "yes" | "no" | null, "line": the line it came from}.
+/// The newest line that decides wins; no such line means the engine did not say (null), never a guess.
+pub fn large_pages_of(facts: &[Obj]) -> Value {
+    for f in facts.iter().rev() {
+        let m = f.get("msg").and_then(|v| v.as_str()).unwrap_or("");
+        let state = if m.contains("large pages refused")
+            || m.contains("using 4 KB pages")
+            || m.contains("MAP_HUGETLB unavailable")
+            || m.contains("no large-page minimum")
+        {
+            Some("no")
+        } else if m.contains("large pages (") || m.contains("hugetlb 2 MB pages") {
+            Some("yes")
+        } else {
+            None
+        };
+        if let Some(s) = state {
+            return json!({"state": s, "line": m});
+        }
+    }
+    json!({"state": null, "line": null})
+}
+
+/// One finished request as /v1/stats shows it: the history record plus the rates it implies.
+pub fn stats_request(r: &Obj) -> Value {
+    let prompt = ival(r.get("prompt_tokens"));
+    let reused = nn(r.get("reused")).map(|v| ival(Some(v)));
+    let read = prompt - reused.unwrap_or(0);
+    let prefill = match fval(nn(r.get("prompt_ms"))) {
+        Some(ms) if ms > 0.0 && read > 0 => fv(py_round(read as f64 / (ms / 1000.0), 1)),
+        _ => Value::Null,
+    };
+    let offered = ival(nn(r.get("drafts_offered")));
+    let accept = if offered > 0 {
+        fv(py_round(ival(nn(r.get("drafts_accepted"))) as f64 / offered as f64, 3))
+    } else {
+        Value::Null
+    };
+    let g = |k: &str| r.get(k).cloned().unwrap_or(Value::Null);
+    json!({"id": g("id"), "time": g("time"), "path": g("path"), "slot": g("slot"), "duration_s": g("duration_s"),
+           "end_reason": g("finish"), "prompt_tokens": prompt, "reused": g("reused"), "read_tokens": read,
+           "output_tokens": g("output_tokens"), "prompt_ms": g("prompt_ms"), "prefill_tok_s": prefill,
+           "decode_tok_s": g("decode_tok_s"), "ttft_s": g("ttft_s"), "drafts_offered": g("drafts_offered"),
+           "drafts_accepted": g("drafts_accepted"), "draft_acceptance": accept, "draft_len": g("draft_len"),
+           "expert_hit_rate": g("hit_rate"), "pcie_share": g("pcie_share"), "ssd_share": g("ssd_share")})
+}
+
+impl Service {
+    /// stats: GET /v1/stats - the engine's state and its last `n` requests, newest first, from what the engine
+    /// reports (its INFO/VRAM/CONV lines, the request records, the memory lines of its log). A figure the engine
+    /// does not report is null. Rust server only.
+    pub fn stats_v(&self, n: usize, facts: &[Obj]) -> Value {
+        let m = self.metrics_v();
+        let v1 = self.v1_status_v();
+        let (rows, queue) = self.slot_table_v();
+        let hist: Vec<Obj> = {
+            let st = self.status_lock.lock().unwrap();
+            st.history.iter().rev().take(n.min(STATS_REQUESTS_MAX)).cloned().collect()
+        };
+        let empty = Map::new();
+        let engine = m.get("engine").and_then(|v| v.as_object()).unwrap_or(&empty);
+        let live = m.get("live").and_then(|v| v.as_object()).unwrap_or(&empty);
+        let e = |k: &str| engine.get(k).cloned().unwrap_or(Value::Null);
+        let ctx = self.engine.max_context();
+        let max_ctx = if ctx != 0 { ctx } else { self.engine.known_ctx() };
+        let used: Vec<i64> = rows.iter().map(|r| ival(r.get("ctx_used"))).collect();
+        let slots: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let g = |k: &str| r.get(k).cloned().unwrap_or(Value::Null);
+                json!({"id": g("id"), "state": g("state"), "ctx_used": g("ctx_used"), "n_ctx": g("n_ctx"),
+                       "tok_s": g("tok_s"), "generated": g("generated"), "prompt_tokens": g("prompt_tokens"),
+                       "prefill_done": g("prefill_done"), "reused": g("reused"),
+                       "drafts_offered": g("drafts_offered"), "drafts_accepted": g("drafts_accepted")})
+            })
+            .collect();
+        let memory: Vec<Value> =
+            facts.iter().map(|f| json!({"t": f.get("t").cloned(), "msg": f.get("msg").cloned()})).collect();
+        let last_load = self.last_load.lock().unwrap().clone();
+        json!({
+            "service": "basalt", "model": self.model, "at": fv(py_round(now(), 3)),
+            "state": live.get("state").cloned(), "loaded": self.loaded(), "loading": self.is_loading(),
+            "asleep": self.engine.asleep(),
+            "engine_version": e("version"), "quant": e("quant"), "gpus": e("gpus"), "kv": e("kv"),
+            "uptime_s": v1.get("uptime_s").cloned(), "started": v1.get("started").cloned(),
+            "context": {"max": max_ctx, "in_use": used.iter().sum::<i64>(), "largest_slot": used.iter().max().cloned()},
+            "slots": {"summary": live.get("slots").cloned(), "rows": slots, "queue": queue},
+            "vram": v1.get("vram").cloned(),
+            "experts": {"slots": e("expert_slots"), "slots_primary": e("expert_slots_primary"),
+                        "ram_mib": e("ram_experts_mib"), "total": e("expert_total"), "spill": e("spill")},
+            "large_pages": large_pages_of(facts),
+            "conversation": m.get("conversation").cloned(),
+            "load": {"in_progress": live.get("load").cloned(), "last": last_load, "memory_lines": memory},
+            "live": {"tok_s": live.get("tok_s").cloned(), "prompt_tokens": live.get("prompt_tokens").cloned(),
+                     "generated": live.get("generated").cloned(), "elapsed_s": live.get("elapsed_s").cloned(),
+                     "phase": live.get("phase").cloned(), "prefill_tok_s_mean": live.get("prefill_tok_s_mean").cloned()},
+            "totals": m.get("totals").cloned(), "best": m.get("best").cloned(),
+            "machine": v1.get("machine").cloned(),
+            "requests": hist.iter().map(stats_request).collect::<Vec<_>>()})
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    fn obj(v: Value) -> Obj {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn large_pages_read_from_the_newest_deciding_line() {
+        assert_eq!(large_pages_of(&[]), json!({"state": null, "line": null}));
+        let yes = obj(json!({"msg": "FileExpertSource: ... ready; large pages (2097152 B)"}));
+        let no = obj(json!({"msg": "large pages refused for 4194304 B (GetLargePageMinimum=2097152, VirtualAlloc error 1314); using 4 KB pages"}));
+        let other = obj(json!({"msg": "the cards' share is read (20.00 GiB in 4.1 s); RAM next"}));
+        assert_eq!(large_pages_of(&[yes.clone(), other.clone()])["state"], "yes");
+        assert_eq!(large_pages_of(&[yes.clone(), no.clone()])["state"], "no");
+        assert_eq!(large_pages_of(&[no, yes])["state"], "yes");
+        assert_eq!(large_pages_of(&[other])["state"], Value::Null);
+    }
+
+    #[test]
+    fn a_request_row_derives_only_what_its_record_supports() {
+        let r = obj(json!({"id": "r_0001", "finish": "stop", "prompt_tokens": 10000, "reused": 8000, "output_tokens": 300,
+                           "prompt_ms": 500.0, "decode_tok_s": 150.5, "hit_rate": 0.912, "pcie_share": 0.05,
+                           "drafts_offered": 200, "drafts_accepted": 150}));
+        let s = stats_request(&r);
+        assert_eq!(s["read_tokens"], 2000);
+        assert_eq!(s["prefill_tok_s"], json!(4000.0));
+        assert_eq!(s["draft_acceptance"], json!(0.75));
+        assert_eq!(s["end_reason"], "stop");
+        assert_eq!(s["expert_hit_rate"], json!(0.912));
+        // no clock, no drafts: null, not zero
+        let bare = obj(json!({"prompt_tokens": 5, "reused": null, "prompt_ms": null}));
+        let s = stats_request(&bare);
+        assert_eq!(s["prefill_tok_s"], Value::Null);
+        assert_eq!(s["draft_acceptance"], Value::Null);
+        assert_eq!(s["read_tokens"], 5);
+        assert_eq!(s["ssd_share"], Value::Null);
+    }
+}

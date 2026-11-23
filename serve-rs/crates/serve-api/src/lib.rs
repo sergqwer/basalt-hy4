@@ -12,6 +12,7 @@ pub mod service;
 mod service_api;
 mod service_run;
 mod service_stats;
+pub use service_stats::{STATS_REQUESTS_DEFAULT, STATS_REQUESTS_MAX};
 pub mod template;
 pub mod vision;
 pub mod xml;

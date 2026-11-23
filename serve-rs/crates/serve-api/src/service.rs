@@ -228,6 +228,8 @@ pub struct Service {
     /// a reply was token 0 repeated (non-finite logits): the next request unloads the engine first
     pub restart_pending: AtomicBool,
     pub load_kind: Mutex<&'static str>,
+    /// The last load or wake that brought the engine up: {"kind", "seconds", "at"}, for GET /v1/stats.
+    pub last_load: Mutex<Option<Obj>>,
     pub boot_error: Mutex<Option<EngineErr>>,
     pub on_loaded: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub stop_ids: HashSet<u32>,
@@ -317,6 +319,7 @@ impl Service {
             booting: AtomicBool::new(false),
             restart_pending: AtomicBool::new(false),
             load_kind: Mutex::new("weights"),
+            last_load: Mutex::new(None),
             boot_error: Mutex::new(None),
             on_loaded: RwLock::new(None),
             stop_ids,
@@ -493,9 +496,16 @@ impl Service {
         if self.loaded() && !self.vision_down() && !self.engine.asleep() {
             return Ok(());
         }
-        *self.load_kind.lock().unwrap() = if self.engine.asleep() { "wake" } else { "weights" };
+        let kind = if self.engine.asleep() { "wake" } else { "weights" };
+        *self.load_kind.lock().unwrap() = kind;
         self.loading_flag.store(true, Ordering::SeqCst);
+        let t0 = now();
         let r = self.ensure_loaded_inner().and_then(|_| {
+            let mut m = Obj::new();
+            m.insert("kind".into(), Value::from(kind));
+            m.insert("seconds".into(), fv(py_round(now() - t0, 1)));
+            m.insert("at".into(), Value::from(now() as i64));
+            *self.last_load.lock().unwrap() = Some(m);
             if let Some(f) = self.on_loaded.read().unwrap().clone() {
                 f();
             }
