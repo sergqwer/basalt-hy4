@@ -1284,7 +1284,13 @@ private:
     /// with --kv int8 the chunk then reads the f32 query rows (attend_i8_kernel<false>) instead of packed ones.
     // HY4_I8_MMA: a prompt chunk's int8 attention on the fp16 kernel (tiles dequantized in shared memory, the query fp32 rows)
     static bool i8_mma() { static const bool on = [] { const char* e = std::getenv("HY4_I8_MMA"); return e && *e && *e != '0'; }(); return on; }
-    static bool qdirect() { static const bool on = std::getenv("HY4_Q_DIRECT") != nullptr; return on; }
+    // A chunk's k_b product writes the query rows' latent part in place (prepare adds the rope part): no qabs_ buffer, no
+    // copy. On by default for fp16/fp8/f32 caches (bit-identical: the same values land in the same rows); the int8 cache
+    // keeps its packed query unless HY4_Q_DIRECT=1. HY4_Q_DIRECT=0 turns it off.
+    bool qdirect() const {
+        static const int env = [] { const char* e = std::getenv("HY4_Q_DIRECT"); return e ? (*e && *e != '0' ? 1 : 0) : -1; }();
+        return env >= 0 ? env == 1 : !i8();
+    }
     bool f32() const { return m_.cache_f32(); }
     int elem() const { return f32() ? 4 : 2; }
     int sparse_row_bytes() const { return i8() ? kI8RowBytes : fp8() ? kFp8RowBytes : kRowWidth * elem(); }
