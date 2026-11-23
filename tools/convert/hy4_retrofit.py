@@ -110,7 +110,8 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
         rec = meta.get("dfly2")
     if dfly != "keep" and (not rec or rec.get("format") != "safetensors"):
         die("--dfly needs a drafter stored as its safetensors (meta.dfly2.format safetensors)")
-    planes = {}   # name -> (bytes, scale): the dense matrices to NVFP4 planes
+    planes = {}   # name -> ((spill file, offset, bytes), bytes, scale): the dense matrices as NVFP4 planes, spilled to disk
+    spill = None
     if dense_re:
         pat = re.compile(dense_re)
         todo = [(n, t) for n, t in tens.items() if pat.search(n) and t.get("type") == "Q8_0" and len(t["shape"]) == 2
@@ -118,9 +119,11 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
         if not todo:
             die(f"--dense-nvfp4 {dense_re!r} matches no Q8_0 matrix of [K % 256, rows % 128]")
         jobs = [(src, gg_off + t["offset"], int(t["shape"][0]), int(t["shape"][1])) for _, t in todo]
-        with multiprocessing.Pool(workers) as pool:
-            for (n, _), r in zip(todo, pool.imap(_planes_job, jobs)):
-                planes[n] = r
+        spill = str(Path(out).parent / (Path(out).name + ".planes.tmp"))   # beside the output: RAM holds one matrix per worker
+        with multiprocessing.Pool(workers) as pool, open(spill, "wb") as sf:
+            for (n, _), (pb, sc) in zip(todo, pool.imap(_planes_job, jobs)):
+                planes[n] = ((spill, sf.tell(), len(pb)), len(pb), sc)
+                sf.write(pb)
         print(f"  {len(planes)} dense matrices to NVFP4 planes", flush=True)
     embd = None   # (file, offset, bytes) of the BF16 embedding
     if embd_ckpt:
@@ -164,11 +167,11 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
                         parts.append((src, gg_off + at, t["bytes"]))
                     names.append(n)
                 for n in planes:   # each planes matrix's FP32 scale, a tensor of its own
-                    parts.append(np.array([planes[n][1]], "<f4").tobytes())
+                    parts.append(np.array([planes[n][2]], "<f4").tobytes())
                     names.append(n + ".scale")
                 offsets = w.add_parts("gguf", parts, TENSOR_ALIGN)
-                for n, (pb, sc) in planes.items():
-                    tens[n].update(type="NVFP4_PLANES", type_id=45, bytes=len(pb))
+                for n, (_, nb, _) in planes.items():
+                    tens[n].update(type="NVFP4_PLANES", type_id=45, bytes=nb)
                     tens[n + ".scale"] = {"type": "F32", "type_id": 0, "shape": [1], "bytes": 4}
                 for n, o in zip(names, offsets):
                     tens[n]["offset"] = o
@@ -207,6 +210,8 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
         w.add_bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
     finally:
+        if spill:
+            Path(spill).unlink(missing_ok=True)
         if tmp:
             tmp[1].unlink(missing_ok=True)
             tmp[2].unlink(missing_ok=True)
