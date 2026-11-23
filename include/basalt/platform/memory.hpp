@@ -61,6 +61,10 @@ void free_region(void* mapping_base, uint64_t mapping_bytes);
 /// refusal is the limit.
 bool pin_budget(uint64_t& limit, std::string& why, const char* luid = nullptr,
                 uint32_t node_mask = 0, bool shared_mapping = false);
+/// DIAG: the adapter's DXGI local (VRAM) and non-local budgets and this process's usage of each (summed over the nodes in
+/// node_mask); false off Windows or when the adapter is not found.
+bool video_memory(const char* luid, uint32_t node_mask, uint64_t& local_budget, uint64_t& local_usage, uint64_t& nonlocal_budget,
+                  uint64_t& nonlocal_usage);
 
 // Portable registrations consume each WDDM adapter's non-local budget. Host VMM instead backs the CPU tier
 // without registering the same pages on every adapter; other platforms keep their existing allocation path.

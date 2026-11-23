@@ -82,6 +82,10 @@ Hy4-flash reads no video, so the engine needs no FFmpeg. Upstream's video setup:
   `whoami /priv` shows whether a token holds it.
 - No shared arena files and no cgroup limits.
 - `basalt serve` runs the Python server as a child.
+- The main card keeps 700 MiB of VRAM free by default (`--vram-reserve-mib`, which still wins when given). With less, WDDM does not
+  refuse a new allocation on a full card: it moves GPU memory out to system RAM, and the kernels that read it slow down without
+  any error. A Hy4-Flash prompt's KV once grew 1 GiB past the card's budget that way, and its sparse attention ran ~15x slower
+  above 64K tokens. The expert tier's start plan and every KV growth step leave this much free, lending expert slots for the room.
 - A display-attached GPU can hit the driver's timeout (TDR). Raise `TdrDelay` under `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`.
 - A card that drives the desktop has VRAM that moves between starts, so greedy output can differ run to run. Pin `expert-cache` and raise
   `vram-reserve-mib` for reproducible output.
