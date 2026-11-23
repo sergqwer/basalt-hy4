@@ -813,6 +813,7 @@ public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
+        if (dp_on_ || dp_windows_ > 0) dp_reset();   // a request's decode profile ends with its next prompt
         if (!big_.rows) {   // a prompt starts
             turn_report();
             if (tier_) tier_->forget_use();
@@ -3951,8 +3952,16 @@ private:
         }
         dp_cat_.clear();
     }
+    void dp_reset() {
+        if (dp_on_) dp_flush();
+        std::fill(std::begin(dp_ms_), std::end(dp_ms_), 0.0);
+        dp_host_moe_ = dp_wall_ = 0;
+        dp_windows_ = dp_rows_ = 0;
+        dp_on_ = false;
+    }
     void dp_window_begin(int R) {
         const bool on = dp_every() > 0 && graphs_ && bsegs_.empty();
+        if (on && !dp_on_ && dp_windows_ == 0 && tier_) tier_->report("decode start");   // the base the 29-window shares are read against
         if (dp_on_) dp_flush();
         dp_on_ = on;
         if (!on) return;
