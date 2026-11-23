@@ -15,56 +15,71 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
 
 // ---- a reply the model wrote in other pieces than the tokenizer cuts it into: the client sends it back unchanged,
 // the prompt is tokenized canonically, and the ids stop matching inside the reply. Where a conversation this request
-// can continue (the live one, or an idle slot's) holds ids that spell exactly the bytes of the prompt's next tokens,
-// ending on a prompt token boundary, the held ids stand for those tokens: the request continues them instead of
-// reading the reply again from a checkpoint (and leaving a copy of the conversation behind in another slot).
-// Not with pictures, when a token has no bytes, or when the longer prompt would leave no room for max_new.
+// can continue (the live one, an idle slot's, or one parked in RAM or on disk) holds ids that spell exactly the bytes of
+// the prompt's next tokens, ending on a prompt token boundary, the held ids stand for those tokens: the request
+// continues them instead of reading the reply again from an earlier checkpoint (and leaving a copy of the conversation
+// behind in another slot). Not with pictures, when a token has no bytes, or when the longer prompt would leave no room
+// for max_new.
 void Request::respell_prompt() {
     if (geni || !runtime_.req_imgs.empty() || !runtime_.text_tokenizer_note.empty()) return;
     const auto bytes = [this](int32_t id) { return runtime_.token_bytes(id); };
-    const std::vector<int32_t>* best = nullptr;
+    enum class From { live, check, slot, parked, disk };
+    const int32_t* best = nullptr;   // the held ids the prompt meets: they outlive this function's splice
+    int64_t best_n = 0;
+    std::vector<int32_t> disk_ids;   // a stored conversation's ids, copied out of the store's lock
     HeldMeet meet;
     int from_slot = -1;
-    const auto offer = [&](const std::vector<int32_t>& held, int slot) {
-        if ((int64_t) held.size() <= meet.held) return;
-        const HeldMeet m = meet_held(ids32.data(), n, held.data(), (int64_t) held.size(), true, bytes);
-        if (m.held > 0) {
-            best = &held;
-            meet = m;
-            from_slot = slot;
-        }
+    From from_kind = From::live;
+    const auto offer = [&](const int32_t* held, int64_t h, From kind, int slot) {
+        if (h <= meet.held) return false;
+        const HeldMeet m = meet_held(ids32.data(), n, held, h, true, bytes);
+        if (m.held <= 0) return false;
+        best = held;
+        best_n = h;
+        meet = m;
+        from_kind = kind;
+        from_slot = slot;
+        return true;
     };
-    if (runtime_.live_ok && runtime_.live_imgs.empty()) offer(runtime_.live, own_slot);
+    if (runtime_.live_ok && runtime_.live_imgs.empty()) offer(runtime_.live.data(), (int64_t) runtime_.live.size(), From::live, own_slot);
     // the live chain's checkpoints too: when the last reply came back in other bytes (the live ids meet nothing), the
     // checkpoints still hold the earlier replies in the model's pieces, and only one that is respelled meets the prompt -
     // else every checkpoint past the first respelled reply misses and the prompt is read from the system prompt on
-    bool from_check = false;
     for (const ConvCheckpoint& c : runtime_.checks)
-        if (c.imgs.empty() && (int64_t) c.ids.size() > meet.held) {
-            const std::vector<int32_t>* had = best;
-            offer(c.ids, own_slot);
-            if (best != had) from_check = true;
-        }
+        if (c.imgs.empty()) offer(c.ids.data(), (int64_t) c.ids.size(), From::check, own_slot);
     if (!in_slot && runtime_.slots_share_cells())
         for (int b = 0; b < (int) runtime_.bs.size(); ++b) {
             const BSlot& sl = runtime_.bs[(size_t) b];
-            if (b != own_slot && !sl.active && sl.cached && sl.cvec == want_cvec && sl.imgs.empty()) {
-                const std::vector<int32_t>* had = best;
-                offer(sl.ids, b);
-                if (best != had) from_check = false;
-            }
+            if (b != own_slot && !sl.active && sl.cached && sl.cvec == want_cvec && sl.imgs.empty())
+                offer(sl.ids.data(), (int64_t) sl.ids.size(), From::slot, b);
         }
+    // a parked conversation (another chat came in between): its checkpoints hold its replies in the model's pieces, as
+    // the live chain's do; unrespelled, the prompt meets only the checkpoint before the first reply and reads the rest
+    // again on the prompt path - other ids and other numerics than the turn it continues
+    if (runtime_.conversations)
+        runtime_.conversations->each_held(want_cvec, [&](const std::vector<int32_t>& h) { offer(h.data(), (int64_t) h.size(), From::parked, -1); });
+    if (runtime_.disk.enabled())
+        runtime_.disk.each_held(want_cvec, [&](const int32_t* h, int64_t hn) {
+            if (hn <= meet.held) return;
+            const HeldMeet m = meet_held(ids32.data(), n, h, hn, true, bytes);
+            if (m.held <= 0) return;
+            disk_ids.assign(h, h + hn);
+            offer(disk_ids.data(), hn, From::disk, -1);
+        });
     if (best == nullptr || !meet.respelled()) return;
     const int64_t grown = meet.held + n - meet.resume;
     const int64_t ctx = runtime_.admit_slot >= 0 ? runtime_.slot_context(runtime_.admit_slot) : runtime_.o.max_context;
     if (!respell_fits(grown, n, runtime_.admit_slot >= 0 ? runtime_.admit_max_new : (long long) max_new, ctx)) return;
-    const int64_t from = std::mismatch(best->begin(), best->begin() + std::min<int64_t>((int64_t) best->size(), n), ids32.begin()).first - best->begin();
-    splice_held(best->data(), meet, ids32.data(), n, ids);
+    const int64_t from = std::mismatch(best, best + std::min(best_n, n), ids32.begin()).first - best;
+    splice_held(best, meet, ids32.data(), n, ids);
     ids32 = std::vector<int32_t>(ids.begin(), ids.end());
     runtime_.cur = ids;
-    const std::string whose = from_slot >= 0 && from_slot != own_slot ? "slot " + std::to_string(from_slot)
-                              : from_check ? "a checkpoint of the live conversation (" + std::to_string(meet.held) + " tokens)"
-                                           : std::string("the live conversation");
+    const std::string held = " (" + std::to_string(meet.held) + " tokens)";
+    const std::string whose = from_kind == From::slot && from_slot != own_slot ? "slot " + std::to_string(from_slot)
+                              : from_kind == From::check  ? "a checkpoint of the live conversation" + held
+                              : from_kind == From::parked ? "a parked conversation" + held
+                              : from_kind == From::disk   ? "a conversation on disk" + held
+                                                          : std::string("the live conversation");
     basalt::log::info("basalt serve", "prompt kept the ids of %s from token %lld on: the same bytes in other pieces "
                       "(%+lld tokens)", whose.c_str(), (long long) from, (long long) (grown - n));
     n = grown;

@@ -404,6 +404,19 @@ public:
         return best;
     }
 
+    /// Each parked conversation's held ids without pictures (its live tokens, then its checkpoints) of control-vector
+    /// state `cvec`, most recently parked first: what a prompt may be respelled against (prefix_anchor.hpp).
+    template<class F>
+    void each_held(bool cvec, F&& f) const {
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& e = entries_[i];
+            if (e.cvec != cvec) continue;
+            if (e.live.imgs.empty()) f(e.live.ids);
+            for (const auto& c : e.checkpoints)
+                if (c.imgs.empty()) f(c.ids);
+        }
+    }
+
     SavedConversation take(size_t index) {
         SavedConversation out = std::move(entries_.at(index));
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);

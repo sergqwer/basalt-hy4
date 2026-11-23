@@ -630,6 +630,18 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
 
 // ------------------------------------------------------------------------------------------------ matching
 
+void ConversationStore::each_held(bool cvec, const std::function<void(const int32_t*, int64_t)>& f) const {
+    if (!open_) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& ep : entries_) {
+        const Entry& e = *ep;
+        if (!e.mine || e.cvec != cvec || e.ids.empty() || !e.imgs.empty()) continue;
+        f(e.ids.data(), (int64_t) e.ids.size());
+        for (int64_t c : e.checks)
+            if (c > 0 && c < (int64_t) e.ids.size()) f(e.ids.data(), c);
+    }
+}
+
 ConversationStore::Match ConversationStore::best(const int32_t* prompt, size_t n,
                                                  const std::vector<ConversationImageKey>& images, bool cvec) const {
     Match best;
