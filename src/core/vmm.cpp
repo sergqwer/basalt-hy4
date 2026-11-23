@@ -109,28 +109,38 @@ uint64_t host_granularity() {
     return host_prop(prop, g) ? g : 0;
 }
 
-uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
-    mapped = 0;
+uint8_t* reserve_host(uint64_t bytes, uint64_t& reserved) {
+    reserved = 0;
     const Fns& v = fns();
     CUmemAllocationProp prop{};
     size_t g = 0;
     if (!bytes || !host_prop(prop, g) || kHostPieceBytes % g != 0) return nullptr;
-    const int dev = current_device();
     if (bytes > SIZE_MAX - (g - 1)) return nullptr;
-    size_t n = (bytes + g - 1) / g * g;
+    const size_t n = (bytes + g - 1) / g * g;
     CUdeviceptr p = 0;
-    const auto refused = [&](const char* op, CUresult error, uint64_t off) {
-        basalt::log::warn("basalt memory", "host VMM %s at %.2f of %.2f GiB on CUDA%d failed (driver code %d)",
-                          op, off / 1073741824.0, n / 1073741824.0, dev, (int) error);
-    };
-    CUresult error = v.reserve(&p, n, 0, 0, 0);
-    if (error != CUDA_SUCCESS) { refused("reserve", error, 0); return nullptr; }
-    uint64_t off = 0;
-    for (; off < n;) {
-        const uint64_t piece = std::min<uint64_t>(kHostPieceBytes, n - off);
+    const CUresult error = v.reserve(&p, n, 0, 0, 0);
+    if (error != CUDA_SUCCESS) {
+        basalt::log::warn("basalt memory", "host VMM reserve of %.2f GiB on CUDA%d failed (driver code %d)", n / 1073741824.0,
+                          current_device(), (int) error);
+        return nullptr;
+    }
+    reserved = n;
+    return reinterpret_cast<uint8_t*>(p);
+}
+
+bool back_host(uint8_t* ptr, uint64_t reserved, uint64_t& backed, int device) {
+    backed = 0;
+    const Fns& v = fns();
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    if (!ptr || !host_prop(prop, g)) return false;
+    const int dev = device >= 0 ? device : current_device();
+    const auto p = reinterpret_cast<CUdeviceptr>(ptr);
+    for (uint64_t off = 0; off < reserved;) {
+        const uint64_t piece = std::min<uint64_t>(kHostPieceBytes, reserved - off);
         CUmemGenericAllocationHandle h;
         const char* op = "create";
-        error = v.create(&h, piece, &prop, 0);
+        CUresult error = v.create(&h, piece, &prop, 0);
         if (error == CUDA_SUCCESS) {
             op = "map";
             error = v.map(p + off, piece, 0, h, 0);
@@ -140,18 +150,36 @@ uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
                     {{CU_MEM_LOCATION_TYPE_DEVICE, dev}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
                 op = "access";
                 error = v.set_access(p + off, piece, a, 2);
-                if (error == CUDA_SUCCESS) { off += piece; continue; }
+                if (error == CUDA_SUCCESS) { off += piece; backed = off; continue; }
                 v.unmap(p + off, piece);
             }
         }
-        refused(op, error, off);
-        for (uint64_t at = 0; at < off; at += kHostPieceBytes)
-            v.unmap(p + at, std::min<uint64_t>(kHostPieceBytes, off - at));
-        v.address_free(p, n);
+        basalt::log::warn("basalt memory", "host VMM %s at %.2f of %.2f GiB on CUDA%d failed (driver code %d)",
+                          op, off / 1073741824.0, reserved / 1073741824.0, dev, (int) error);
+        return false;
+    }
+    return true;
+}
+
+void free_host_range(uint8_t* ptr, uint64_t backed, uint64_t reserved) {
+    if (!ptr) return;
+    const auto p = reinterpret_cast<CUdeviceptr>(ptr);
+    for (uint64_t off = 0; off < backed; off += kHostPieceBytes)
+        fns().unmap(p + off, std::min<uint64_t>(kHostPieceBytes, backed - off));
+    fns().address_free(p, reserved);
+}
+
+uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
+    mapped = 0;
+    uint64_t reserved = 0, backed = 0;
+    uint8_t* p = reserve_host(bytes, reserved);
+    if (!p) return nullptr;
+    if (!back_host(p, reserved, backed)) {
+        free_host_range(p, backed, reserved);
         return nullptr;
     }
-    mapped = n;
-    return reinterpret_cast<uint8_t*>(p);
+    mapped = reserved;
+    return p;
 }
 
 void free_host(uint8_t* ptr, uint64_t mapped) {
