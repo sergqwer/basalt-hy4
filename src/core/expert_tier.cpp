@@ -1369,6 +1369,11 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
     }
 }
 
+void ExpertTier::set_recall(int layer, const std::vector<int32_t>& experts) {
+    if (recall_.empty()) recall_.resize((size_t) n_layers_);
+    if (layer >= 0 && layer < n_layers_) recall_[(size_t) layer] = experts;
+}
+
 void ExpertTier::recall(int layer, int64_t lo, int64_t n) {
     if (recall_.empty()) recall_.resize((size_t) n_layers_);
     std::vector<int32_t>& r = recall_[(size_t) layer];

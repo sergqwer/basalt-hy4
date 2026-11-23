@@ -163,6 +163,8 @@ public:
     /// copied before it returns. Homes stay.
     void lend_all();
     bool reclaim(std::string& err, bool restore = false);
+    /// The experts reclaim(.., restore) refills a layer's returned slots with, in order (replaces what the lends evicted).
+    void set_recall(int layer, const std::vector<int32_t>& experts);
     /// Whether lend() can give up part of the base arena (ExpertTierSpec::lend_segment, copies, a segmented arena).
     bool partial_lend() const { return !live_.empty(); }
     /// Leaves `bytes` device bytes free above the floor by giving up the fewest slots: the ones beside the base arena,
