@@ -1,4 +1,5 @@
 // src/program/serve/protocol.cpp - protocol operations for the persistent engine.
+#include "basalt/platform/pagefile.hpp"
 #include "basalt/protocol.hpp"
 #include "state.hpp"
 #include "basalt_git.h"
@@ -305,6 +306,9 @@ int Runtime::announce() {
         std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    // the page file that counts (pagefile.hpp), for a server or tray that shows the warning
+    if (const basalt::platform::PageFileCheck pf = basalt::platform::page_file_check(); pf.known)
+        std::printf("INFO pagefile_mib=%llu pagefile_ok=%d\n", (unsigned long long) (pf.bytes >> 20), pf.ok ? 1 : 0);
     {   // the build's commit, and the processors that share each L3 cache (the console's load per CCD)
         std::string l3;
         for (const std::vector<int>& g : basalt::platform::cpu_l3_groups()) {

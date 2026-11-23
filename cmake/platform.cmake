@@ -30,7 +30,8 @@ add_library(platform STATIC
   ${BASALT_CMAKE_ROOT}/src/platform/file.cpp ${BASALT_CMAKE_ROOT}/src/platform/memory.cpp
   ${BASALT_CMAKE_ROOT}/src/platform/direct_file.cpp ${BASALT_CMAKE_ROOT}/src/platform/process.cpp
   ${BASALT_CMAKE_ROOT}/src/platform/mapped_file.cpp ${BASALT_CMAKE_ROOT}/src/platform/cpu.cpp
-  ${BASALT_CMAKE_ROOT}/src/platform/system.cpp ${BASALT_CMAKE_ROOT}/src/platform/dynlib.cpp)
+  ${BASALT_CMAKE_ROOT}/src/platform/system.cpp ${BASALT_CMAKE_ROOT}/src/platform/dynlib.cpp
+  ${BASALT_CMAKE_ROOT}/src/platform/pagefile.cpp)
 target_include_directories(platform PUBLIC ${BASALT_CMAKE_ROOT}/include)
 # dlopen (DynLib) lives in libdl before glibc 2.34
 target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})

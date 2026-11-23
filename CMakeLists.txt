@@ -820,6 +820,11 @@ basalt_embed_manifest(path_utf8_test)
 basalt_cpu_test(NAME path_utf8_test COMMAND path_utf8_test)
 set_tests_properties(path_utf8_test PROPERTIES TIMEOUT 60)
 
+# the page file that counts (current or initial size, never the growth maximum) on fake inputs, then the live check
+add_executable(pagefile_test tests/platform/pagefile_test.cpp)
+target_link_libraries(pagefile_test PRIVATE platform)
+basalt_cpu_test(NAME pagefile_test COMMAND pagefile_test)
+
 # platform::MappedFile, file_size and pread_all on a scratch file (CPU only).
 add_executable(mapped_file_test tests/platform/mapped_file_test.cpp)
 target_link_libraries(mapped_file_test PRIVATE platform)
