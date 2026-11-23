@@ -27,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
+import loader_round
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import checkpoint as C  # noqa: E402
@@ -130,6 +132,26 @@ def _head_job(args):
     return (u >> 16).astype("<u2").tobytes()
 
 
+# the head as Q8_0: the bytes the engine's loader made from the BF16 head (loader_round.py, checked against the C++)
+q8_0_loader = loader_round.q8_0
+
+
+def _head_q8_job(args):
+    """The head's values (BF16, or F32 holding BF16 numbers) as Q8_0 blocks, the loader's rounding."""
+    path, off, n, f32 = args
+    if f32:
+        u = np.frombuffer(pread(path, off, n * 4), dtype="<u4")
+        if (u & 0xFFFF).any():
+            return "an F32 value that is not a BF16 number"
+        u = (u >> 16).astype("<u2")
+    else:
+        u = np.frombuffer(pread(path, off, n * 2), dtype="<u2")
+    x = bf16_values(u.tobytes())
+    if not np.isfinite(x).all():
+        return "a non-finite value"
+    return q8_0_loader(x)
+
+
 _LUT = None
 
 
@@ -219,7 +241,9 @@ class Plan:
         if name == "output.weight":
             if tn not in ("F32", "BF16"):
                 raise S.ConvertError(f"{name} is {tn}; expected F32 or BF16 numbers")
-            return ("raw", "BF16") if tn == "BF16" else ("head", "BF16")
+            if int(t.shape[0]) % 32:
+                raise S.ConvertError(f"{name}: rows of {t.shape[0]} values are not whole Q8_0 blocks")
+            return ("headq8", "Q8_0") if tn == "BF16" else ("headq8f", "Q8_0")
         if tn == "F32":
             return "raw", "F32"
         if tn != "BF16":
@@ -261,7 +285,13 @@ class Plan:
             if how == "raw":
                 out.append((n, ty, (path, off, size)))
                 continue
-            if how == "head":
+            if how in ("headq8", "headq8f"):   # whole rows a job: each job a run of whole Q8_0 blocks
+                f32 = how == "headq8f"
+                n_val = size // (4 if f32 else 2)
+                step = ROWS_VALUES_PER_JOB // 32 * 32
+                jobs = [(path, off + v * (4 if f32 else 2), min(step, n_val - v), f32) for v in range(0, n_val, step)]
+                fn = _head_q8_job
+            elif how == "head":
                 n_val = size // 4
                 step = ROWS_VALUES_PER_JOB
                 jobs = [(path, off + v * 4, min(step, n_val - v)) for v in range(0, n_val, step)]
@@ -298,7 +328,8 @@ class QuantDense(S.Dense):
     """`dense` of the float tensors (the others are native rows, as for a GGUF whose projections are quantized), rows in file order."""
 
     def __init__(self, model, arch, how):
-        super().__init__(model, False, arch, only=lambda n: n in how and how[n][0] in ("raw", "head"))
+        # the float pool keeps the head's BF16 values (the gguf section holds its Q8_0 rows)
+        super().__init__(model, False, arch, only=lambda n: n in how and how[n][0] in ("raw", "head", "headq8", "headq8f"))
         have = {x[0]: x for x in self.todo}
         self.todo = [have.get(n) or (n, t, p, True) for n, (g, t, p) in model.where.items() if n in how]
 
@@ -328,7 +359,7 @@ def check_tokenizer(kv: dict, hf_dir: Path) -> None:
 
 # ------------------------------------------------------------------ the build
 def build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_tokenizer) -> None:
-    from dfly_attach import SECTION as DFLY, dfly_record
+    from dfly_attach import SECTION as DFLY, _dfly_record, dfly_record, write_runtime
     out = Path(a.out)
     partial = Path(str(out) + ".partial")
     dry = getattr(a, "dry_run", False)
@@ -339,6 +370,7 @@ def build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_
     hf_dir = Path(a.hf_dir)
     mmproj = Path(a.mmproj) if a.mmproj and not a.no_vision else None
     dfly = Path(a.dfly) if getattr(a, "dfly", None) else None
+    dfly_rt = None   # (file, tensors): the drafter in its runtime formats (dfly_attach.write_runtime), unless --dfly-bf16
     try:
         print("reading the source GGUF ...", flush=True)
         model = S.SourceModel(paths, frozenset())
@@ -406,7 +438,12 @@ def build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_
             if mmproj is not None:
                 job.file("vision/mmproj", mmproj)
                 vision = {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size, "extra": []}
-            if dfly is not None:
+            if dfly is not None and not getattr(a, "dfly_bf16", False):
+                rt = Path(str(out) + ".dfly-runtime.tmp")
+                dfly_rt = (rt, write_runtime(dfly, rt, int(_dfly_record(dfly, hf_meta["hf_config"])["layers"]),
+                                           bool(getattr(a, "dfly_nvfp4", False))))
+                job.file(DFLY, rt)
+            elif dfly is not None:
                 job.file(DFLY, dfly)
             kv = dict(kv)
             kv["general.architecture"] = ARCH.name
@@ -432,14 +469,16 @@ def build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_
                     "[gate | up | down] and the FP32 tail {s_gate, s_up, s_down, 0}",
                     "dense": "Q6_K (least-squares 16-value group scales) where Q6K_TARGETS names the tensor and rows are whole "
                     "256-value blocks, else Q8_0 (ggml reference rounding)" if q6k else "Q8_0 (ggml reference rounding)",
-                    "dense_variant": "Q6_K" if q6k else "Q8_0", "head": "BF16 (the F32 values are BF16 numbers)",
+                    "dense_variant": "Q6_K" if q6k else "Q8_0", "head": "Q8_0 (the engine loader's rounding of the BF16 head)",
                     "engram": {"format": "E4M3 codes (llama.cpp type 43), to nearest, ties to even, no scale", **(engram_cost or {})},
                 },
-                **({"dfly2": dfly_record(dfly, hf_meta["hf_config"])} if dfly is not None else {}),
+                **({"dfly2": dfly_record(dfly, hf_meta["hf_config"], dfly_rt)} if dfly is not None else {}),
                 **hf_meta,
             }
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
+        if dfly_rt is not None:
+            dfly_rt[0].unlink(missing_ok=True)
         ok = True
     except S.ConvertError as e:
         raise SystemExit(f"convert: {e}")

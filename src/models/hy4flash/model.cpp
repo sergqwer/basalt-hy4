@@ -145,6 +145,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     const int file = reads.file_fd(fd_);
 
     uint64_t dense = 0;
+    bool head_converts = false;   // an older pack's BF16 head, rounded as it loads
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight") {
             if (t.type != kTypeQ8_0 || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd) {
@@ -164,8 +165,12 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         d.type = t.type;
         d.bytes = t.bytes;
         d.shape = t.shape;
-        // the output head: the pack's BF16 rows rounded to Q8_0 as they load, read by the target and the drafts alike
-        const bool head_q8 = name == "output.weight";
+        // the output head: Q8_0 as stored, or (an older pack) BF16 rows rounded to Q8_0 as they load; read by the target and
+        // the drafts alike
+        const bool head_q8 = name == "output.weight" && t.type != kTypeQ8_0;
+        head_converts = head_converts || head_q8;
+        if (name == "output.weight" && t.type == kTypeQ8_0 && (t.shape.size() != 2 || t.shape[0] % 32 != 0))
+            return {model::Status::Error, "hy4flash: output.weight is not Q8_0 rows"};
         if (head_q8) {
             if (t.type != kTypeBF16 || t.shape.size() != 2 || t.shape[0] % 32 != 0)
                 return {model::Status::Error, "hy4flash: output.weight is not BF16 rows of whole Q8_0 blocks"};
@@ -192,6 +197,10 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     if (req.draft)
         if (model::Result r = dfly_plan(pack_, reads, file, device_, dfly_); !r.ok()) return r;
     if (dfly_) dfly_->head_q8 = dev_.at("output.weight").ptr;   // the drafts read the target's own Q8_0 head
+    if (head_converts || (dfly_ && dfly_->converts))
+        basalt::log::info("basalt hy4flash", "this pack's %s rounded at load (an older layout); tools/convert/hy4_retrofit.py stores them "
+                          "pre-quantized for a faster start", head_converts && dfly_ && dfly_->converts ? "head and drafter are"
+                          : head_converts ? "head is" : "drafter is");
     // [vision] the image encoder staged before the context and the tier are sized: it holds no VRAM afterwards
     if (req.vision) {
         if (!vis_.stage(pack_.vision, g.n_embd, err)) return {model::Status::Error, "hy4flash: vision: " + err};

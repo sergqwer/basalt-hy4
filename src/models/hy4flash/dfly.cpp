@@ -4,6 +4,7 @@
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/window_gemm.hpp"
 #include "basalt/kernels/q80_screen.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
@@ -29,6 +30,26 @@ DflyWeights::~DflyWeights() {
     for (auto& [name, p] : slots_)
         if (p) cudaFree(p);
     if (head_screen) cudaFree(head_screen);
+    if (fp4_scales_) cudaFree(fp4_scales_);
+}
+
+bool DflyWeights::set_fp4(const std::vector<float>& scales, std::string& err) {
+    if (scales.size() != (size_t) dims.layers * 5 || cudaMalloc(&fp4_scales_, scales.size() * 4) != cudaSuccess ||
+        cudaMemcpy(fp4_scales_, scales.data(), scales.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "the drafter's NVFP4 scales";
+        return false;
+    }
+    for (int i = 0; i < dims.layers; ++i) {   // dfly_specs' order within a layer: mlp gate, up, down, then gate, o
+        const float* s = fp4_scales_ + 5 * i;
+        DflyLayer& l = layer[(size_t) i];
+        l.mlp_gate_s = s;
+        l.mlp_up_s = s + 1;
+        l.mlp_down_s = s + 2;
+        l.gate_s = s + 3;
+        l.o_s = s + 4;
+    }
+    fp4 = true;
+    return true;
 }
 
 bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
@@ -139,6 +160,17 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
     }
     auto w = std::make_unique<DflyWeights>();
     if (!w->allocate(d, err)) return {model::Status::Error, "hy4flash: " + err};
+    std::vector<float> fp4_scales;   // the Q4_0 set as NVFP4 planes: all of it or none
+    int n_q4 = 0;
+    for (const DflySpec& s : dfly_specs(d)) {
+        if (!s.q4) continue;
+        ++n_q4;
+        const DflyTensor& t = dp.tensors.at(s.name);
+        if (t.dtype == "NVFP4P") fp4_scales.push_back(t.scale);
+    }
+    if (!fp4_scales.empty() && (int) fp4_scales.size() != n_q4)
+        return {model::Status::Error, "hy4flash: the drafter's Q4_0 set is partly NVFP4"};
+    if (!fp4_scales.empty() && !w->set_fp4(fp4_scales, err)) return {model::Status::Error, "hy4flash: " + err};
     for (const DflySpec& s : dfly_specs(d)) {
         const DflyTensor& t = dp.tensors.at(s.name);
         core::LoadItem it;
@@ -147,11 +179,14 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
         it.bytes = t.bytes;
         it.dev = w->slot(s.name);
         it.device = device;
-        it.conv = s.f32 ? core::Conv::Bf16ToF32 : s.q4 ? core::Conv::Bf16ToQ4_0 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
+        // a runtime-format tensor is copied as stored; a BF16 one is rounded as it loads (an older pack)
+        w->converts = w->converts || (t.dtype == "BF16" && (s.f32 || s.q4 || s.q8));
+        it.conv = t.dtype != "BF16" ? core::Conv::Copy
+                  : s.f32 ? core::Conv::Bf16ToF32 : s.q4 ? core::Conv::Bf16ToQ4_0 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
         reads.add(it);
     }
-    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 and Q4_0 projections)", d.layers,
-                      d.kv_layers.front(), d.kv_layers.back(), (double) w->bytes() / (double) (1ull << 30));
+    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 and %s projections)", d.layers,
+                      d.kv_layers.front(), d.kv_layers.back(), (double) w->bytes() / (double) (1ull << 30), w->fp4 ? "NVFP4" : "Q4_0");
     out = std::move(w);
     return {};
 }
@@ -269,6 +304,35 @@ struct DflyRunner::Impl {
     }
     void* act_q8 = nullptr;   // a projection's input rows in q8_1
     void* in_q8 = nullptr;    // rows that several projections read, in q8_1 once
+    // the Q4_0 set as NVFP4 planes (w->fp4): its products on the FP4 window kernels, rows packed to bf16 (in_bf for rows
+    // several products read)
+    void *act_bf = nullptr, *in_bf = nullptr;
+    basalt::kernels::wgemm::Workspace wws;
+    void fp4(const void* wt, const float* s, const void* act, float* y, int n_in, int n_out, int rows, void* st) {
+        namespace wg = basalt::kernels::wgemm;
+        wg::Call c;
+        c.fmt = wg::Format::Nvfp4;
+        c.K = n_in;
+        c.m[0].w = (const uint8_t*) wt;
+        c.m[0].rows = n_out;
+        c.m[0].scale = s;
+        c.m[0].y = y;
+        c.m[0].ld_y = n_out;
+        wg::gemm(c, act, rows, wws, st);
+    }
+    // h = silu(gate x) * (up x) of packed rows: one launch for both matrices
+    void fp4_swiglu(const DflyLayer& L, const void* act, float* h, int n_in, int n_out, int rows, void* st) {
+        namespace wg = basalt::kernels::wgemm;
+        wg::Call c;
+        c.fmt = wg::Format::Nvfp4;
+        c.K = n_in;
+        c.n = 2;
+        c.epi = wg::Epilogue::SwiGLU;
+        c.m[0] = {(const uint8_t*) L.mlp_gate, n_out, L.mlp_gate_s, h, n_out};
+        c.m[1] = {(const uint8_t*) L.mlp_up, n_out, L.mlp_up_s, nullptr, n_out};
+        wg::gemm(c, act, rows, wws, st);
+    }
+    void pack(const float* x, int n_in, int rows, void* act, void* st) { basalt::kernels::wgemm::pack(x, n_in, n_in, rows, act, st); }
 };
 
 std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err) {
@@ -300,6 +364,31 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     const int widest_in = std::max({2 * d.E, d.q_lora, d.heads * (int) kDflyV, d.ffn, d.hc_ffn});
     p.act_q8 = p.dev(bk::native_q8_1_bytes(widest_in, kDflyBlock) / 4 + 1, ok);
     p.in_q8 = p.dev(bk::native_q8_1_bytes(widest_in, kDflyBlock) / 4 + 1, ok);
+    if (p.w->fp4) {   // the NVFP4 window products' bf16 rows and split-K workspace, sized over the Q4_0 set's shapes
+        namespace wg = basalt::kernels::wgemm;
+        size_t pf = 0, tk = 0;
+        const int shapes[4][2] = {{d.E, d.heads * (int) kDflyV}, {d.heads * (int) kDflyV, d.E}, {d.E, d.ffn}, {d.ffn, d.E}};
+        for (const auto& sh : shapes)
+            for (int n = 1; n <= 2; ++n) {   // a plain product and the SwiGLU pair
+                wg::Call c;
+                c.fmt = wg::Format::Nvfp4;
+                c.K = sh[0];
+                c.n = n;
+                c.epi = n == 2 ? wg::Epilogue::SwiGLU : wg::Epilogue::Store;
+                c.m[0].rows = c.m[1].rows = sh[1];
+                size_t a = 0, b = 0;
+                wg::workspace_need(c, a, b);
+                pf = std::max(pf, a);
+                tk = std::max(tk, b);
+            }
+        p.act_bf = p.dev(wg::act_bytes(widest_in) / 4 + 1, ok);
+        p.in_bf = p.dev(wg::act_bytes(widest_in) / 4 + 1, ok);
+        p.wws.partial = p.dev(std::max<size_t>(pf, 4), ok);
+        p.wws.partial_floats = pf;
+        p.wws.tickets = (int32_t*) p.dev(std::max<size_t>(tk, 1), ok);
+        p.wws.tickets_n = tk;
+        if (ok) cudaMemset(p.wws.tickets, 0, std::max<size_t>(tk, 1) * 4);
+    }
     p.pick = (int32_t*) p.dev(1, ok);
     p.h_emb = p.host(R * E, ok); p.h_pe = p.host(E, ok); p.h_conf = p.host(1, ok);
     p.h_tok = (int32_t*) p.host(1, ok);
@@ -403,17 +492,34 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             rs.counts = p.meta_d + i * 16 + 8;
             mla_attend(p.qcur, p.ctx, rs, R, L.sink, a, 0, p.env.sel_cap + kDflyBlock, p.attw, p.olat, st);
             dfly_expand_v(L.kv_b, p.olat, R, H, p.vout, st);
-            p.mmq(L.gate, p.in_q8, p.gate, E, H * kDflyV, R, st, true);
+            if (w.fp4) {
+                p.pack(p.xn, E, R, p.in_bf, st);
+                p.fp4(L.gate, L.gate_s, p.in_bf, p.gate, E, H * kDflyV, R, st);
+            } else {
+                p.mmq(L.gate, p.in_q8, p.gate, E, H * kDflyV, R, st, true);
+            }
             mul_sigmoid(p.gate, p.vout, R * H * kDflyV, st);
-            p.mm(L.o, p.vout, H * kDflyV, p.o, E, H * kDflyV, E, R, st, true);
+            if (w.fp4) {
+                p.pack(p.vout, H * kDflyV, R, p.act_bf, st);
+                p.fp4(L.o, L.o_s, p.act_bf, p.o, H * kDflyV, E, R, st);
+            } else {
+                p.mm(L.o, p.vout, H * kDflyV, p.o, E, H * kDflyV, E, R, st, true);
+            }
             bk::rms_norm_rows(p.o, L.post_proj_ln, p.o2, R, E, d.rms_eps, st);
             add_vectors(p.X, p.o2, p.X1, R * E, st);
             bk::rms_norm_rows(p.X1, L.post_attn_ln, p.xn, R, E, d.rms_eps, st);
-            bk::native_quantize_q8_1(p.xn, p.in_q8, E, R, st);   // the MLP's gate and up read it
-            p.mmq(L.mlp_gate, p.in_q8, p.g, E, d.ffn, R, st, true);
-            p.mmq(L.mlp_up, p.in_q8, p.u, E, d.ffn, R, st, true);
-            bk::swiglu_scaled(p.g, p.u, nullptr, nullptr, p.h, R, d.ffn, d.ffn, st);
-            p.mm(L.mlp_down, p.h, d.ffn, p.mlp, E, d.ffn, E, R, st, true);
+            if (w.fp4) {   // gate and up in one launch with the SwiGLU, then down
+                p.pack(p.xn, E, R, p.in_bf, st);
+                p.fp4_swiglu(L, p.in_bf, p.h, E, d.ffn, R, st);
+                p.pack(p.h, d.ffn, R, p.act_bf, st);
+                p.fp4(L.mlp_down, L.mlp_down_s, p.act_bf, p.mlp, d.ffn, E, R, st);
+            } else {
+                bk::native_quantize_q8_1(p.xn, p.in_q8, E, R, st);   // the MLP's gate and up read it
+                p.mmq(L.mlp_gate, p.in_q8, p.g, E, d.ffn, R, st, true);
+                p.mmq(L.mlp_up, p.in_q8, p.u, E, d.ffn, R, st, true);
+                bk::swiglu_scaled(p.g, p.u, nullptr, nullptr, p.h, R, d.ffn, d.ffn, st);
+                p.mm(L.mlp_down, p.h, d.ffn, p.mlp, E, d.ffn, E, R, st, true);
+            }
             add_vectors(p.X1, p.mlp, p.X, R * E, st);
         }
         bk::rms_norm_rows(p.X, w.final_norm, p.z, R, E, d.rms_eps, st);

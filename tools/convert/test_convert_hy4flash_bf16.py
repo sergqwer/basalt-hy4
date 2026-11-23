@@ -2,6 +2,7 @@
 Q6_K projections, the head, the E4M3 Engram table and its error figures, the float tensors as stored, the sections and meta,
 the tokenizer check, and `--verify` on the result (it must catch a flipped byte in every rounded section)."""
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -155,7 +156,7 @@ class Hy4FlashBf16Test(unittest.TestCase):
 
     def args(self, **kw):
         d = dict(gguf=[str(self.gguf)], mmproj=str(self.mmproj), out=str(self.t / "out.basalt"), name=None, no_vision=False,
-                 force=False, hf_dir=str(self.hf), dfly=str(self.dfly), dense_q6k=False, workers=2, dry_run=False)
+                 force=False, hf_dir=str(self.hf), dfly=str(self.dfly), dfly_bf16=True, dense_q6k=False, workers=2, dry_run=False)
         d.update(kw)
         return type("A", (), d)()
 
@@ -224,9 +225,9 @@ class Hy4FlashBf16Test(unittest.TestCase):
             d = blocks[:, :2].copy().view(np.float16).astype(np.float32)
             got = d * blocks[:, 2:].view(np.int8)
             self.assertTrue((np.abs(got - x.reshape(-1, 32)) <= d * 0.6 + 1e-7).all(), name)
-        raw, e = self.tensor(m, meta, "output.weight")
-        self.assertEqual((e["type"], e["type_id"], e["bytes"]), ("BF16", 30, 4 * 64 * 2))
-        self.assertTrue(np.array_equal(bf16_to_f32(raw), np.frombuffer(self.src["output.weight"], "<f4")))
+        raw, e = self.tensor(m, meta, "output.weight")   # Q8_0 as the engine's loader rounded the BF16 head
+        self.assertEqual((e["type"], e["type_id"], e["bytes"]), ("Q8_0", 8, 4 * 64 // 32 * 34))
+        self.assertEqual(raw, H.q8_0_loader(np.frombuffer(self.src["output.weight"], "<f4")))
         for name in ("output_norm.weight", "blk.1.ffn_gate_inp.weight"):
             raw, e = self.tensor(m, meta, name)
             self.assertEqual((e["type"], raw), ("F32", self.src[name]))
@@ -239,6 +240,20 @@ class Hy4FlashBf16Test(unittest.TestCase):
         self.assertEqual(pool[off:off + 512], bf16_bytes(np.frombuffer(self.src["output.weight"], "<f4")))
         self.assertNotIn("blk.1.ffn_gate_exps.weight", meta["tensors"])
         self.assertEqual(set(meta["tensors"]) - {H.ENGRAM_TENSOR}, set(index))
+
+    def test_head_rounding_is_the_loaders(self):
+        # core/loader.cpp quantize_bf16_q8_0 per value: float32 d = amax / 127, id = 1 / d, std::round(x * id); ties away
+        rng = np.random.default_rng(3)
+        x = bf16_to_f32(bf16_bytes(rng.normal(0, 0.05, 32 * 64).astype(np.float32)))
+        x[:32] = np.float32(127.0) * np.arange(-16, 16, dtype=np.float32) / np.float32(31.5)   # halfway products
+        got = np.frombuffer(H.q8_0_loader(x), np.uint8).reshape(-1, 34)
+        for b in range(len(got)):
+            blk = x[32 * b:32 * b + 32]
+            d = np.float32(np.max(np.abs(blk)) / np.float32(127.0))
+            idv = np.float32(1.0) / d if d != 0 else np.float32(0.0)
+            want = [int(np.int8(math.floor(abs(float(np.float32(v * idv))) + 0.5) * (1 if v * idv >= 0 else -1))) for v in blk]
+            self.assertEqual(got[b, :2].tobytes(), np.float16(d).tobytes())
+            self.assertEqual(list(got[b, 2:].view(np.int8)), want, b)
 
     def test_dense_q6k_variant(self):
         m = self.build(dense_q6k=True)

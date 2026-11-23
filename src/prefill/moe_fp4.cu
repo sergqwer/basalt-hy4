@@ -289,6 +289,7 @@ struct GemmArgs {
     int n;
     const int32_t* dst_ids;   // FLAT: output row r to dst row dst_ids[r] (null: r)
     float cg, cu;             // FLAT SWIGLU: the softcaps (cg > 0)
+    float lim;                // FLAT SWIGLU: > 0, Hy4's clamped form in place of the softcaps
 };
 
 // The weight row behind B tile row sr of block rb: 128 consecutive rows, or (SWIGLU) the block's 64 gate rows and the
@@ -310,6 +311,14 @@ __device__ __forceinline__ float swiglu_cap(float g, float u, float4 s, float cg
     g *= s.x;
     u *= s.y;
     return __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu)) * s.z;
+}
+
+// Hy4's clamped SwiGLU on the tail-scaled values: gate capped above at lim, up clamped to [-lim, lim], h scaled by s_down
+// (swiglu_split_clamped's arithmetic, hy4flash/kernels/ops.cu)
+__device__ __forceinline__ float swiglu_clamp(float g, float u, float4 s, float lim) {
+    g = fminf(g * s.x, lim);
+    u = fminf(fmaxf(u * s.y, -lim), lim);
+    return g / (1.f + expf(-g)) * u * s.z;
 }
 
 __device__ __forceinline__ float swiglu_tail(float g, float u, float4 s) {
@@ -493,9 +502,11 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
                 float* out = a.dst + (row0 + t) * a.ld_dst + rb * 64 + warp_n * 16 + 2 * tig;
 #pragma unroll
                 for (int r = 0; r < 2; ++r)
-                    *(float2*) (out + 8 * r) =
-                        make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 2][2 * h] * g, tail, a.cg, a.cu),
-                                    swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 2][2 * h + 1] * g, tail, a.cg, a.cu));
+                    *(float2*) (out + 8 * r) = a.lim > 0.0f
+                        ? make_float2(swiglu_clamp(acc[mt][r][2 * h] * g, acc[mt][r + 2][2 * h] * g, tail, a.lim),
+                                      swiglu_clamp(acc[mt][r][2 * h + 1] * g, acc[mt][r + 2][2 * h + 1] * g, tail, a.lim))
+                        : make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 2][2 * h] * g, tail, a.cg, a.cu),
+                                      swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 2][2 * h + 1] * g, tail, a.cg, a.cu));
             } else if (FLAT) {
                 const int64_t orow = a.dst_ids ? a.dst_ids[row0 + t] : row0 + t;
                 float* out = a.dst + orow * a.ld_dst + rb * kRowsPerBlock + warp_n * 32 + 2 * tig;
@@ -553,9 +564,10 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
     const unsigned grid = (unsigned) ((rows + 7) / 8);
     const cudaStream_t s = (cudaStream_t) stream;
     if (two) {
-        if (cols == 1152) quantize_kernel<3, false, true><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+        if (cols == 1152 || cols == 1536) quantize_kernel<3, false, true><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
         else { basalt::log::error("basalt", "prefill fp4: %lld columns (two terms)", (long long) cols); std::exit(1); }
     } else if (cols == 2560) quantize_kernel<5, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+    else if (cols == 1536) quantize_kernel<3, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 640) quantize_kernel<2, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 5120) quantize_kernel<10, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 17408) quantize_kernel<34, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
@@ -571,9 +583,11 @@ void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, v
     const unsigned grid = (unsigned) ((tokens + 7) / 8);
     const cudaStream_t s = (cudaStream_t) stream;
     if (two) {
-        if (cols == 2304) quantize_kernel<5, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
+        if (cols == 1536) quantize_kernel<3, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
+        else if (cols == 2304) quantize_kernel<5, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
         else { basalt::log::error("basalt", "prefill fp4: %lld token columns (two terms)", (long long) cols); std::exit(1); }
     } else if (cols == 2560) quantize_kernel<5, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
+    else if (cols == 1536) quantize_kernel<3, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
     else if (cols == 640) quantize_kernel<2, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
     else { basalt::log::error("basalt", "prefill fp4: %lld columns", (long long) cols); std::exit(1); }
     ck(cudaGetLastError(), "quantize tokens");
@@ -604,8 +618,8 @@ template <bool GATHER, bool SWIGLU, bool FLAT = false, bool TWO = false> void la
 void run(const Product& p, void* stream) {
     if (p.base) {   // a layer's experts in one launch
         if (p.n <= 0 || p.blocks <= 0) return;
-        if ((p.ids != nullptr) != p.swiglu || !p.blk_off || p.gate_softcap <= 0.0f) {
-            basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off, softcaps, and token rows with the SwiGLU");
+        if ((p.ids != nullptr) != p.swiglu || !p.blk_off || (p.swiglu && p.gate_softcap <= 0.0f && p.swiglu_limit <= 0.0f)) {
+            basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off, a SwiGLU form, and token rows with the SwiGLU");
             std::exit(1);
         }
         GemmArgs a{};
@@ -614,7 +628,7 @@ void run(const Product& p, void* stream) {
         a.tail_off = p.tail_off;
         a.a4s = p.ids ? (const uint8_t*) p.a4 + (size_t) p.tokens * (size_t) ((p.two ? 2 : 1) * p.w_cols / 2) : nullptr;
         a.base = p.base; a.stride = p.stride; a.blk_off = p.blk_off; a.n = p.n; a.dst_ids = p.dst_ids;
-        a.cg = p.gate_softcap; a.cu = p.up_softcap;
+        a.cg = p.gate_softcap; a.cu = p.up_softcap; a.lim = p.swiglu_limit;
         const dim3 grid((unsigned) (p.w_rows / kRowsPerBlock), (unsigned) p.blocks, 1);
         if (p.two) {
             if (p.swiglu) launch<true, true, true, true>(a, grid, (cudaStream_t) stream);

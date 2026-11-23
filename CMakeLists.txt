@@ -151,7 +151,7 @@ add_library(model_hy4flash STATIC src/models/hy4flash/adapter.cpp src/models/hy4
   src/models/hy4flash/model.cpp src/models/hy4flash/session.cpp
   src/models/hy4flash/vision.cpp src/models/hy4flash/vision_encoder.cpp)
 target_include_directories(model_hy4flash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_hy4flash PUBLIC model tokenizer hy4flash_kernels expert_tier tiers mmq peer_share kernels core vision_cuda ${_gpu_runtime_target})
+target_link_libraries(model_hy4flash PUBLIC model tokenizer hy4flash_kernels expert_tier tiers mmq prefill_fp4 window_gemm peer_share kernels core vision_cuda ${_gpu_runtime_target})
 # the DFly2 drafter (src/models/hy4flash/dfly*)
 add_library(hy4flash_dfly_kernels STATIC src/models/hy4flash/dfly_kernels.cu)
 target_include_directories(hy4flash_dfly_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -327,6 +327,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/mhc.cu
                         src/kernels/cuda/mhc_plain.cu
                         src/kernels/cuda/router.cu
+                        src/kernels/cuda/router_tc.cu
                         src/kernels/cuda/route_tail_skip.cu
                         src/kernels/cuda/row_norm.cu
                         src/ngram/ple_reader.cpp)
@@ -414,6 +415,16 @@ if(BUILD_TESTING)
   target_link_libraries(fp4_dense_tma_test PRIVATE prefill_fp4 kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME fp4_dense_tma_test COMMAND fp4_dense_tma_test)
   set_tests_properties(fp4_dense_tma_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # Hy4's prompt experts on moe_fp4 (1536 latent, clamped SwiGLU epilogue) against double references
+  add_executable(hy4_fp4_moe_test tests/prefill/hy4_fp4_moe_test.cpp)
+  target_link_libraries(hy4_fp4_moe_test PRIVATE prefill_fp4 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME hy4_fp4_moe_test COMMAND hy4_fp4_moe_test)
+  # the prompt router's logits on BF16 tensor cores (two terms) against double and router()'s fp32
+  add_executable(router_tc_test tests/kernels/router_tc_test.cpp)
+  target_link_libraries(router_tc_test PRIVATE kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME router_tc_test COMMAND router_tc_test)
+  set_tests_properties(router_tc_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  set_tests_properties(hy4_fp4_moe_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the SwiGLU epilogue's branch-free SiLU quotient against the plain expression on every float
   add_executable(silu_parity tests/kernels/silu_parity.cu)
   set_target_properties(silu_parity PROPERTIES CUDA_ARCHITECTURES 120a-real)
