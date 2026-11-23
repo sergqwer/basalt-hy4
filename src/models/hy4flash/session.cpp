@@ -167,6 +167,8 @@ public:
         join_moe(e);
         for (cudaGraphExec_t g : gx_)
             if (g) cudaGraphExecDestroy(g);
+        for (cudaGraphExec_t g : gxr_)
+            if (g) cudaGraphExecDestroy(g);
         for (cudaGraphExec_t g : gbx_)
             if (g) cudaGraphExecDestroy(g);
         if (joiner_.joinable()) {
@@ -628,6 +630,7 @@ public:
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        rope_forget(pos);
         const model::Result r = dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
         early_window(anchor, pos);   // while the card runs the block
         return r;
@@ -640,6 +643,7 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
+        rope_forget(r.pos);   // [vision] a picture rewound out of the session: the windows run as graphs again
         prof_t0 = prof_.on ? now_ms() : 0;
         prof_.last = 0;
         // the lossy routing flags apply to decode windows only: prompts route as the model does
@@ -655,7 +659,7 @@ public:
             const bool last = t0 + n == r.n_tokens;
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
-            graphs_ = use_graphs_ && m_.diag_dump().empty() && !rope_on_ && n <= kMaxWindow && n <= arows_;
+            graphs_ = use_graphs_ && m_.diag_dump().empty() && n <= kMaxWindow && n <= arows_;
             const bool ran = run_rows(r.tokens + t0, n, r.pos + t0, head, err);
             graphs_ = false;
             if (!ran) return {model::Status::Error, "hy4flash: " + err};
@@ -2072,7 +2076,7 @@ private:
         };
         const double norm_start = time_prompt ? now_ms() : 0;
         // the codes need a fifth more room in the rows' buffer (arows_ rows of n_embd floats) than the rows themselves
-        if (engram_gpu_ && (int64_t) R * n_cols * W * 5 <= (int64_t) arows_ * g_.n_embd * 4) {   // BASALT_ENGRAM_GPU: the card decodes and norms the codes
+        if (engram_gpu_ && (int64_t) R * n_cols * W * 5 <= (int64_t) arows_ * g_.n_embd * 4) {   // the card decodes and norms the codes
             if (!d_elut_) {
                 if (cudaMalloc((void**) &d_elut_, 256 * 4) != cudaSuccess) { err = "no device memory for the Engram table"; return false; }
                 bufs_.push_back(d_elut_);
@@ -2260,10 +2264,11 @@ private:
     // ---- CUDA graphs of a decode window's layers: the stretches with no position in them, captured once per layer and row
     // count and replayed (the launches of a token were ~2,200 one by one, and the host's launch rate set the pace).
     std::vector<cudaGraphExec_t> gx_;   // [(R - 1) * n_layers * 3 + l * 3 + part]
+    std::vector<cudaGraphExec_t> gxr_;  // [vision] the same with a picture in the session: the kernels read the cells' rotary table
     std::vector<cudaGraphExec_t> gbx_;  // a batch window's, the same way (layer_batched)
-    bool graphs_ = false;               // this run_rows replays them (a decode window, no dumps, no picture)
+    bool graphs_ = false;               // this run_rows replays them (a decode window, no dumps)
     template <class Fn>
-    bool replay(int l, int R, int part, Fn&& body, std::string& err) { return replay_in(gx_, l, R, part, body, err); }
+    bool replay(int l, int R, int part, Fn&& body, std::string& err) { return replay_in(rope_on_ ? gxr_ : gx_, l, R, part, body, err); }
     template <class Fn>
     bool replay_in(std::vector<cudaGraphExec_t>& set, int l, int R, int part, Fn&& body, std::string& err) {
         if (set.empty()) set.assign((size_t) kMaxWindow * g_.n_layers * 3, nullptr);
@@ -3088,6 +3093,7 @@ private:
     // cell on the host and, once a picture is in the session, on the device where the kernels read them (MlaArgs::cell_rope).
     void sync_rope(int64_t pos) {
         rope_.rewind(pos);
+        rope_forget(pos);
         while (rope_.size() < pos) rope_.push_text();   // cells the session never placed (a restored history) count as text
     }
     // The rotary position a text token at cell `pos` takes, the track left as it is (the drafter's block, before its window).
@@ -3095,11 +3101,19 @@ private:
         const int64_t have = std::min<int64_t>(pos, rope_.size());
         return (have > 0 ? rope_.at(have - 1).last() + 1 : 0) + (pos - have);
     }
+    // No picture cell left below `pos`: the text cells' positions are their cells again, and the kernels go back to them.
+    void rope_forget(int64_t pos) {
+        if (rope_on_ && pos <= img_cell0_) { rope_on_ = false; img_cell0_ = INT64_MAX; }
+    }
     void place_rope(int64_t pos0, int R) {
         sync_rope(pos0);
         const bool was_on = rope_on_;
         for (int t = 0; t < R; ++t) {
-            if (emb_rows_) { rope_.push_row(img_start_, img_nx_, img_j_ + t); rope_on_ = true; }
+            if (emb_rows_) {
+                img_cell0_ = std::min(img_cell0_, rope_.size());
+                rope_.push_row(img_start_, img_nx_, img_j_ + t);
+                rope_on_ = true;
+            }
             else rope_.push_text();
         }
         if (!rope_on_) return;
@@ -3226,7 +3240,8 @@ private:
     void* xq_n_ = nullptr;   // quant_n
     void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr, *ex_gplan_ = nullptr;
     bool gsteer_now_ = false;   // BASALT_GPU_STEER, inside a solo decode window's MoE layer: its card experts are planned on the card
-    const bool engram_gpu_ = [] { const char* e = std::getenv("BASALT_ENGRAM_GPU"); return e && *e && *e != '0'; }();
+    // the Engram rows' E4M3 decode and norm on the card (bit for bit the host loop's); BASALT_ENGRAM_GPU=0 keeps the host loop
+    const bool engram_gpu_ = [] { const char* e = std::getenv("BASALT_ENGRAM_GPU"); return !(e && *e == '0'); }();
     float* d_elut_ = nullptr;   // engram_gpu_: the E4M3 decode table on the card
     float* ex_rows_ = nullptr;
     float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_e_ = nullptr, *h_erows_ = nullptr, *h_evalid_ = nullptr;
@@ -3246,7 +3261,7 @@ private:
     std::vector<L2Ranges> ra_;
     // the joiner thread (moe_group hands it a group's CPU and second-card share; join_moe waits for its result)
     bool use_joiner_ = true;
-    bool use_graphs_ = true;
+    const bool use_graphs_ = [] { const char* e = std::getenv("BASALT_GRAPHS"); return !(e && *e == '0'); }();   // 0: diagnostics, launches one by one
     core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     std::thread joiner_;
     std::mutex jm_;
@@ -3285,6 +3300,7 @@ private:
     RopeTrack rope_;
     int32_t* rope_dev_ = nullptr;
     bool rope_on_ = false;               // a picture has been fed: the kernels read the rotary table
+    int64_t img_cell0_ = INT64_MAX;      // the first cell of a picture in the session (rope_on_)
     const float* emb_rows_ = nullptr;    // the embeddings of the rows being run, in place of the tokens'
     int32_t img_start_ = 0;              // the first position of the block being fed
     int img_nx_ = 1, img_j_ = 0;         // its columns (newline included) and the row of its first run row
