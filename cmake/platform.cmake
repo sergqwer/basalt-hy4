@@ -48,6 +48,19 @@ target_link_libraries(model_file PUBLIC platform warnings)
 # The executables a release ships go to <source>/bin for every generator. A plain RUNTIME_OUTPUT_DIRECTORY gets a
 # per-configuration subdirectory (bin/Release) from the multi-config generators (Visual Studio, Ninja Multi-Config),
 # and the engine finds data/ and its sibling programs relative to bin/; the generator expression stops that.
+#
+# Every shipped program also carries the Basalt icon (assets/basalt.ico, from tools/make_icon.py). The .rc is
+# generated with the icon's absolute path, so rc.exe never has to resolve it relative to some directory.
+if(WIN32)
+  set(BASALT_ICON_RC ${CMAKE_BINARY_DIR}/basalt_icon.rc)
+  set(BASALT_ICON_FILE ${BASALT_CMAKE_ROOT}/assets/basalt.ico)
+  # rewritten only when the text changes, so a reconfigure does not relink every program
+  file(CONFIGURE OUTPUT ${BASALT_ICON_RC} CONTENT "IDI_ICON1 ICON \"@BASALT_ICON_FILE@\"\n" @ONLY)
+  set_source_files_properties(${BASALT_ICON_RC} PROPERTIES OBJECT_DEPENDS ${BASALT_ICON_FILE})
+endif()
 function(basalt_ship_to_bin target)
   set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${BASALT_CMAKE_ROOT}/bin>")
+  if(WIN32)
+    target_sources(${target} PRIVATE ${BASALT_ICON_RC})
+  endif()
 endfunction()
