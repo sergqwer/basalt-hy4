@@ -1865,6 +1865,10 @@ private:
     bool lent_ = false;                       // the open prompt lent the tier's slots
     uint8_t* ring_ = nullptr;
     cudaEvent_t ring_copied_[2] = {nullptr, nullptr}, ring_done_[2] = {nullptr, nullptr};
+    // The copies from the card's own slots (and a peer's) go on a second stream: on the one copy engine, a device copy between
+    // the host copies stalls them (a probe: 1 GiB H2D with 512 MiB D2D interleaved 37 GB/s, on two streams 57 GB/s).
+    cudaStream_t ring_dev_st_ = nullptr;
+    cudaEvent_t ring_dev_[2] = {nullptr, nullptr};
     int ring_layer_[2] = {-1, -1};
     std::thread ring_thr_[2];
     bool ring_ok_[2] = {false, false};
@@ -1878,12 +1882,19 @@ private:
         }
         for (int i = 0; i < 2; ++i) {
             if (cudaEventCreateWithFlags(&ring_copied_[i], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ring_dev_[i], cudaEventDisableTiming) != cudaSuccess ||
                 cudaEventCreateWithFlags(&ring_done_[i], cudaEventDisableTiming) != cudaSuccess ||
                 cudaEventRecord(ring_done_[i], stream_) != cudaSuccess) {
                 cudaGetLastError();
                 ring_close();
                 return false;
             }
+        }
+        if (!ring_dev_st_ && cudaStreamCreateWithFlags(&ring_dev_st_, cudaStreamNonBlocking) != cudaSuccess) {
+            cudaGetLastError();
+            ring_dev_st_ = nullptr;
+            ring_close();
+            return false;
         }
         ring_layer_[0] = ring_layer_[1] = -1;
         return true;
@@ -1896,11 +1907,14 @@ private:
         if (!ring_) return;
         ring_join();
         cudaStreamSynchronize(copy_);
+        if (ring_dev_st_) cudaStreamSynchronize(ring_dev_st_);
         cudaStreamSynchronize(stream_);
         cudaFree(ring_);
         ring_ = nullptr;
         for (int i = 0; i < 2; ++i) {
             if (ring_copied_[i]) cudaEventDestroy(ring_copied_[i]);
+            if (ring_dev_[i]) cudaEventDestroy(ring_dev_[i]);
+            ring_dev_[i] = nullptr;
             if (ring_done_[i]) cudaEventDestroy(ring_done_[i]);
             ring_copied_[i] = ring_done_[i] = nullptr;
         }
@@ -1910,7 +1924,9 @@ private:
         const int slot = tl & 1;
         const ExpertLayer& el = m_.pack().experts[(size_t) (tl + g_.n_dense)];
         uint8_t* base = ring_ + (size_t) slot * g_.n_expert * stride_;
+        const double t_issue = progress() ? now_ms() : 0;
         cudaStreamWaitEvent(copy_, ring_done_[slot], 0);
+        cudaStreamWaitEvent(ring_dev_st_, ring_done_[slot], 0);
         cudaEvent_t cp0 = nullptr, cp1 = nullptr;
         if (progress()) {
             cudaEventCreate(&cp0);
@@ -1953,13 +1969,16 @@ private:
             if (src.dev) {
                 if (progress()) pt_d2d_bytes_ += (double) el.blob_bytes;
                 if (tier_->slot_ok(core::bounds::kTierSource, tl, src.dev, el.blob_bytes))   // HY4_BOUNDS_CHECK; else skipped, reported
-                    cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
-            } else if (src.peer) cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), el.blob_bytes, copy_);
+                    cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, ring_dev_st_);
+            } else if (src.peer) cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), el.blob_bytes, ring_dev_st_);
             else return false;
             ++e;
         }
+        cudaEventRecord(ring_dev_[slot], ring_dev_st_);
+        cudaStreamWaitEvent(copy_, ring_dev_[slot], 0);   // the slot is complete when both streams are
         cudaEventRecord(ring_copied_[slot], copy_);
         if (progress()) {
+            pt_issue_ms_ += now_ms() - t_issue;
             cudaEventRecord(cp1, copy_);
             std::lock_guard<std::mutex> g(pt_copy_mu_);
             pt_copy_ev_.push_back({cp0, cp1});
@@ -3860,6 +3879,7 @@ private:
     enum { kTlEngram, kTlHc, kTlAttn, kTlDenseFfn, kTlMoeHead, kTlMoe, kTlMoeTail, kTlTail, kTlN };
     std::vector<std::pair<int, int>> tl_marks_;   // (event index, step it starts)
     double pt_ring_wait_ms_ = 0;
+    std::atomic<double> pt_issue_ms_{0};   // the copy threads' host time issuing the ring's copies
     std::atomic<double> pt_h2d_bytes_{0}, pt_d2d_bytes_{0};
     std::mutex pt_copy_mu_;
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> pt_copy_ev_;
@@ -3940,14 +3960,15 @@ private:
                           fr / 1073741824.0, lu / G, lb / G, nu / G, nb / G);
         basalt::log::info("basalt hy4flash", "prompt chunk %d timeline: %.0f GPU ms of %.0f wall; engram %.0f, hc+norms %.0f, attention %.0f, "
                           "dense FFN %.0f, MoE head %.0f, routed experts %.0f, MoE tail %.0f, end %.0f; dense products %.0f (nested); ring: "
-                          "H2D %.2f GB + D2D %.2f GB in %.0f ms of the copy stream (%.1f GB/s), host waited %.0f ms for its copy thread",
+                          "H2D %.2f GB + D2D %.2f GB in %.0f ms of the copy stream (%.1f GB/s), issued in %.0f host ms, host waited %.0f ms for its copy thread",
                           pt_chunk_ - 1, tl_sum, wall, tl[kTlEngram], tl[kTlHc], tl[kTlAttn], tl[kTlDenseFfn], tl[kTlMoeHead], tl[kTlMoe],
                           tl[kTlMoeTail], tl[kTlTail], ms[kPtDense], pt_h2d_bytes_.load() / 1e9, pt_d2d_bytes_.load() / 1e9, cp_ms,
-                          cp_ms > 0 ? pt_h2d_bytes_.load() / 1e6 / cp_ms : 0.0, pt_ring_wait_ms_);
+                          cp_ms > 0 ? pt_h2d_bytes_.load() / 1e6 / cp_ms : 0.0, pt_issue_ms_.load(), pt_ring_wait_ms_);
         basalt::log::info("basalt hy4flash", "prompt chunk %d attention steps: q/kv projections %.0f, cells meta %.0f, k_b absorb %.0f, prepare (rope, "
                           "cache rows, query rows) %.0f, indexer %.0f, sparse %.0f, window %.0f, v_b %.0f, gate+output+norm %.0f ms",
                           pt_chunk_ - 1, ms[kPtAQkv], ms[kPtAMeta], ms[kPtAKb], ms[kPtAPrep], ms[kPtIndexer], ms[kPtAttSparse], ms[kPtAttWin],
                           ms[kPtAVb], ms[kPtAOut]);
+        pt_issue_ms_ = 0;
         pt_h2d_bytes_ = 0;
         pt_d2d_bytes_ = 0;
         pt_ring_wait_ms_ = 0;
