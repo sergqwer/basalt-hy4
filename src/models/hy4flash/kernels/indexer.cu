@@ -4,6 +4,7 @@
 #include "basalt/models/hy4flash/kernels.hpp"
 
 #include <cuda_fp16.h>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -160,6 +161,82 @@ __global__ void __launch_bounds__(128) scores_mma_kernel(const float* __restrict
     }
 }
 
+// scores_mma_kernel for RPB rows a block: each tile of 8 pooled keys is read once for all of them (the prompt path scores every
+// row of a step against the same keys, so the one-row kernel read every key once per row: an L2-bound O(rows x pools) stream).
+// A row's two fp16 query terms sit in shared memory as the one-row kernel builds them in registers, and each row runs the same
+// mma sequence and epilogue on the same key fragments: its scores are bit-identical to scores_mma_kernel's. Keys past a row's
+// own pools (a longer row of the block needs them) only fill columns that are not written.
+constexpr int kQLd = 136;   // halves a (row, head) line: 128 + 8, so the fragment reads of the 8 rows a quad touches miss bank conflicts
+template <int RPB>
+__global__ void __launch_bounds__(128) scores_mma_rows_kernel(const float* __restrict__ q, const float* __restrict__ w, const __half* __restrict__ pooled,
+                                                              const int32_t* __restrict__ meta, int rows, int stride, float* __restrict__ scores) {
+    extern __shared__ __align__(16) unsigned char smq[];
+    __half* qs = reinterpret_cast<__half*>(smq);   // [2][RPB * 16][kQLd]: the high terms, then the low ones
+    __shared__ float ws[RPB * 16];
+    __shared__ int np[RPB];
+    const int r0 = blockIdx.y * RPB, nr = min(RPB, rows - r0);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x < RPB) np[threadIdx.x] = threadIdx.x < nr ? meta[(r0 + threadIdx.x) * 3] : 0;
+    for (int i = threadIdx.x; i < nr * 16 * 64; i += 128) {   // a pair of values a thread, as the one-row kernel rounds them
+        const int hr = i >> 6, c = (i & 63) * 2;
+        const float2 v = *reinterpret_cast<const float2*>(q + (size_t) (r0 + (hr >> 4)) * 16 * 128 + (hr & 15) * 128 + c);
+        const __half2 h = __floats2half2_rn(v.x, v.y);
+        const float2 hf = __half22float2(h);
+        const __half2 l = __floats2half2_rn(v.x - hf.x, v.y - hf.y);
+        *reinterpret_cast<__half2*>(qs + (size_t) hr * kQLd + c) = h;
+        *reinterpret_cast<__half2*>(qs + (size_t) (RPB * 16 + hr) * kQLd + c) = l;
+    }
+    for (int i = threadIdx.x; i < nr * 16; i += 128) ws[i] = w[(size_t) (r0 + (i >> 4)) * 16 + (i & 15)];
+    __syncthreads();
+    int max_np = 0;
+    for (int r = 0; r < nr; ++r) max_np = max(max_np, np[r]);
+    if ((int) blockIdx.x * 512 >= max_np) return;
+    const int base = blockIdx.x * 512 + warp * 128;
+    for (int nt = 0; nt < 16; ++nt) {
+        const int p0 = base + nt * 8;
+        if (p0 >= max_np) break;
+        const uint32_t* kr = reinterpret_cast<const uint32_t*>(pooled + (size_t) min(p0 + (lane >> 2), max_np - 1) * 128);
+        uint32_t b[8][2];
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            b[ks][0] = kr[ks * 8 + (lane & 3)];
+            b[ks][1] = kr[ks * 8 + 4 + (lane & 3)];
+        }
+        for (int r = 0; r < nr; ++r) {
+            const int n_pool = np[r];
+            if (p0 >= n_pool) continue;
+            // the one-row kernel's fragment of a key past n_pool - 1 is key n_pool - 1's: it only feeds columns not written
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int ks = 0; ks < 8; ++ks) {
+                uint32_t ah[4], al[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int hr = r * 16 + (lane >> 2) + (j & 1) * 8, col = ks * 16 + (lane & 3) * 2 + (j >> 1) * 8;
+                    ah[j] = *reinterpret_cast<const uint32_t*>(qs + (size_t) hr * kQLd + col);
+                    al[j] = *reinterpret_cast<const uint32_t*>(qs + (size_t) (RPB * 16 + hr) * kQLd + col);
+                }
+                mma_f16(c, ah, b[ks][0], b[ks][1]);
+                mma_f16(c, al, b[ks][0], b[ks][1]);
+            }
+            const float wr0 = ws[r * 16 + (lane >> 2)], wr1 = ws[r * 16 + (lane >> 2) + 8];
+            // the one-row kernel's contraction, spelled out (its SASS: FMUL wr0 c0, then FFMA wr1 c2 onto it)
+            float v0 = __fmaf_rn(wr1, fmaxf(c[2], 0.f), __fmul_rn(wr0, fmaxf(c[0], 0.f)));
+            float v1 = __fmaf_rn(wr1, fmaxf(c[3], 0.f), __fmul_rn(wr0, fmaxf(c[1], 0.f)));
+            for (int o = 4; o < 32; o <<= 1) {
+                v0 += __shfl_xor_sync(0xffffffffu, v0, o);
+                v1 += __shfl_xor_sync(0xffffffffu, v1, o);
+            }
+            if (lane < 4) {
+                float* sr = scores + (size_t) (r0 + r) * stride;
+                const int p = p0 + lane * 2;
+                if (p < n_pool) sr[p] = v0;
+                if (p + 1 < n_pool) sr[p + 1] = v1;
+            }
+        }
+    }
+}
+
 constexpr int kSelThreads = 1024;
 
 __device__ __forceinline__ uint32_t order_key(float f) {
@@ -308,8 +385,30 @@ void idx_select(const float* scores, int n_pool, int k, int pool, int tail0, int
 
 void idx_scores_rows(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
                      float* scores, int stride, void* stream) {
+    // HY4_IDX_RPB_F16 rows a block (default 1, the one-row kernel; 4 or 8 read each key once for that many rows, the same scores)
+    static const int rpb = [] { const char* e = std::getenv("HY4_IDX_RPB_F16"); return e ? std::atoi(e) : 1; }();
+    idx_scores_rows_rpb(q, w, pooled, meta, max_pool, rows, a, scores, stride, rpb, stream);
+}
+
+void idx_scores_rows_rpb(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
+                         float* scores, int stride, int rpb, void* stream) {
     if (a.heads == 16 && a.dim == 128) {
-        scores_mma_kernel<<<dim3((max_pool + 511) / 512, rows), 128, 0, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), meta, stride, scores);
+        if (rpb >= 8 && rows > 1) {
+            constexpr size_t smem = (size_t) 2 * 8 * 16 * kQLd * sizeof(__half);
+            static bool raised = false;
+            if (!raised) {
+                cudaFuncSetAttribute(scores_mma_rows_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+                raised = true;
+            }
+            scores_mma_rows_kernel<8><<<dim3((max_pool + 511) / 512, (rows + 7) / 8), 128, smem, (cudaStream_t) stream>>>(
+                q, w, reinterpret_cast<const __half*>(pooled), meta, rows, stride, scores);
+        } else if (rpb >= 4 && rows > 1) {
+            constexpr size_t smem = (size_t) 2 * 4 * 16 * kQLd * sizeof(__half);
+            scores_mma_rows_kernel<4><<<dim3((max_pool + 511) / 512, (rows + 3) / 4), 128, smem, (cudaStream_t) stream>>>(
+                q, w, reinterpret_cast<const __half*>(pooled), meta, rows, stride, scores);
+        } else {
+            scores_mma_kernel<<<dim3((max_pool + 511) / 512, rows), 128, 0, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), meta, stride, scores);
+        }
         if (!stream) cudaStreamSynchronize(nullptr);
         return;
     }

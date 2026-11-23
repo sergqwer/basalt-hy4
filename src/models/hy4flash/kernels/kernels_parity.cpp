@@ -667,6 +667,30 @@ void test_indexer() {
             }
         report("idx_scores_rows (tensor cores)", g3, r3, 1e-5);
     }
+    {   // rows a block (8, 4) against one row a block: 13 rows of their own queries and pool counts, bit for bit
+        const int rows = 13;
+        std::vector<float> qn = randn((size_t) rows * a.heads * D, 0.3f), wn = randn((size_t) rows * a.heads, 0.05f);
+        std::vector<int32_t> mn;
+        for (int r = 0; r < rows; ++r) {
+            const int n = r == 0 ? NP : r == 5 ? 1 : std::max(1, NP - 37 * r * r);
+            mn.insert(mn.end(), {n, n * a.pool, 1});
+        }
+        float *dqn = dev(qn), *dwn = dev(wn);
+        int32_t* dmn = dev(mn);
+        std::vector<float> ref;
+        bool ok = true;
+        for (int rpb : {1, 8, 4}) {
+            std::vector<float> fill((size_t) rows * NP, -7.f);
+            float* dsn = dev(fill);
+            idx_scores_rows_rpb(dqn, dwn, dpool, dmn, NP, rows, a, dsn, NP, rpb, nullptr);
+            std::vector<float> s = host(dsn, fill.size());
+            if (rpb == 1) ref = s;
+            else ok = ok && std::memcmp(s.data(), ref.data(), s.size() * sizeof(float)) == 0;
+            cudaFree(dsn);
+        }
+        std::printf("%-30s %s\n", "idx_scores_rows rpb 8/4 vs 1", ok ? "identical" : "FAIL");
+        failures += !ok;
+    }
     for (int ties = 0; ties < 2; ++ties) {
         std::vector<float> s2 = sc;
         if (ties)   // many equal scores around the cut
@@ -717,6 +741,15 @@ void bench_indexer_batch() {
     cudaEventCreate(&e2);
     idx_scores_rows(dq, dw, dk, dm, NP, rows, a, ds, NP, st);
     idx_select_rows(ds, NP, dm, rows, K, P, dc, cs, st);
+    for (int rpb : {1, 4}) {   // the one-row kernel and 4 rows a block, for the record
+        cudaEventRecord(e0, st);
+        for (int it = 0; it < 10; ++it) idx_scores_rows_rpb(dq, dw, dk, dm, NP, rows, a, ds, NP, rpb, st);
+        cudaEventRecord(e1, st);
+        cudaEventSynchronize(e1);
+        float mr = 0.f;
+        cudaEventElapsedTime(&mr, e0, e1);
+        std::printf("%-30s scores %.0f us at %d rows a block\n", "indexer batch microbench", mr * 100.f, rpb);
+    }
     cudaEventRecord(e0, st);
     for (int it = 0; it < 10; ++it) idx_scores_rows(dq, dw, dk, dm, NP, rows, a, ds, NP, st);
     cudaEventRecord(e1, st);

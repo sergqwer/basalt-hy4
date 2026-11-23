@@ -123,6 +123,9 @@ void idx_select(const float* scores, int n_pool, int k, int pool, int tail0, int
 /// go to scores[t * stride ..] (stride >= max_pool), its cells to cells[t * cells_stride ..]. A row with pools <= k is left alone.
 void idx_scores_rows(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
                      float* scores, int stride, void* stream);
+/// idx_scores_rows with `rpb` rows a block (8 or 4: each key read once for them; else one row a block): bit-identical scores.
+void idx_scores_rows_rpb(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
+                         float* scores, int stride, int rpb, void* stream);
 void idx_select_rows(const float* scores, int stride, const int32_t* meta, int rows, int k, int pool, int32_t* cells, int cells_stride, void* stream);
 
 /// y[t][r] = scale * w[r] . x[t] for r < rows over `cols` values, t < n_tok (w fp32 [rows][cols], cols % 4 == 0).
