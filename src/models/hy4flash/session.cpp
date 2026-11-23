@@ -3916,16 +3916,17 @@ private:
     // MoE; "rest" = wall - their sum). The events are read once at the chunk's end. Off by default; the output is unchanged.
     enum { kPtIndexer, kPtScore, kPtSelect, kPtAttSparse, kPtAttWin, kPtMoe, kPtDense, kPtAQkv, kPtAMeta, kPtAKb, kPtAPrep, kPtAVb, kPtAOut, kPtN };
     // DIAG HY4_ROUTE_COUNTS=FILE: at a prompt's end, its routing counts (int64, MoE layers x experts) are written to FILE.
-    // Re-seed (default; HY4_RESEED=0 turns it off): the take-back after a lending prompt refills the returned slots with that
-    // prompt's most routed experts per layer (descending count) instead of the experts the lends evicted. Placement only: the
-    // outputs do not change. Measured at 128K (agent text): routed experts 61.3 -> 56.4 ms a window, decode 37.2 -> 39.5 tok/s.
+    // HY4_RESEED=1 (opt-in): the take-back after a lending prompt refills the returned slots with that prompt's most routed
+    // experts per layer (descending count) instead of the experts the lends evicted. It moves experts between the card and
+    // the CPU, so tokens change at the tier-placement noise level; the combined test (2026-11-23, 128K) found no gain:
+    // VRAM share 59.8% -> 59.7%, verify 72.5 -> 73.3 ms a window.
     // DIAG HY4_ROUTE_TRACE=FILE: the decode routing, appended (the format of the tier simulator, hy4-data/e3/sim_hy4_tier.py).
     static std::FILE* route_trace() {
         static std::FILE* f = [] { const char* e = std::getenv("HY4_ROUTE_TRACE"); return e && *e ? std::fopen(e, "ab") : nullptr; }();
         return f;
     }
     static const char* route_count_file() { static const char* f = std::getenv("HY4_ROUTE_COUNTS"); return f; }
-    static bool reseed_on() { static const bool on = [] { const char* e = std::getenv("HY4_RESEED"); return !(e && *e == '0'); }(); return on; }
+    static bool reseed_on() { static const bool on = [] { const char* e = std::getenv("HY4_RESEED"); return e && *e == '1'; }(); return on; }
     static bool route_count_on() { return route_count_file() != nullptr || reseed_on(); }
     std::vector<int64_t> pcount_;
     void route_counts_end() {
