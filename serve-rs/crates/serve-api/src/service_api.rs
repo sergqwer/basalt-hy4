@@ -152,6 +152,9 @@ impl Service {
     pub fn status_view(&self) -> Map<String, Value> {
         map(self.status_view_v())
     }
+    pub fn stats(&self, n: usize, facts: &[Map<String, Value>]) -> Map<String, Value> {
+        map(self.stats_v(n, facts))
+    }
     pub fn slot_table(&self) -> (Vec<Value>, Vec<Value>) {
         let (a, b) = self.slot_table_v();
         (a.into_iter().map(Value::Object).collect(), b)

@@ -551,6 +551,17 @@ impl<'a> Ctx<'a> {
                     self.json(200, &v)?;
                 }
             }
+            "/v1/stats" => {
+                if self.authorized()? {
+                    let n = query_first(&self.req.path, "n")
+                        .and_then(|v| py_int(&v))
+                        .map(|v| v.clamp(0, serve_api::STATS_REQUESTS_MAX as i64) as usize)
+                        .unwrap_or(serve_api::STATS_REQUESTS_DEFAULT);
+                    let facts = self.conf().logs.facts();
+                    let s = router.shown().stats(n, &facts);
+                    self.json(200, &Value::Object(s))?;
+                }
+            }
             "/v1/status" => {
                 if self.authorized()? {
                     let mut m = router.shown().v1_status();
