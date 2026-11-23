@@ -28,7 +28,7 @@ void usage() {
                  "                       instead of the engine's own for the model\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
-                 "  --kv fp16|fp8        KV storage of the attention caches: fp16 (default) or fp8\n"
+                 "  --kv fp16|int8|fp8   KV storage of the attention caches: fp16 (default), int8 or fp8\n"
                  "                       (docs/models/hy4-flash.md)\n"
                  "  --serve              stay resident and take requests on stdin (the server's mode)\n"
                  "  --exp NAME=VALUE[,...]  diagnostics; concur9_logit_hash=1 prints a hash of each accepted row's\n"

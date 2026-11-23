@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <string>
@@ -33,7 +34,10 @@ public:
         return g;
     }
     bool available() const { return fd_ >= 0 && out_ != nullptr; }
-    int64_t first() const { return n_ctx_ / 2; }
+    int64_t first() const {   // DIAG BASALT_PPL_FIRST=N: the prompt is the first N + 1 tokens (a per-answer base), else n_ctx / 2
+        static const int64_t f = [] { const char* e = std::getenv("BASALT_PPL_FIRST"); return e ? std::atoll(e) : (int64_t) 0; }();
+        return f > 0 ? f : n_ctx_ / 2;
+    }
     int64_t end() const { return n_ctx_ - 1; }   // one past the last scored position
     int32_t token(int64_t pos) const { return tok_[(size_t) pos]; }
 
@@ -122,13 +126,43 @@ private:
         return true;
     }
 
+    static int seek(std::FILE* f, uint64_t off) {
+#ifdef _WIN32
+        return _fseeki64(f, (int64_t) off, SEEK_SET);
+#else
+        return fseeko(f, (off_t) off, SEEK_SET);
+#endif
+    }
     // the same arithmetic as llama-perplexity's KL-divergence pass
     bool row(int64_t pos, const std::vector<float>& lg) {
         const int64_t r = pos - first(), rows = n_ctx_ - 1 - first();
         const uint64_t off = 20 + (uint64_t) n_chunk_ * n_ctx_ * 4 +
                              ((uint64_t) chunk_ * rows + (uint64_t) r) * (uint64_t) row_u16_ * 2;
         base_.resize((size_t) row_u16_);
-        if (!read_at(base_.data(), base_.size() * 2, off)) return false;
+        static const bool write_base = std::getenv("BASALT_PPL_WRITE_BASE") != nullptr;   // DIAG: this run's rows become the base
+        if (write_base) {   // llama-perplexity's row: scale, min over the log-probs above max - 16 ... , uint16 codes
+            int64_t tp = 0;
+            for (int64_t i = 1; i < n_vocab_; ++i)
+                if (lg[(size_t) i] > lg[(size_t) tp]) tp = i;
+            double sum = 0.0;
+            for (int64_t i = 0; i < n_vocab_; ++i) sum += std::exp(lg[(size_t) i] - lg[(size_t) tp]);
+            const float lse = lg[(size_t) tp] + (float) std::log(sum);
+            float mn = 0.f, mx = lg[(size_t) tp] - lse;
+            for (int64_t i = 0; i < n_vocab_; ++i) mn = std::min(mn, lg[(size_t) i] - lse);
+            mn = std::max(mn, mx - 16.f);
+            const float sc = (mx - mn) / 65535.f;
+            std::memcpy(base_.data(), &sc, 4);
+            std::memcpy(base_.data() + 2, &mn, 4);
+            for (int64_t i = 0; i < n_vocab_; ++i) {
+                const float v = std::max(lg[(size_t) i] - lse, mn);
+                base_[(size_t) i + 4] = (uint16_t) std::lround((v - mn) / sc);
+            }
+            static std::FILE* wf = basalt::platform::open_file_utf8(paths().first, "r+b");
+            if (!wf || seek(wf, off) != 0 || std::fwrite(base_.data(), 2, base_.size(), wf) != base_.size()) return false;
+            std::fflush(wf);
+        } else if (!read_at(base_.data(), base_.size() * 2, off)) {
+            return false;
+        }
         float scale, min_lp;
         std::memcpy(&scale, base_.data(), 4);
         std::memcpy(&min_lp, base_.data() + 2, 4);

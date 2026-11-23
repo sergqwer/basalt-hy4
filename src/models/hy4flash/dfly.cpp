@@ -355,7 +355,7 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     p.vout = p.dev(R * H * kDflyV, ok); p.gate = p.dev(R * H * kDflyV, ok);
     p.g = p.dev(R * d.ffn, ok); p.u = p.dev(R * d.ffn, ok); p.h = p.dev(R * d.ffn, ok);
     p.ctx = (uint16_t*) p.dev((size_t) (env.sel_cap + kDflyBlock) * kDflyRowWidth / 2 + 1, ok);
-    if (env.fp8) p.blk8 = (uint8_t*) p.dev((size_t) kDflyBlock * kFp8RowBytes / 4, ok);
+    if (env.fp8 || env.i8) p.blk8 = (uint8_t*) p.dev((size_t) kDflyBlock * (env.i8 ? kI8RowBytes : kFp8RowBytes) / 4, ok);
     p.meta_d = (int32_t*) p.dev(kDflyMaxLayers * 16, ok);
     const size_t attw = mla_attend_work_bytes((int) H, env.sel_cap + kDflyBlock, kDflyBlock);
     p.attw = p.dev((attw + 3) / 4, ok);
@@ -477,7 +477,8 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             const int32_t* cells = cnt < 0 ? nullptr : tap.cells(i, row);
             if (cells && p.bk_d)   // HY4_BOUNDS_CHECK: the selected cells in [0, backed)
                 core::bounds::check_list(const_cast<int32_t*>(cells), nctx, p.bk_d, core::bounds::kDraftCells, i, st);
-            if (p.env.fp8) dfly_gather_rows_fp8((const uint8_t*) cache[i], cells, nctx, p.ctx, st);
+            if (p.env.i8) dfly_gather_rows_i8((const uint8_t*) cache[i], cells, nctx, p.ctx, st);
+            else if (p.env.fp8) dfly_gather_rows_fp8((const uint8_t*) cache[i], cells, nctx, p.ctx, st);
             else dfly_gather_rows((const uint16_t*) cache[i], cells, nctx, kDflyRowWidth, p.ctx, st);
 
             bk::rms_norm_rows(p.X, L.in_ln, p.xn, R, E, d.rms_eps, st);
@@ -490,7 +491,10 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             // the block's rows land after the selected ones, turned by their rotary positions: position rp + r of this base is
             // row nctx + r of ctx
             const int64_t rp = rope_pos < 0 ? pos : rope_pos;
-            if (p.env.fp8) {   // the block's rows as the target stores them: FP8 rows at rp + r of blk8's base, decoded after the selected ones
+            if (p.env.i8) {   // the block's rows as int8 rows, as the target would store them, decoded after the selected ones
+                mla_prepare(p.q, p.qabs, p.kvraw, L.kv_a_ln, a, (int) rp, R, 0, p.qcur, (int8_t*) (p.blk8 - rp * kI8RowBytes), st);
+                dfly_gather_rows_i8(p.blk8, nullptr, R, p.ctx + (int64_t) nctx * kDflyRowWidth, st);
+            } else if (p.env.fp8) {   // the block's rows as the target stores them: FP8 rows at rp + r of blk8's base, decoded after the selected ones
                 mla_prepare(p.q, p.qabs, p.kvraw, L.kv_a_ln, a, (int) rp, R, 0, p.qcur, p.blk8 - rp * kFp8RowBytes, st);
                 dfly_gather_rows_fp8(p.blk8, nullptr, R, p.ctx + (int64_t) nctx * kDflyRowWidth, st);
             } else {
@@ -631,9 +635,10 @@ bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std:
 DflyHook::~DflyHook() = default;
 
 bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, std::function<bool(int32_t, float*)> embed,
-                    const std::string& dump, bool fp8, std::string& err) {
+                    const std::string& dump, bool fp8, std::string& err, bool i8) {
     if (!w) return true;
     fp8_ = fp8;
+    i8_ = i8;
     dump_ = dump;
     embed_ = embed;
     w_ = w;
@@ -645,6 +650,7 @@ bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, std::functio
     env.embed = std::move(embed);
     env.sel_cap = sel_cap;
     env.fp8 = fp8;
+    env.i8 = i8;
     runner_ = DflyRunner::create(env, err);
     return runner_ != nullptr;
 }
@@ -678,7 +684,7 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
         dump_n_ = n;
         put("hid.f32", tap_->hidden_row(row), (size_t) w_->dims.E * 4);
         for (int i = 0; i < w_->dims.layers; ++i)
-            if (tap_->count(i, row) < 0 && !fp8_) put("kv" + std::to_string(i) + ".f16", caches[i], (size_t) pos * kDflyRowWidth * 2);
+            if (tap_->count(i, row) < 0 && !fp8_ && !i8_) put("kv" + std::to_string(i) + ".f16", caches[i], (size_t) pos * kDflyRowWidth * 2);
     }
     return {};
 }

@@ -1259,6 +1259,209 @@ void test_fp8_chunk() {
     cudaFree(dq); cudaFree(dqa); cudaFree(dkv); cudaFree(dn); cudaFree(ds); cudaFree(dqcur); cudaFree(dlat); cudaFree(d1); cudaFree(dc); cudaFree(work);
 }
 
+// --kv int8: the rows mla_prepare writes against a host rounding of the fp32 rows; a chunk of rows (int8 tensor cores) against
+// the reference over the decoded rows and against the window kernel row by row; a row alone among 9; a ring's spans.
+void test_i8_chunk() {
+    MlaArgs a;
+    a.heads = 32;
+    const int W = a.rank + a.rope, Q = a.nope + a.rope, N = 1200, T = 12, stride = 1300;
+    std::vector<float> q = randn((size_t) N * a.heads * Q), qabs = randn((size_t) N * a.heads * a.rank, 0.3f), kvraw = randn((size_t) N * W, 2.f),
+                       norm = randn(a.rank, 0.5f), sinks = randn(a.heads);
+    for (auto& v : norm) v += 1.f;
+    float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *ds = dev(sinks);
+    float *dqcur = devf((size_t) N * a.heads * W), *dlat = devf((size_t) T * a.heads * a.rank), *d1 = devf((size_t) 9 * a.heads * a.rank);
+    float* d32 = devf((size_t) N * W);
+    void* work = nullptr;
+    cudaMalloc(&work, mla_attend_work_bytes(a.heads, N, T));
+    cudaMemset(work, 0, mla_attend_work_bytes(a.heads, N, T));
+    int8_t* dc = nullptr;
+    cudaMalloc(&dc, (size_t) N * kI8RowBytes);
+    mla_prepare(dq, dqa, dkv, dn, a, 0, N, 0, dqcur, d32, nullptr);   // the fp32 rows, for the rounding check
+    const std::vector<float> rows32 = host(d32, (size_t) N * W);
+    mla_prepare(dq, dqa, dkv, dn, a, 0, N, 0, dqcur, dc, nullptr);
+    std::vector<uint8_t> rows = host((uint8_t*) dc, (size_t) N * kI8RowBytes);
+    std::vector<float> dec((size_t) N * W), qcur = host(dqcur, (size_t) T * a.heads * W);
+    int bad = 0;
+    double err2 = 0, ref2 = 0;
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* row = &rows[(size_t) n * kI8RowBytes];
+        float sc[4];
+        std::memcpy(sc, row + kI8ScaleOff, sizeof sc);
+        for (int c = 0; c < a.rope; ++c) {   // the rope part: fp16 as stored
+            uint16_t hb;
+            std::memcpy(&hb, row + kI8Latent + 2 * c, 2);
+            if (hb != to_f16(rows32[(size_t) n * W + a.rank + c])) ++bad;
+            dec[(size_t) n * W + a.rank + c] = from_f16(hb);
+        }
+        for (int b = 0; b < 4; ++b) {
+            const int c0 = b * 128, len = 128;
+            float amax = 0.f;
+            for (int c = c0; c < c0 + len; ++c) amax = std::max(amax, std::fabs(rows32[(size_t) n * W + c]));
+            if (sc[b] != amax / 127.f) ++bad;
+            for (int c = c0; c < c0 + len; ++c) {
+                const float x = rows32[(size_t) n * W + c];
+                const int want = sc[b] > 0.f ? (int) std::nearbyint(x / sc[b]) : 0;
+                if ((int) (int8_t) row[c] != want) ++bad;
+                dec[(size_t) n * W + c] = (float) (int8_t) row[c] * sc[b];
+                err2 += (dec[(size_t) n * W + c] - x) * (dec[(size_t) n * W + c] - x);
+                ref2 += (double) x * x;
+            }
+        }
+    }
+    std::printf("%-30s %d mismatches, row error %.3f%%  %s\n", "int8 rows", bad, 100.0 * std::sqrt(err2 / ref2), bad ? "FAIL" : "ok");
+    failures += bad != 0;
+    for (int use_cells = 0; use_cells < 2; ++use_cells) {
+        std::vector<int32_t> firsts(T), counts(T), cl((size_t) T * stride, 0);
+        std::vector<std::vector<int>> lists(T);
+        for (int t = 0; t < T; ++t) {
+            firsts[t] = 0;
+            if (use_cells)
+                for (int c = t % 2; c < N && (int) lists[t].size() < 600 + 37 * t; c += 2) lists[t].push_back(c);
+            else
+                for (int c = 0; c < 1000 + 13 * t; ++c) lists[t].push_back(c);
+            counts[t] = (int) lists[t].size();
+            for (int j = 0; j < counts[t]; ++j) cl[(size_t) t * stride + j] = lists[t][j];
+        }
+        int32_t *df = dev(firsts), *dcnt = dev(counts), *dcl = dev(cl);
+        RowSpans rs;
+        rs.firsts = df;
+        rs.counts = dcnt;
+        rs.cells = use_cells ? dcl : nullptr;
+        rs.cells_stride = stride;
+        mla_attend(dqcur, dc, rs, T, ds, a, 0, N, work, dlat, nullptr);
+        const std::vector<float> got = host(dlat, (size_t) T * a.heads * a.rank);
+        std::vector<double> ref, win;
+        for (int t = 0; t < T; ++t) {
+            for (int h = 0; h < a.heads; ++h) {
+                std::vector<float> qrow(qcur.begin() + (size_t) t * a.heads * W, qcur.begin() + (size_t) (t + 1) * a.heads * W);
+                std::vector<double> o = ref_attend(qrow, dec, lists[t], h, a, sinks[h]);
+                ref.insert(ref.end(), o.begin(), o.end());
+            }
+            RowSpans r1;
+            r1.firsts = df + t;
+            r1.counts = dcnt + t;
+            r1.cells = use_cells ? dcl + (size_t) t * stride : nullptr;
+            r1.cells_stride = stride;
+            mla_attend(dqcur + (size_t) t * a.heads * W, dc, r1, 1, ds, a, 0, N, work, d1, nullptr);
+            const std::vector<float> w1 = host(d1, (size_t) a.heads * a.rank);
+            win.insert(win.end(), w1.begin(), w1.end());
+        }
+        report(use_cells ? "mla_attend int8 chunk, cells" : "mla_attend int8 chunk, spans", got, ref, 1e-3);
+        {   // the pre-rounded query (mla_prepare_i8q / mla_attend_i8q): the same bits, and the same cache rows
+            void* qp = nullptr;
+            int8_t* dc2 = nullptr;
+            cudaMalloc(&qp, (size_t) N * a.heads * kI8QRowBytes);
+            cudaMalloc(&dc2, (size_t) N * kI8RowBytes);
+            mla_prepare_i8q(dq, dqa, dkv, dn, a, 0, N, 0, qp, dc2, nullptr);
+            const bool rows_same = host((uint8_t*) dc2, (size_t) N * kI8RowBytes) == rows;
+            mla_attend_i8q(qp, dc, rs, T, ds, a, 0, dlat, nullptr);
+            const bool same = std::memcmp(host(dlat, got.size()).data(), got.data(), got.size() * 4) == 0;
+            std::printf("%-30s %s, rows %s\n", "  packed query", same ? "bitwise" : "FAIL", rows_same ? "bitwise" : "FAIL");
+            failures += !same || !rows_same;
+            cudaFree(qp);
+            cudaFree(dc2);
+        }
+        std::vector<float> wf(win.begin(), win.end());
+        report("  window kernel vs reference", wf, ref, 1e-4);
+        if (!use_cells) {
+            RowSpans r9;
+            r9.firsts = df + 1;
+            r9.counts = dcnt + 1;
+            mla_attend(dqcur + (size_t) a.heads * W, dc, r9, 9, ds, a, 0, N, work, d1, nullptr);
+            const bool same = std::memcmp(host(d1, (size_t) a.heads * a.rank).data(), got.data() + (size_t) a.heads * a.rank, (size_t) a.heads * a.rank * 4) == 0;
+            std::printf("%-30s %s\n", "  row independence", same ? "bitwise" : "FAIL");
+            failures += !same;
+        }
+        cudaFree(df); cudaFree(dcnt); cudaFree(dcl);
+    }
+    {   // a ring of 600 cells: row t attends the 500 positions before 700 + t, at cell pos % 600
+        const int ring = 600, wnd = 500;
+        std::vector<int32_t> firsts(T), counts(T);
+        std::vector<std::vector<int>> lists(T);
+        for (int t = 0; t < T; ++t) {
+            const int pos = 700 + 37 * t, f = pos + 1 - wnd;
+            firsts[t] = f;
+            counts[t] = wnd;
+            for (int j = 0; j < wnd; ++j) lists[t].push_back((f + j) % ring);
+        }
+        int32_t *df = dev(firsts), *dcnt = dev(counts);
+        RowSpans rs;
+        rs.firsts = df;
+        rs.counts = dcnt;
+        mla_attend(dqcur, dc, rs, T, ds, a, ring, wnd, work, dlat, nullptr);
+        const std::vector<float> got = host(dlat, (size_t) T * a.heads * a.rank);
+        std::vector<double> ref;
+        for (int t = 0; t < T; ++t)
+            for (int h = 0; h < a.heads; ++h) {
+                std::vector<float> qrow(qcur.begin() + (size_t) t * a.heads * W, qcur.begin() + (size_t) (t + 1) * a.heads * W);
+                std::vector<double> o = ref_attend(qrow, dec, lists[t], h, a, sinks[h]);
+                ref.insert(ref.end(), o.begin(), o.end());
+            }
+        report("mla_attend int8 chunk, ring", got, ref, 1e-3);
+        cudaFree(df); cudaFree(dcnt);
+    }
+    cudaFree(dq); cudaFree(dqa); cudaFree(dkv); cudaFree(dn); cudaFree(ds); cudaFree(dqcur); cudaFree(dlat); cudaFree(d1); cudaFree(dc);
+    cudaFree(d32); cudaFree(work);
+}
+
+// --kv int8 pooled keys: idx_pool_i8 against idx_pool's fp16 keys (the rounding), and the int8 tensor-core scores of 3 rows
+// against a double reference over the decoded keys and the f32 query.
+void test_indexer_i8() {
+    IndexerArgs a;
+    const int D = a.dim, P = a.pool, RING = 2064, NP = 3000, ROWS = 3;
+    std::vector<float> vals = randn((size_t) RING * D), gates = randn((size_t) RING * D), ape = randn((size_t) P * D, 0.3f), nw = randn(D, 0.2f);
+    for (auto& v : nw) v += 1.f;
+    float *dv = dev(vals), *dg = dev(gates), *da = dev(ape), *dn = dev(nw);
+    uint16_t* d16 = nullptr;
+    uint8_t* d8 = nullptr;
+    cudaMalloc(&d16, (size_t) NP * D * 2);
+    cudaMalloc(&d8, (size_t) NP * kIdxI8RowBytes);
+    idx_pool(dv, dg, da, dn, a, RING, 0, NP, d16, nullptr);
+    idx_pool_i8(dv, dg, da, dn, a, RING, 0, NP, d8, nullptr);
+    const std::vector<uint16_t> k16 = host(d16, (size_t) NP * D);
+    const std::vector<uint8_t> k8 = host(d8, (size_t) NP * kIdxI8RowBytes);
+    std::vector<float> dec((size_t) NP * D);
+    double e2 = 0, r2 = 0;
+    int bad = 0;
+    for (int p = 0; p < NP; ++p) {
+        float s;
+        std::memcpy(&s, &k8[(size_t) p * kIdxI8RowBytes + 128], 4);
+        float amax = 0;
+        for (int d = 0; d < D; ++d) amax = std::max(amax, std::fabs(h2f(k16[(size_t) p * D + d])));
+        if (std::fabs(s * 127.f - amax) > 2e-3f * amax) ++bad;
+        for (int d = 0; d < D; ++d) {
+            dec[(size_t) p * D + d] = (float) (int8_t) k8[(size_t) p * kIdxI8RowBytes + d] * s;
+            const double x = h2f(k16[(size_t) p * D + d]);
+            e2 += (dec[(size_t) p * D + d] - x) * (dec[(size_t) p * D + d] - x);
+            r2 += x * x;
+        }
+    }
+    std::printf("%-30s key error vs fp16 %.3f%%  %s\n", "idx_pool_i8", 100.0 * std::sqrt(e2 / r2), bad == 0 && e2 / r2 < 1e-4 ? "ok" : "FAIL");
+    failures += !(bad == 0 && e2 / r2 < 1e-4);
+    std::vector<float> q = randn((size_t) ROWS * a.heads * D), w = randn((size_t) ROWS * a.heads, 0.05f);
+    std::vector<int32_t> meta = {NP, 0, 1, NP - 7, 0, 1, 700, 0, 1};
+    const int stride = NP + 16;
+    float *dq = dev(q), *dw = dev(w), *dsc = devf((size_t) ROWS * stride);
+    int32_t* dm = dev(meta);
+    idx_scores_rows_i8(dq, dw, d8, dm, NP, ROWS, a, dsc, stride, nullptr);
+    const std::vector<float> sc = host(dsc, (size_t) ROWS * stride);
+    std::vector<float> got;
+    std::vector<double> ref;
+    for (int r = 0; r < ROWS; ++r)
+        for (int p = 0; p < meta[(size_t) r * 3]; ++p) {
+            double t = 0;
+            for (int h = 0; h < a.heads; ++h) {
+                double dot = 0;
+                for (int d = 0; d < D; ++d) dot += (double) q[((size_t) r * a.heads + h) * D + d] * dec[(size_t) p * D + d];
+                t += w[(size_t) r * a.heads + h] * std::max(dot, 0.0);
+            }
+            ref.push_back(t);
+            got.push_back(sc[(size_t) r * stride + p]);
+        }
+    report("idx_scores_rows_i8 (3 rows)", got, ref, 1e-4);
+    cudaFree(dv); cudaFree(dg); cudaFree(da); cudaFree(dn); cudaFree(d16); cudaFree(d8); cudaFree(dq); cudaFree(dw); cudaFree(dsc); cudaFree(dm);
+}
+
 void test_mmq_dense() {
     namespace mmq = basalt::prefill::mmq;
     const int R = 64, rows = 1536, K = 3072;
@@ -1484,6 +1687,8 @@ int main() {
     test_query();
     test_mla_long();
     test_fp8_chunk();
+    test_i8_chunk();
+    test_indexer_i8();
     test_mmq_dense();
     test_mmq_expert(12, "mmq experts Q4_K");
     test_mmq_expert(14, "mmq experts Q6_K");
