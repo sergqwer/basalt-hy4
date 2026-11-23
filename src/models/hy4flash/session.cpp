@@ -172,6 +172,10 @@ public:
         platform::free_aligned(cpu_act_);
         std::string e;
         join_moe(e);
+        if (route_h_) {
+            cudaStreamSynchronize(stream_);
+            cudaFreeHost(route_h_);
+        }
         for (cudaGraphExec_t g : gx_)
             if (g) cudaGraphExecDestroy(g);
         for (cudaGraphExec_t g : gxr_)
@@ -2486,10 +2490,15 @@ private:
         const bool two = fp4 && fp4_two() > 0, two_d = fp4 && fp4_two() > 1;
         if (fp4) f4::quantize_tokens(xlat_, R, L, L, xq1_, fp4_gs_, st, two);
         std::vector<int32_t> hid((size_t) R * K);
+        // the routing to the host: a kernel writes it into mapped pinned memory, read after the sync (no copy engine, no pageable
+        // staging behind the ring's copies); HY4_ROUTE_COPY=1 keeps the old cudaMemcpy
+        const bool mapped = !route_copy() && route_map((size_t) R * K);
+        if (mapped) put_i32_mapped(route_dev_, ids_, (int64_t) R * K, st);
         const double t0 = now_ms();
         cudaStreamSynchronize(st);
         stage_at_ = 0;   // the stream has drained: what was staged is read
-        cudaMemcpy(hid.data(), ids_, hid.size() * 4, cudaMemcpyDeviceToHost);
+        if (mapped) std::memcpy(hid.data(), route_h_, hid.size() * 4);
+        else cudaMemcpy(hid.data(), ids_, hid.size() * 4, cudaMemcpyDeviceToHost);
         const double t1 = now_ms();
         t_pre_ms_ += t1 - t0;
         std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot
@@ -3422,6 +3431,24 @@ private:
     double t_pre_ms_ = 0, t_moe_ms_ = 0, t_eng_ms_ = 0, t_build_ms_ = 0, t_issue_ms_ = 0, t_att_ms_ = 0, t_ffn_ms_ = 0;
     double t_eng_read_ms_ = 0, t_eng_norm_ms_ = 0;
     std::atomic<double> t_ring_ms_{0};
+    static bool route_copy() { static const bool on = std::getenv("HY4_ROUTE_COPY") != nullptr; return on; }
+    int32_t *route_h_ = nullptr, *route_dev_ = nullptr;
+    size_t route_n_ = 0;
+    bool route_map(size_t n) {   // the mapped buffer for n ids, grown as needed (false: the plain copy)
+        if (n <= route_n_) return true;
+        if (route_h_) cudaFreeHost(route_h_);
+        route_h_ = route_dev_ = nullptr;
+        route_n_ = 0;
+        if (cudaHostAlloc((void**) &route_h_, n * 4, cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &route_dev_, route_h_, 0) != cudaSuccess) {
+            cudaGetLastError();
+            if (route_h_) cudaFreeHost(route_h_);
+            route_h_ = route_dev_ = nullptr;
+            return false;
+        }
+        route_n_ = n;
+        return true;
+    }
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
 
