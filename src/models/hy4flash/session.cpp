@@ -28,6 +28,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/prefill/cpu_split.hpp"
 #include "basalt/program/expert_spill.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/batch_driver.hpp"
@@ -131,6 +132,8 @@ struct Scratch {
     int32_t *iidx_meta = nullptr, *pos_d = nullptr, *pos_h = nullptr, *heads_ids = nullptr, *heads_bounds = nullptr, *bounds_tab = nullptr;
     void *attw = nullptr, *q8 = nullptr, *xq_n = nullptr, *ex_xq = nullptr, *ex_scr = nullptr, *ex_plan = nullptr, *ex_plan2 = nullptr;
     void *xq1 = nullptr, *xq2 = nullptr;
+    float* fp4_gs = nullptr;        // the FP4 prompt experts: token scales [kMaxChunk], then H's [scale_count]
+    int32_t* fp4_plan = nullptr;    // their tile and block tables (2 x (kStageExperts + 1))
     struct Staged {
         uint8_t* blobs = nullptr;
         int32_t *tok = nullptr, *bounds = nullptr;
@@ -315,8 +318,15 @@ public:
             b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
             b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
         }
-        sc.xq1 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
-        sc.xq2 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
+        // the FP4 path (fp4_experts()) puts the token planes in xq1 and H's tiles in xq2, the two-term rows included
+        namespace f4 = basalt::prefill::fp4;
+        const bool fp4 = fp4_experts();
+        sc.xq1 = alloc(std::max(mmq::q8_bytes(kLaunchRows, g_.n_latent), fp4 ? f4::token_bytes(kMaxChunk, 2 * (int64_t) g_.n_latent) : 0), ok);
+        sc.xq2 = alloc(std::max(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), fp4 ? f4::a4_bytes(kLaunchRows, 2 * (int64_t) g_.n_ff_exp, kStageExperts) : 0), ok);
+        if (fp4) {
+            sc.fp4_gs = f((int64_t) kMaxChunk + (int64_t) f4::scale_count(kLaunchRows, kStageExperts));
+            sc.fp4_plan = (int32_t*) alloc((size_t) 2 * (kStageExperts + 1) * 4, ok);
+        }
         sc.heads_ids = (int32_t*) alloc(((size_t) max_heads_ * kAttRows + mmq::kIdsTail) * 4, ok);   // MMQ reads a tile past the last row
         sc.heads_bounds = (int32_t*) alloc((size_t) (max_heads_ + 1) * 4, ok);
         sc.rowptr_d = (const float**) alloc(kLookupK * sizeof(void*), ok);
@@ -352,7 +362,7 @@ public:
             stage_[i].tok = sc.stage[i].tok;
             stage_[i].bounds = sc.stage[i].bounds;
         }
-        xq1_ = sc.xq1; xq2_ = sc.xq2; heads_ids_ = sc.heads_ids; heads_bounds_ = sc.heads_bounds; rowptr_d_ = sc.rowptr_d;
+        xq1_ = sc.xq1; xq2_ = sc.xq2; fp4_gs_ = sc.fp4_gs; fp4_plan_ = sc.fp4_plan; heads_ids_ = sc.heads_ids; heads_bounds_ = sc.heads_bounds; rowptr_d_ = sc.rowptr_d;
         h_rowptr_ = sc.h_rowptr; bounds_tab_ = sc.bounds_tab; h_plan_ = (WindowPlan*) sc.h_plan;
     }
 
@@ -2252,6 +2262,23 @@ private:
     // The routed experts of a prompt chunk, by expert: each used expert's blob is staged on the card (a copy from its slot, its
     // pinned RAM or the second card), its rows (the pairs routed to it, with their activations quantised for MMQ) go through the
     // gate/up product, the clamped SwiGLU and the down product, and a pair's output row is kept for the weighted sum.
+    // The prompt's NVFP4 experts run on the FP4 block-scaled tensor cores (moe_fp4, W4A4) unless BASALT_HY4_PROMPT_MMQ=1 keeps
+    // the int8 MMQ products. The gate/up input is rounded as two FP4 terms (about 8 bits; one term cost KLD +0.022 against
+    // MMQ, two +0.004): BASALT_HY4_FP4_TWO=0 one term, =all H too.
+    bool fp4_experts() const {
+        static const bool off = [] { const char* v = std::getenv("BASALT_HY4_PROMPT_MMQ"); return v && *v && *v != '0'; }();
+        if (off) return false;
+        for (const ExpertLayer& el : m_.pack().experts)
+            if (el.gu_type == kTypeNvfp4 && el.d_type == kTypeNvfp4) return true;
+        return false;
+    }
+    static int fp4_two() {   // 0 none, 1 gate/up, 2 gate/up and down
+        static const int on = [] {
+            const char* v = std::getenv("BASALT_HY4_FP4_TWO");
+            return !v || !*v || std::string(v) == "gu" ? 1 : *v == '0' ? 0 : 2;
+        }();
+        return on;
+    }
     bool moe_prompt(int l, int tl, int R, const kernels::NativeExpertLayout& lay, std::string& err) {
         namespace mmq = basalt::prefill::mmq;
         const int K = g_.n_used, L = g_.n_latent, F = g_.n_ff_exp;
@@ -2263,6 +2290,11 @@ private:
         if (loaded_.insert({el.gu_type, 2 * F}).second) mmq::load(el.gu_type, 2 * F);
         if (loaded_.insert({el.d_type, L}).second) mmq::load(el.d_type, L);
         cudaStream_t st = stream_;
+        // NVFP4 experts on the FP4 tensor cores (W4A4): the layer's rows rounded to FP4 once, as token planes every launch reads
+        namespace f4 = basalt::prefill::fp4;
+        const bool fp4 = fp4_gs_ && el.gu_type == kTypeNvfp4 && el.d_type == kTypeNvfp4;
+        const bool two = fp4 && fp4_two() > 0, two_d = fp4 && fp4_two() > 1;
+        if (fp4) f4::quantize_tokens(xlat_, R, L, L, xq1_, fp4_gs_, st, two);
         std::vector<int32_t> hid((size_t) R * K);
         const double t0 = now_ms();
         cudaStreamSynchronize(st);
@@ -2336,6 +2368,50 @@ private:
                           const std::vector<int32_t>& bounds) {
             put_i32(B.tok, tok.data(), tok.size());
             put_i32(B.bounds, bounds.data(), bounds.size());
+            if (fp4) {   // gate/up with the clamped SwiGLU in its epilogue, H rounded to FP4 per expert tile, then down
+                int32_t *toh = fp4_plan_, *blk = fp4_plan_ + kStageExperts + 1;
+                float* gsh = fp4_gs_ + kMaxChunk;
+                f4::plan_blocks(B.bounds, nb, toh, blk, st);
+                f4::Product p;
+                p.base = blobs;
+                p.stride = stride_;
+                p.n = nb;
+                p.blk_off = blk;
+                p.blocks = f4::max_blocks(rows, nb);
+                p.bounds = B.bounds;
+                p.tile_off = toh;
+                p.w_rows = 2 * (int64_t) F;
+                p.w_cols = L;
+                p.a4 = xq1_;
+                p.gs = fp4_gs_;
+                p.ids = B.tok;
+                p.tokens = R;
+                p.swiglu = true;
+                p.swiglu_limit = g_.clamp_exp[(size_t) l];
+                p.tail_off = (size_t) el.blob_bytes - 16;
+                p.dst = h_;
+                p.ld_dst = F;
+                p.two = two;
+                f4::run(p, st);
+                f4::quantize(h_, nullptr, B.bounds, toh, nb, xq2_, gsh, F, F, rows, st, two_d);
+                f4::Product d = p;
+                d.w_off = lay.down_off;
+                d.w_rows = L;
+                d.w_cols = F;
+                d.a4 = xq2_;
+                d.gs = gsh;
+                d.ids = nullptr;
+                d.tokens = 0;
+                d.swiglu = false;
+                d.swiglu_limit = 0.0f;
+                d.dst = pair_rows_ + (size_t) pos * L;
+                d.ld_dst = L;
+                d.two = two_d;
+                f4::run(d, st);
+                cudaEventRecord(B.done, st);
+                pos += rows;
+                return;
+            }
             mmq::quantize(xlat_, B.tok, xq1_, el.gu_type, L, L, rows, st);
             mmq::Product p;
             p.w = blobs;
@@ -3020,6 +3096,8 @@ private:
     float* pair_rows_ = nullptr;
     int32_t *pair_map_ = nullptr, *pair_ident_ = nullptr;
     void *xq1_ = nullptr, *xq2_ = nullptr;
+    float* fp4_gs_ = nullptr;
+    int32_t* fp4_plan_ = nullptr;
     basalt::prefill::mmq::Context mmq_;
     std::set<std::pair<int, int>> loaded_;   // (type, rows) the MMQ tiles are loaded for
     void *mmq_xq_ = nullptr;
