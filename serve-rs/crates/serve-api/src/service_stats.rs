@@ -593,16 +593,10 @@ impl Service {
         let ctx = self.engine.max_context();
         let max_ctx = if ctx != 0 { ctx } else { self.engine.known_ctx() };
         let used: Vec<i64> = rows.iter().map(|r| ival(r.get("ctx_used"))).collect();
-        let slots: Vec<Value> = rows
-            .iter()
-            .map(|r| {
-                let g = |k: &str| r.get(k).cloned().unwrap_or(Value::Null);
-                json!({"id": g("id"), "state": g("state"), "ctx_used": g("ctx_used"), "n_ctx": g("n_ctx"),
-                       "tok_s": g("tok_s"), "generated": g("generated"), "prompt_tokens": g("prompt_tokens"),
-                       "prefill_done": g("prefill_done"), "reused": g("reused"),
-                       "drafts_offered": g("drafts_offered"), "drafts_accepted": g("drafts_accepted")})
-            })
-            .collect();
+        // the read's chunk clock is the engine's one prompt read: shown on the reading slot when exactly one reads
+        let reading = rows.iter().filter(|r| r.get("state").and_then(|v| v.as_str()) == Some("prefill")).count();
+        let read = if reading == 1 { self.engine.read_progress() } else { None };
+        let slots: Vec<Value> = rows.iter().map(|r| stats_slot(r, read.as_ref())).collect();
         let memory: Vec<Value> =
             facts.iter().map(|f| json!({"t": f.get("t").cloned(), "msg": f.get("msg").cloned()})).collect();
         let last_load = self.last_load.lock().unwrap().clone();
@@ -627,6 +621,17 @@ impl Service {
             "machine": v1.get("machine").cloned(),
             "requests": hist.iter().map(stats_request).collect::<Vec<_>>()})
     }
+}
+
+/// A `/v1/stats` slot row: the slot table's figures, and `prompt_progress` (read_clock.rs) while it reads a prompt.
+fn stats_slot(r: &Obj, read: Option<&serve_engine::read_clock::ReadProgress>) -> Value {
+    let g = |k: &str| r.get(k).cloned().unwrap_or(Value::Null);
+    let prefill = r.get("state").and_then(|v| v.as_str()) == Some("prefill");
+    json!({"id": g("id"), "state": g("state"), "ctx_used": g("ctx_used"), "n_ctx": g("n_ctx"),
+           "tok_s": g("tok_s"), "generated": g("generated"), "prompt_tokens": g("prompt_tokens"),
+           "prefill_done": g("prefill_done"), "reused": g("reused"),
+           "drafts_offered": g("drafts_offered"), "drafts_accepted": g("drafts_accepted"),
+           "prompt_progress": read.filter(|_| prefill).map(|p| p.json()).unwrap_or(Value::Null)})
 }
 
 #[cfg(test)]
@@ -667,5 +672,30 @@ mod stats_tests {
         assert_eq!(s["draft_acceptance"], Value::Null);
         assert_eq!(s["read_tokens"], 5);
         assert_eq!(s["ssd_share"], Value::Null);
+    }
+
+    #[test]
+    fn a_stats_slot_row_keeps_its_fields_and_adds_prompt_progress_while_reading() {
+        use serve_engine::read_clock::ReadClock;
+        let row = obj(json!({"id": 0, "state": "prefill", "ctx_used": 400000, "n_ctx": 524288, "tok_s": 0.0, "generated": 0,
+                             "prompt_tokens": 400000, "prefill_done": 32768, "reused": 0, "drafts_offered": null,
+                             "drafts_accepted": null, "api": "anthropic"}));
+        let mut c = ReadClock::start(0.0);
+        c.chunk(16384, 400000, Some(20000.0), 20.0);
+        c.chunk(32768, 400000, Some(44000.0), 44.0);
+        let p = c.snapshot(50.0).unwrap();
+        let v = stats_slot(&row, Some(&p));
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, vec!["id", "state", "ctx_used", "n_ctx", "tok_s", "generated", "prompt_tokens", "prefill_done",
+                              "reused", "drafts_offered", "drafts_accepted", "prompt_progress"]);
+        assert_eq!(v["prefill_done"], 32768);
+        assert_eq!(v["prompt_progress"], json!({"done": 32768, "total": 400000, "chunks": 2, "last_chunk_ms": 24000.0,
+                                                "in_chunk_s": 6.0, "eta_s": 537.9}));
+        // not reading (decoding, idle) or no clock: null, the other fields as they were
+        let mut dec = row.clone();
+        dec.insert("state".into(), json!("decoding"));
+        assert_eq!(stats_slot(&dec, Some(&p))["prompt_progress"], Value::Null);
+        assert_eq!(stats_slot(&row, None)["prompt_progress"], Value::Null);
+        assert_eq!(stats_slot(&row, None)["tok_s"], json!(0.0));
     }
 }

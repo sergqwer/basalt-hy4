@@ -155,6 +155,10 @@ pub trait Engine: Send + Sync {
     fn progress(&self) -> Option<(i64, i64)> {
         None
     }
+    /// the prompt read's chunk clock: done/total, chunks, the last chunk's ms, the time in the current one, an ETA
+    fn read_progress(&self) -> Option<crate::read_clock::ReadProgress> {
+        None
+    }
     /// `engine.prompt_progress()`; None when the engine has no such method
     fn prompt_progress(&self) -> Option<JsonMap> {
         None

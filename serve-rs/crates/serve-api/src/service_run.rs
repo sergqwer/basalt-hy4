@@ -1281,7 +1281,13 @@ impl Service {
                 self.slot_of_locked(&mut g, key)
             };
             let started = fval(s.get("started")).unwrap_or(t);
-            out(&format!("[server] {} read  pp={done}{speed} {}s", slot_tag(slot), py_fixed(t - started, 0)));
+            // the chunk clock (read_clock.rs): which chunk, the last one's time, this one's age, the ETA
+            let clock = if pr.map(|p| p.1 != 0).unwrap_or(false) {
+                self.engine.read_progress().map(|p| p.console()).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            out(&format!("[server] {} read  pp={done}{speed}{clock} {}s", slot_tag(slot), py_fixed(t - started, 0)));
         } else {
             let due = {
                 let mut la = self.live_at_lock();

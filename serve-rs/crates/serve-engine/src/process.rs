@@ -24,6 +24,7 @@ use crate::iface::{thread_ident, Engine, Flag, GenStream, JsonMap, Last, Prompt,
 use crate::logprobs::{self, LogProb, Tok};
 use crate::progress;
 use crate::py;
+use crate::read_clock::{wall, ReadClock, ReadProgress};
 use crate::slots::{AdmissionQueue, Ticket};
 use crate::suspend;
 use crate::util::console::tagged;
@@ -499,6 +500,8 @@ struct St {
     conversation: JsonMap,
     prefill_tok_s_mean: Option<f64>,
     progress: Option<(i64, i64)>,
+    /// the prompt read's chunk clock (read_clock.rs), from the PP/PL/RESUME lines
+    read_clock: Option<ReadClock>,
     silent_note: Option<String>,
     last_err: Option<String>,
     gen: u64,
@@ -590,6 +593,7 @@ impl ProcessEngine {
                 conversation: Map::new(),
                 prefill_tok_s_mean: None,
                 progress: None,
+                read_clock: None,
                 silent_note: None,
                 last_err: None,
                 gen: 0,
@@ -706,10 +710,17 @@ impl Inner {
             self.tl_with(owner, |t| t.read_ms = v);
         }
     }
-    fn note_read(&self, owner: u64, f: &[&str]) {
+    /// A `PP` (`chunk`: a prompt chunk ended) or `PL` line.
+    fn note_read(&self, owner: u64, f: &[&str], chunk: bool) {
         let (a, b) = (f[1].parse::<i64>().unwrap_or(0), f[2].parse::<i64>().unwrap_or(0));
-        self.st().progress = Some((a, b));
         let ms = f.get(3).and_then(|x| py::float_of(x));
+        {
+            let mut st = self.st();
+            st.progress = Some((a, b));
+            if let Some(c) = st.read_clock.as_mut() {
+                if chunk { c.chunk(a, b, ms, wall()) } else { c.live(a, b) }
+            }
+        }
         self.tl_with(owner, |t| {
             let mut state = t.ptl.clone().unwrap_or_default();
             state.insert("read".into(), json!(a));
@@ -722,6 +733,9 @@ impl Inner {
     }
     fn note_resume(&self, owner: u64, line: &str) {
         let Some(n) = py::split(line).get(1).and_then(|x| x.parse::<i64>().ok()) else { return };
+        if let Some(c) = self.st().read_clock.as_mut() {
+            c.resume(n);
+        }
         self.tl_with(owner, |t| {
             let mut state = t.ptl.clone().unwrap_or_default();
             state.insert("cache".into(), json!(n));
@@ -746,7 +760,7 @@ impl Inner {
     fn note_live(&self, owner: u64, line: &str) {
         let f = py::split(line);
         if f.len() >= 5 && py::isdigit(f[1]) && py::isdigit(f[2]) {
-            self.note_read(owner, &f);
+            self.note_read(owner, &f, false);
             if let Some(x) = py::float_of(f[4]) {
                 self.st().prefill_tok_s_mean = Some(x);
             }
@@ -783,6 +797,7 @@ impl Inner {
             st.conversation = Map::new();
             st.prefill_tok_s_mean = None;
             st.progress = None;
+            st.read_clock = None;
             st.silent_note = None;
             st.last_err = None;
             let version = std::fs::read(Path::new(&sp.bin).parent().unwrap_or(Path::new("")).join("BUILD.json"))
@@ -1325,6 +1340,7 @@ impl Inner {
             st.proc_set = false;
             st.ended = true;
             st.progress = None;
+            st.read_clock = None;
             st.conversation = Map::new();
             self.set_last_locked(&mut st, Map::new());
         }
@@ -1668,7 +1684,7 @@ impl Inner {
             } else if line.starts_with("PP ") {
                 let f = py::split(&line);
                 if f.len() >= 3 && py::isdigit(f[1]) && py::isdigit(f[2]) {
-                    self.note_read(owner, &f);
+                    self.note_read(owner, &f, true);
                     self.st().prefill_tok_s_mean = if f.len() >= 5 { py::float_of(f[4]) } else { None };
                 }
                 if !stopped && cancel.is_set() {
@@ -2066,6 +2082,7 @@ impl Inner {
         {
             let mut st = self.st();
             st.progress = None;
+            st.read_clock = Some(ReadClock::start(wall()));
             st.prefill_tok_s_mean = None;
         }
         self.reset_read(owner);
@@ -2168,7 +2185,7 @@ impl Inner {
                 } else if line.starts_with("PP ") {
                     let f = py::split(&line);
                     if f.len() >= 3 && py::isdigit(f[1]) && py::isdigit(f[2]) {
-                        self.note_read(owner, &f);
+                        self.note_read(owner, &f, true);
                         let rate = if f.len() >= 5 { py::float_of(f[4]) } else { None };
                         self.st().prefill_tok_s_mean = rate;
                         let at: i64 = f[1].parse().unwrap_or(0);
@@ -2308,7 +2325,11 @@ impl Inner {
         if !self.alive() {
             return Err(Stop::Raised(EngineErr::died("the engine is unavailable; this request was not sent")));
         }
-        self.st().progress = None;
+        {
+            let mut st = self.st();
+            st.progress = None;
+            st.read_clock = Some(ReadClock::start(wall()));
+        }
         self.reset_read(owner);
         self.reset_windows(owner);
         let (handle, n) = self.hold_prompt(&prompt, embeddings.is_some())?;
@@ -2890,6 +2911,9 @@ impl Engine for ProcessEngine {
     }
     fn progress(&self) -> Option<(i64, i64)> {
         self.inner.st().progress
+    }
+    fn read_progress(&self) -> Option<ReadProgress> {
+        self.inner.st().read_clock.as_ref().and_then(|c| c.snapshot(wall()))
     }
     fn prompt_progress(&self) -> Option<JsonMap> {
         self.prompt_progress_for(thread_ident())
