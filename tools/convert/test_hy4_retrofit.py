@@ -135,6 +135,40 @@ class RetrofitTest(unittest.TestCase):
             self.assertTrue(b.verify(s_), s_)
         self.assertFalse(Path(str(cp) + ".retrofit.tmp").exists())
 
+    def test_planes_from_a_directory(self):
+        import shutil
+        d = self.t / "planes"
+        d.mkdir()
+        n = "blk.0.attn_q_b.weight"
+        pb = bytes(random.Random(5).randrange(256) for _ in range(128 * 256 // 64 * 36))
+        (d / (n + ".planes")).write_bytes(pb)
+        (d / (n + ".json")).write_text(json.dumps({"gs": 0.0123}))
+        cp = self.t / "cp.basalt"
+        shutil.copyfile(self.src, cp)
+        RF.PLANES_FROM = str(d)
+        try:
+            RF.in_place(str(cp), "keep", "keep", r"attn_q_b", 1, None)
+        finally:
+            RF.PLANES_FROM = None
+        self.assertEqual(self.src.read_bytes(), self.before)
+        m = ModelFile(str(cp))
+        meta = json.loads(m.read("meta"))
+        raw, t = self.tensor(m, meta, n)
+        self.assertEqual((t["type_id"], raw), (45, pb))
+        s, _ = self.tensor(m, meta, n + ".scale")
+        self.assertEqual(np.frombuffer(s, "<f4")[0], np.float32(0.0123))
+        self.assertEqual(self.tensor(m, meta, "output.weight")[0], self.head)
+        self.assertEqual(m.read("dfly"), self.st)
+        for s_ in m.names():
+            self.assertTrue(m.verify(s_), s_)
+        (d / (n + ".planes")).write_bytes(pb[:-1])   # a missing or short file stops the write
+        RF.PLANES_FROM = str(d)
+        try:
+            with self.assertRaises(SystemExit):
+                RF.retrofit(str(self.src), str(self.t / "x.basalt"), "keep", "keep", r"attn_q_b", workers=1)
+        finally:
+            RF.PLANES_FROM = None
+
     def test_dfly_from_redoes_a_runtime_drafter(self):
         import shutil
         out = self.t / "n4.basalt"
