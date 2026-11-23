@@ -161,10 +161,13 @@ Basalt refuses settings that would leave the machine without memory, and never s
 
 ## Vision: `--vision`
 
-`--vision off | dynamic | cpu | <GPU number>` (config: `"vision"` in `server`). The encoder is Basalt's own, and all modes give bitwise
-identical embeddings. All of them read the projector in place from the model file's `vision/mmproj` section. The text can still
-differ between modes: the sidecar's VRAM cost shrinks the expert cache, and which experts run on the GPU or the CPU shifts the
-last bits of the logits, so a greedy answer can fork after some tokens (`dynamic` does the same with a different cache size).
+`--vision off | dynamic | cpu | <GPU number>` (config: `"vision"` in `server`). The encoder is Basalt's own. The GPU and CPU
+encoders round to bf16 at the same steps but are not bitwise identical: on Hy4-flash, a 3912 x 3936 photo (4,032 merged tokens)
+gives a relative L2 difference of 4.8e-3 between the two, and each is 4.7e-3 from an FP32 pass (cosine of every row at least
+0.9995; 0.002% of the values more than 11% off), so the difference is bf16 rounding. All of them read the projector in place from
+the model file's `vision/mmproj` section. The text can still differ between modes: the sidecar's VRAM cost shrinks the expert
+cache, and which experts run on the GPU or the CPU shifts the last bits of the logits, so a greedy answer can fork after some
+tokens (`dynamic` does the same with a different cache size).
 
 | Mode | Encoder runs | VRAM cost | Fresh-image TTFT (IQ3_S, 400 W): 1k / 3k / 4k image tokens |
 | --- | --- | --- | --- |
