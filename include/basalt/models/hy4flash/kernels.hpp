@@ -48,6 +48,13 @@ constexpr int kFp8RowBytes = 656;
 void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
                  int n_tok, int ring, float* qcur, uint8_t* cache, void* stream);
 
+/// The same with an int8 cache (--kv int8): rows of kI8RowBytes: the 512 latent values as int8 codes, the 64 rope values as fp16
+/// (int8 rope values cost 18x the attention-weight KL on Hy4's rows), then four fp32 scales at kI8ScaleOff, one per 128 latent
+/// values, each amax / 127, a code round(v / scale). Both the sparse layers' rows and the window rings take it.
+constexpr int kI8Latent = 512, kI8Rope = 64, kI8ScaleOff = 640, kI8RowBytes = 656;
+void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                 int n_tok, int ring, float* qcur, int8_t* cache, void* stream);
+
 /// The cells each row attends (device arrays of n_tok entries): row t takes counts[t] cells, the cells of row t listed at
 /// cells + t * cells_stride, or (cells null, or fill set and fill[t] > 0) firsts[t] + j (modulo the ring when it is set).
 struct RowSpans {
@@ -71,6 +78,21 @@ void mla_attend(const float* qcur, const uint16_t* cache, const RowSpans& r, int
                 int max_cells, void* work, float* o_lat, void* stream);
 void mla_attend(const float* qcur, const uint8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 int max_cells, void* work, float* o_lat, void* stream);
+/// The same over an int8 cache. A prompt's chunk runs on int8 tensor cores (mma m16n8k32 s8, int32 sums): the cached codes as
+/// stored; the query as two exact int8 terms per (head, scale block), q ~ s (c1 + c2 / 128); the probabilities times the cell's
+/// value scale as two such terms per (head, value block, 32 cells); the terms join in int32 and the blocks in fp32. The rope
+/// part runs on fp16 tensor cores (fp32 sums) with the query's rope values as two fp16 terms (value, remainder).
+void mla_attend(const float* qcur, const int8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                int max_cells, void* work, float* o_lat, void* stream);
+/// A prompt's chunk with an int8 cache, the query pre-rounded: mla_prepare_i8q writes the cache rows as mla_prepare does and each
+/// (row, head)'s query as kI8QRowBytes at qpack + (t * heads + h) * kI8QRowBytes (512 codes c1, 512 codes c2 of the latent part,
+/// the 64 rope values as fp16 and their fp16 remainders, four fp32 scales s * scale / 128), the terms mla_attend's int8 kernel makes;
+/// mla_attend_i8q reads them (the same output bits as mla_attend over fp32 rows of the same values). heads a multiple of 32.
+constexpr int kI8QRowBytes = 1296;
+void mla_prepare_i8q(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                     int n_tok, int ring, void* qpack, int8_t* cache, void* stream);
+void mla_attend_i8q(const void* qpack, const int8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                    float* o_lat, void* stream);
 
 /// mla_prepare for a window of 1 to 8 rows in one launch, with q_abs computed in it: the k_b product (w_kb: Q8_0 [heads][rank][nope],
 /// as q8_0_heads_gemv with the query's head stride) goes straight into qcur. Row t is at position pos[t] (device).
@@ -80,6 +102,8 @@ void mla_query(const void* w_kb, const float* q, const float* kv_raw, const floa
                int ring, float* qcur, uint16_t* cache, void* stream);
 void mla_query(const void* w_kb, const float* q, const float* kv_raw, const float* kv_norm, const MlaArgs& a, const int32_t* pos, int n_tok,
                int ring, float* qcur, uint8_t* cache, void* stream);
+void mla_query(const void* w_kb, const float* q, const float* kv_raw, const float* kv_norm, const MlaArgs& a, const int32_t* pos, int n_tok,
+               int ring, float* qcur, int8_t* cache, void* stream);
 
 /// ids[h * rows + t] = t * heads + h: the (token, head) rows of a [token][head][k] array in head-major order; bounds[h] = h * rows
 /// for h <= heads (each head an "expert" of an MMQ product).
@@ -124,6 +148,16 @@ void idx_select(const float* scores, int n_pool, int k, int pool, int tail0, int
 void idx_scores_rows(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
                      float* scores, int stride, void* stream);
 void idx_select_rows(const float* scores, int stride, const int32_t* meta, int rows, int k, int pool, int32_t* cells, int cells_stride, void* stream);
+
+/// --kv int8: the pooled keys as rows of kIdxI8RowBytes: 128 int8 codes, then the key's fp32 scale (amax / 127; a code round(v / s))
+/// and 12 zero bytes. idx_pool_i8 writes them as idx_pool does fp16 bits; idx_scores_rows_i8 scores them on int8 tensor cores
+/// (heads 16, dim 128): each head's query as two exact int8 terms, q ~ s (c1 + c2 / 128), so a head's dot product is one exact
+/// int32 sum times the two scales.
+constexpr int kIdxI8RowBytes = 144;
+void idx_pool_i8(const float* values, const float* gates, const float* ape, const float* norm_w, const IndexerArgs& a, int ring,
+                 int first_pos, int n_groups, uint8_t* pooled, void* stream);
+void idx_scores_rows_i8(const float* q, const float* w, const uint8_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
+                        float* scores, int stride, void* stream);
 
 /// y[t][r] = scale * w[r] . x[t] for r < rows over `cols` values, t < n_tok (w fp32 [rows][cols], cols % 4 == 0).
 void f32_gemm_rows(const float* x, const float* w, int rows, int cols, float scale, int n_tok, float* y, void* stream);

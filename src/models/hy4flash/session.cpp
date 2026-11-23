@@ -274,11 +274,11 @@ public:
         pea_.resize((size_t) g_.n_layers);
         for (int l = 0; ok && l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) {
-                cache_[(size_t) l] = (uint8_t*) alloc((size_t) swa_ring() * kRowWidth * elem(), ok);
+                cache_[(size_t) l] = (uint8_t*) alloc(ring_bytes(), ok);
             } else {
                 ea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 pea_[(size_t) l] = std::make_unique<core::ElasticArray>();
-                if (!ea_[(size_t) l]->open((uint64_t) ctx * sparse_row_bytes(), err) || !pea_[(size_t) l]->open((uint64_t) pools * g_.idx_dim * 2, err)) return false;
+                if (!ea_[(size_t) l]->open((uint64_t) ctx * sparse_row_bytes(), err) || !pea_[(size_t) l]->open((uint64_t) pools * pool_row_bytes(), err)) return false;
                 cache_[(size_t) l] = ea_[(size_t) l]->data();
                 ipool_[(size_t) l] = (uint16_t*) pea_[(size_t) l]->data();
                 ival_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
@@ -296,7 +296,7 @@ public:
         if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
         use(sc_->dec);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
-        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
+        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err, i8()))
             return false;
         dfly_.bounds(bk_cells_.d, bk_cells_.h);
         dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
@@ -919,7 +919,7 @@ public:
     double cell_bytes() const {
         int sparse = 0;
         for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
-        return (double) sparse * ((double) sparse_row_bytes() + (double) g_.idx_dim * 2.0 / (double) g_.idx_pool);
+        return (double) sparse * ((double) sparse_row_bytes() + (double) pool_row_bytes() / (double) g_.idx_pool);
     }
     // the free memory a prompt chunk needs: the expert ring and the buffers of a chunk of attention-step rows
     static constexpr uint64_t kPromptFloorBuffers = 1ull << 30;
@@ -939,7 +939,7 @@ public:
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
             ea_[(size_t) l]->trim((uint64_t) keep * sparse_row_bytes());
-            pea_[(size_t) l]->trim((uint64_t) (keep / g_.idx_pool + 1) * g_.idx_dim * 2);
+            pea_[(size_t) l]->trim((uint64_t) (keep / g_.idx_pool + 1) * pool_row_bytes());
         }
         basalt::log::info("basalt hy4flash", "elastic KV: %lld -> %lld positions backed", (long long) backed_, (long long) keep);
         backed_ = keep;
@@ -967,7 +967,7 @@ public:
     }
 
     std::string info_words() const override {
-        const std::string kv = m_.cache_fp8() ? "kv=fp8" : "kv=fp16";   // what a community row records
+        const std::string kv = m_.cache_i8() ? "kv=int8" : m_.cache_fp8() ? "kv=fp8" : "kv=fp16";   // what a community row records
         return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(tier_->spill())
                      : kv + " " + program::spill_words({});   // no tier: every expert is on the card, none read from the file
     }
@@ -1001,8 +1001,8 @@ public:
     // (running_state). A ring holds the last swa_ring() (window layers) or kRawRing (indexer rows) positions, so a checkpoint
     // at `pos` is intact while the session has not run more than kMaxRows rows past it.
 
-    int cell_format() const { return fp8() ? 1 : f32() ? 2 : 3; }   // 3: fp16 rows
-    size_t ring_bytes() const { return (size_t) swa_ring() * kRowWidth * elem(); }
+    int cell_format() const { return i8() ? 4 : fp8() ? 1 : f32() ? 2 : 3; }   // 3: fp16 rows, 4: int8 rows
+    size_t ring_bytes() const { return (size_t) swa_ring() * ring_row_bytes(); }
     size_t raw_bytes() const { return (size_t) kRawRing * g_.idx_dim * 4; }
 
     size_t running_bytes() const override {
@@ -1036,14 +1036,14 @@ public:
     size_t cells_bytes(int64_t positions) const override {
         int sparse = 0;
         for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
-        return ctxp::cache_bytes(positions, sparse, fp8()) * (f32() ? 2 : 1);
+        return ctxp::cache_bytes(positions, sparse, fp8(), i8(), idx_i8()) * (f32() ? 2 : 1);
     }
 
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (positions > backed_) return {model::Status::Error, "hy4flash: positions that were never run"};
         cudaStreamSynchronize(stream_);
         kv.clear();
-        const size_t rb = (size_t) sparse_row_bytes(), pools = (size_t) (positions / g_.idx_pool + 1), pb = (size_t) g_.idx_dim * 2;
+        const size_t rb = (size_t) sparse_row_bytes(), pools = (size_t) (positions / g_.idx_pool + 1), pb = (size_t) pool_row_bytes();
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
             core::ConversationKv k;
@@ -1145,9 +1145,14 @@ private:
     int swa_ring() const { return g_.window + kAttRows; }
     int max_cells(int l) const { return g_.swa[(size_t) l] ? g_.window : cells_stride_; }   // a row's cells in layer l
     bool fp8() const { return m_.cache_fp8(); }
+    bool i8() const { return m_.cache_i8(); }
     bool f32() const { return m_.cache_f32(); }
     int elem() const { return f32() ? 4 : 2; }
-    int sparse_row_bytes() const { return fp8() ? kFp8RowBytes : kRowWidth * elem(); }
+    int sparse_row_bytes() const { return i8() ? kI8RowBytes : fp8() ? kFp8RowBytes : kRowWidth * elem(); }
+    // DIAG HY4_IDX_I8=1 with --kv int8: the pooled keys int8 too (E2-5, measured apart)
+    bool idx_i8() const { static const bool on = std::getenv("HY4_IDX_I8") != nullptr; return i8() && on; }
+    int pool_row_bytes() const { return idx_i8() ? kIdxI8RowBytes : g_.idx_dim * 2; }   // a pooled key: fp16, or int8
+    int ring_row_bytes() const { return i8() ? kI8RowBytes : kRowWidth * elem(); }
 
     // A prompt chunk's small inputs from the host: staged in mapped memory and copied by a kernel, so they do not wait on a copy
     // engine behind the expert ring's copies (one piece queued there holds every later copy). A window copies as before.
@@ -1459,7 +1464,7 @@ private:
             put_i32(meta_d_, meta, (size_t) 4 * arows_);
         }
         const int ring = swa ? swa_ring() : 0;
-        const bool f8 = !swa && fp8();
+        const bool f8 = !swa && fp8(), i8r = i8();   // --kv int8: the window rings hold int8 rows too
         const float* kvn = F(l, "attn_kv_a_norm.weight");
         if (phases & kCells) {
         if (R <= kMaxWindow) {   // a window: the k_b product, the query rows and the cache rows in one launch (a segment's)
@@ -1469,14 +1474,16 @@ private:
                 const int32_t* pos_d = meta_d_ + 3 * arows_ + sg.row0;
                 const float *q = q_ + (size_t) sg.row0 * H * g_.qk_dim, *kv = kvraw_ + (size_t) sg.row0 * kRowWidth;
                 float* qc = qcur_ + (size_t) sg.row0 * H * kRowWidth;
-                if (f8) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, cache, stream_);
+                if (i8r) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, (int8_t*) cache, stream_);
+                else if (f8) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, cache, stream_);
                 else if (f32()) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, (float*) cache, stream_);
                 else mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, (uint16_t*) cache, stream_);
             });
         } else {
             uint8_t* cache = cache_[(size_t) l];
             heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
-            if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
+            if (i8r) mla_prepare_i8q(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);   // qcur_: packed int8 rows
+            else if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
             else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
             else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
         }
@@ -1534,7 +1541,9 @@ private:
                 if (!swa && sg.s->bk_cells_.d)   // HY4_BOUNDS_CHECK: every cell in [0, backed)
                     core::bounds::check_cells(rs.firsts, const_cast<int32_t*>(rs.counts), const_cast<int32_t*>(rs.cells), rs.cells_stride, rs.fill,
                                               sg.rows, sg.s->bk_cells_.d, core::bounds::kAttendCells, l, stream_);
-                if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
+                if (i8r && R > kMaxWindow) mla_attend_i8q(qcur_ + (size_t) sg.row0 * H * kI8QRowBytes / 4, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, ol, stream_);
+                else if (i8r) mla_attend(qc, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
+                else if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else if (f32()) mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else mla_attend(qc, (const uint16_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
             });
@@ -1586,8 +1595,12 @@ private:
             const int64_t g0 = p0 >= 3 ? (p0 - 3 + P - 1) / P : 0, g1 = last >= 3 ? (last - 3) / P : -1;
             if (c.bk_pools_.h && g1 >= c.bk_pools_.get())   // HY4_BOUNDS_CHECK: the pooled keys written
                 core::bounds::host_violation(core::bounds::kIndexerPools, l, g1, c.bk_pools_.get());
-            if (g1 >= g0) idx_pool(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
-                                   a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), c.ipool_[(size_t) l], stream_);
+            if (g1 >= g0 && idx_i8())
+                idx_pool_i8(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
+                            a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), (uint8_t*) c.ipool_[(size_t) l], stream_);
+            else if (g1 >= g0)
+                idx_pool(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
+                         a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), c.ipool_[(size_t) l], stream_);
         });
         if (!selecting) return;
         const int keep = g_.idx_top_k / P - (g_.idx_select_tail ? 1 : 0);
@@ -1613,7 +1626,8 @@ private:
                     core::bounds::host_violation(core::bounds::kIndexerPools, l, max_pool - 1, sg.s->bk_pools_.get());
                 put_i32(iidx_meta_, meta, (size_t) n * 3);
                 pt_begin(kPtScore);
-                idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
+                if (idx_i8()) idx_scores_rows_i8(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, (const uint8_t*) sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
+                else idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
                 pt_end(kPtScore);
                 pt_begin(kPtSelect);
                 idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
@@ -3195,7 +3209,7 @@ private:
             for (int l = 0; ok && l < g_.n_layers; ++l) {
                 if (g_.swa[(size_t) l]) continue;
                 ok = ea_[(size_t) l]->ensure((uint64_t) target * sparse_row_bytes(), keep, e) &&
-                     pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2, keep, e);
+                     pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * pool_row_bytes(), keep, e);
             }
             if (ok) {
                 backed_ = target;
@@ -3309,7 +3323,7 @@ private:
             }
             put("iq", iq.data(), iq.size() * 4);
         }
-        if (!swa) {
+        if (!swa && !idx_i8()) {
             const size_t pools = (size_t) ((pos0 + R) / g_.idx_pool);
             std::vector<uint16_t> pk(pools * D);
             cudaMemcpy(pk.data(), ipool_[(size_t) l], pk.size() * 2, cudaMemcpyDeviceToHost);

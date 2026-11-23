@@ -193,6 +193,7 @@ public:
         std::function<bool(int32_t, float*)> embed;              ///< a token's embedding row (E floats, host)
         int sel_cap = 2056;                                      ///< cells of a selection
         bool fp8 = false;                                        ///< the target's caches hold --kv fp8 rows (kFp8RowBytes)
+        bool i8 = false;                                         ///< the target's caches hold --kv int8 rows (kI8RowBytes)
     };
     static std::unique_ptr<DflyRunner> create(const Env& env, std::string& err);
     ~DflyRunner();
@@ -232,9 +233,9 @@ public:
     /// `w` null: no drafter. `ctx` the context in positions.
     /// `dump` (--diag-dump's directory, may be empty): each block's inputs (the source row's hidden state, the cache rows it attends)
     /// are written there for the first few blocks, to compare with a reference.
-    /// `fp8`: the target's sparse caches hold --kv fp8 rows.
+    /// `fp8` / `i8`: the target's sparse caches hold --kv fp8 / --kv int8 rows.
     bool init(const DflyWeights* w, int sel_cap, int64_t ctx, std::function<bool(int32_t, float*)> embed,
-              const std::string& dump, bool fp8, std::string& err);
+              const std::string& dump, bool fp8, std::string& err, bool i8 = false);
     bool on() const { return runner_ != nullptr; }
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
     void invalidate() { if (tap_) tap_->invalidate(); }
@@ -267,7 +268,7 @@ private:
     std::function<void(int, int32_t)> on_row_;
     std::string dump_;
     int64_t ctx_ = 0;
-    bool fp8_ = false;
+    bool fp8_ = false, i8_ = false;
 };
 
 /// The drafts of a block in order, `step(j, previous)` giving draft j after the token before it (the anchor first), or

@@ -80,13 +80,14 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 - **Engram table:** read by row from the pack, so it takes no RAM of its own; the OS file cache keeps the hot rows.
 - **Context:** `--max-context` from 1,024 up to 1,048,576, default 8,192. The 12 sparse layers keep a row of every position;
   the window layers' rings do not grow.
-- **Cache precision:** `--kv fp16` (default) keeps the rows in fp16; `--kv fp8` stores vLLM's 656-byte FP8 row
+- **Cache precision:** `--kv fp16` (default) keeps the rows in fp16. `--kv int8` stores a 656-byte int8 row (scale per 128
+  values, rope part fp16) in the sparse layers and the window rings. `--kv fp8` stores vLLM's 656-byte FP8 row in the sparse layers
   ([precision](../precision/hy4-flash.md#attention-caches)). With the pooled indexer keys, a position takes:
 
   | | Per position | 128K | 256K | 1M |
   | --- | ---: | ---: | ---: | ---: |
   | `--kv fp16` | 14.6 KB | 1.8 GiB | 3.6 GiB | 14.3 GiB |
-  | `--kv fp8` | 8.6 KB | 1.1 GiB | 2.1 GiB | 8.4 GiB |
+  | `--kv int8`, `--kv fp8` | 8.6 KB | 1.1 GiB | 2.1 GiB | 8.4 GiB |
 
 - **Elastic caches:** with `--max-context` above 32,768 a session backs its first 32,768 positions at start;
   the start is refused only when those need more than half the memory the weights leave. A prompt or a generation that needs
