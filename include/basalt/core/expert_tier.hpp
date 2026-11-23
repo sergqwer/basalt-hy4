@@ -30,6 +30,9 @@
 
 #include <cstdint>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <functional>
 #include <memory>
 #include <string>
@@ -388,6 +391,20 @@ private:
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
     bool ram_queued_ = false;               ///< the RAM tier's reads are in the start's pass
     std::chrono::steady_clock::time_point ram_t0_{};
+    // BASALT_RAM_AHEAD: the RAM tier's pinned pages are taken on a thread of their own, a layer ahead of the readers,
+    // which wait at the plan's host gate for the layer they write (finish_backing joins it)
+    struct Backing {
+        std::thread thread;
+        std::mutex mu;
+        std::condition_variable cv;
+        int done = 0;          ///< layers whose pages are taken
+        bool failed = false;
+        double seconds = 0;
+        bool large_ok = true;   ///< large pages not refused yet (a refusal moves the later layers to 4 KB pages)
+        std::string notes;
+    };
+    std::unique_ptr<Backing> backing_;
+    bool finish_backing(std::string& err);
     int64_t ext_n_ = 0;                     ///< the slots per layer `grow` opens in `ext_`: planned at the start (and by replan)
     int64_t exact_per_layer_ = 0;           ///< an exact --expert-cache, per layer; 0 when auto
     int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none

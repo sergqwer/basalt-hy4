@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 
 #include "basalt/log.hpp"
+#include "basalt/platform/pagefile.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/program/options.hpp"
 
@@ -68,6 +69,14 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
                       basalt::platform::host_os_name().c_str(),
                       drv / 1000, (drv % 1000) / 10, rt / 1000, (rt % 1000) / 10);
     basalt::log::info("basalt", "gpus: %s", line.c_str());
+    if (const basalt::platform::PageFileCheck pf = basalt::platform::page_file_check(); pf.known) {
+        if (pf.ok)
+            basalt::log::info("basalt", "page file: %.1f GiB (%s)", pf.bytes / 1073741824.0, pf.detail.c_str());
+        else
+            basalt::log::warn("basalt", "page file: %.1f GiB (%s), below the 62 GiB this engine wants: a card's memory is "
+                              "charged against RAM plus page file, so a large start can fail or stall the desktop; %s",
+                              pf.bytes / 1073741824.0, pf.detail.c_str(), basalt::platform::page_file_advice().c_str());
+    }
     if (std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
         basalt::log::warn("basalt", "%s",
                           (ri.layer_stage ? std::string("one card runs the later layers beside the main card; later cards idle")

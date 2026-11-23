@@ -1,5 +1,6 @@
 // src/core/ram_load.cpp - the RAM tier's memory: allocation, pinning and registration.
 #include "basalt/core/ram_load.hpp"
+#include "basalt/platform/large_pages.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
@@ -228,6 +229,9 @@ RamAllocation& RamAllocation::operator=(RamAllocation&& other) noexcept {
     bytes_ = std::exchange(other.bytes_, 0);
     capacity_ = std::exchange(other.capacity_, 0);
     allocation_pinned_ = std::exchange(other.allocation_pinned_, false);
+    backed_ = std::exchange(other.backed_, 0);
+    large_ = std::exchange(other.large_, 0);
+    standin_ = std::exchange(other.standin_, nullptr);
     return *this;
 }
 
@@ -238,6 +242,7 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
     if constexpr (platform::kPreferHostVmm) {
         if (pin) data_ = vmm::alloc_host(bytes, capacity_);
         allocation_pinned_ = data_ != nullptr;
+        backed_ = capacity_;
     }
     if (!data_) {
         data_ = alloc_ram(bytes);
@@ -248,11 +253,105 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
     return true;
 }
 
+bool RamAllocation::reserve_pinned(uint64_t bytes) {
+    reset();
+    if (!bytes) return true;
+    if constexpr (platform::kPreferHostVmm) {
+        data_ = vmm::reserve_host(bytes, capacity_);
+        if (data_) {
+            allocation_pinned_ = true;
+            backed_ = 0;
+            bytes_ = bytes;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool RamAllocation::reserve_large(uint64_t bytes, uint64_t page) {
+    reset();
+    if (!bytes) return true;
+    if (!page) return false;
+    const uint64_t n = (bytes + page - 1) / page * page;
+    standin_ = platform::reserve_addresses(n);
+    if (!standin_) return false;
+    capacity_ = n;
+    bytes_ = bytes;
+    backed_ = 0;
+    allocation_pinned_ = true;
+    large_ = 1;
+    return true;
+}
+
+uint8_t* RamAllocation::real(const uint8_t* p) const {
+    if (!data_ || !standin_ || p < standin_ || p > standin_ + capacity_) return nullptr;
+    return data_ + (p - standin_);
+}
+
+bool RamAllocation::back(int device) {
+    bool large_ok = true;
+    std::string note;
+    return back(device, large_ok, note);
+}
+
+bool RamAllocation::back(int device, bool& large_ok, std::string& note) {
+    if (!allocation_pinned_ || backed_ == capacity_) return data_ != nullptr || bytes_ == 0;
+    if (large_ == 0) return vmm::back_host(data_, capacity_, backed_, device);
+    if (large_ != 1) return true;
+    unsigned long e = 0;
+    uint8_t* p = large_ok ? platform::alloc_large_pages(capacity_, e) : nullptr;
+    if (p) {
+        large_ = 2;
+    } else {
+        if (large_ok) {
+            large_ok = false;
+            note = "large pages refused (error " + std::to_string(e) +
+                   (e == 1450 ? ": no free large pages, physical memory too fragmented" : e == 1314 ? ": privilege not held" : "") +
+                   "): this and the later layers take 4 KB pages, registered";
+        }
+        p = platform::alloc_committed(capacity_, e);
+        if (!p) {
+            note = "cannot commit " + std::to_string(capacity_ >> 20) + " MiB for the RAM tier (error " + std::to_string(e) + ")";
+            return false;
+        }
+        large_ = 3;
+    }
+    data_ = p;
+    (void) cudaSetDevice(device);
+    const cudaError_t r = cudaHostRegister(data_, (size_t) capacity_, cudaHostRegisterPortable);
+    if (r != cudaSuccess) {
+        (void) cudaGetLastError();
+        note = std::string("cudaHostRegister of the RAM tier refused: ") + cudaGetErrorString(r);
+        return false;   // reset() frees the range unregistered
+    }
+    backed_ = capacity_;
+    return true;
+}
+
+const char* RamAllocation::backing_name() const {
+    switch (large_) {
+        case 2: return "large pages, registered";
+        case 3: return "4 KB pages, registered";
+        default: return "host VMM";
+    }
+}
+
 void RamAllocation::reset() {
-    if (allocation_pinned_) vmm::free_host(data_, capacity_);
+    if (large_ != 0) {
+        if (data_ && backed_ == capacity_ && capacity_ > 0) (void) cudaHostUnregister(data_);
+        platform::free_committed(data_);
+        platform::release_addresses(standin_);
+        standin_ = nullptr;
+        data_ = nullptr;
+        bytes_ = capacity_ = backed_ = 0;
+        allocation_pinned_ = false;
+        large_ = 0;
+        return;
+    }
+    if (allocation_pinned_) vmm::free_host_range(data_, backed_, capacity_);
     else platform::free_aligned(data_);
     data_ = nullptr;
-    bytes_ = capacity_ = 0;
+    bytes_ = capacity_ = backed_ = 0;
     allocation_pinned_ = false;
 }
 

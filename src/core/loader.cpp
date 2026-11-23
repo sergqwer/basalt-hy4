@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -414,7 +415,15 @@ struct Loader::Impl {
     }
 };
 
-Loader::Loader(int threads) : impl_(new Impl(threads)) {}
+namespace {
+int load_threads(int threads) {   // BASALT_LOAD_THREADS: the readers of a start, whatever its caller asked
+    const char* e = std::getenv("BASALT_LOAD_THREADS");
+    const int n = e ? std::atoi(e) : 0;
+    return n > 0 ? std::min(n, 64) : threads;
+}
+}  // namespace
+
+Loader::Loader(int threads) : impl_(new Impl(load_threads(threads))) {}
 
 bool Loader::prepare(const std::vector<int>& devices, std::string& err) {
     int prev = 0;
@@ -678,6 +687,7 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
             } else if (it.host != nullptr) {
                 uint8_t* dst = it.host + out_off;
                 const FileHandle& f = *handles[(size_t) it.file];
+                if (plan.host_gate() && (dst = plan.host_gate()(dst, out_len)) == nullptr) { fail("the RAM pages for the load could not be taken"); break; }
                 if (it.conv == Conv::Copy && pos % kAlign == 0 && (uintptr_t) dst % kAlign == 0 && t.len % kAlign == 0) {
                     if (!read_direct(f, dst, pos, t.len, m.buffered_bytes)) { fail("short read at file offset " + std::to_string(pos)); break; }
                 } else {
@@ -737,6 +747,15 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
         for (int i = 1; i < n; ++i) pool.emplace_back(work, i, std::cref(tasks), std::ref(next));
         work(0, tasks, next);
         for (auto& t : pool) t.join();
+        if (&tasks == &rounds[0] && device_tasks < tasks.size() && !failed.load()) {   // a start's pass (1 GiB on): its read time
+            uint64_t read = device_bytes;
+            for (size_t i = device_tasks; i < tasks.size(); ++i) read += tasks[i].len;
+            if (read >= (1ull << 30))
+                basalt::log::info("basalt loader", "the file reads are done (%.2f GiB in %.1f s, %d readers%s)",
+                                  (double) read / 1073741824.0,
+                                  std::chrono::duration<double>(std::chrono::steady_clock::now() - run_t0).count(), n,
+                                  m.buffered_bytes.load() ? ", some through the file cache" : "");
+        }
     }
     if (any_dev) (void) cudaSetDevice(prev_device);
     if (failed.load()) {

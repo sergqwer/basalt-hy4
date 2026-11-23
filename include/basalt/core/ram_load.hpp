@@ -45,15 +45,32 @@ public:
     RamAllocation& operator=(const RamAllocation&) = delete;
     /// `pin` permits allocation-backed pinning; ordinary memory is registered separately after the read.
     bool allocate(uint64_t bytes, bool pin = true);
+    /// allocate's pinned form in two steps: the address range now (false without host VMM: allocate then), its pinned
+    /// pages by back(), from any thread, before anything touches them.
+    bool reserve_pinned(uint64_t bytes);
+    /// The same with large pages (platform/large_pages.hpp): stand-in addresses now (data() until back(), address space
+    /// only); back() allocates the large pages and registers them with CUDA, or, once large pages were refused
+    /// (`large_ok` false, then set false by a refusal, `note` saying why), ordinary pages registered the same way.  From
+    /// then on data() is the real range and real(p) turns a stand-in address into it.  Nothing is written to the real
+    /// range before back() returns.
+    bool reserve_large(uint64_t bytes, uint64_t page);
+    uint8_t* real(const uint8_t* standin) const;
+    bool holds_standin(const uint8_t* p, uint64_t n) const { return standin_ && p >= standin_ && p + n <= standin_ + capacity_; }
+    bool back(int device);
+    bool back(int device, bool& large_ok, std::string& note);
+    const char* backing_name() const;
     void reset();
-    uint8_t* data() const { return data_; }
+    uint8_t* data() const { return data_ ? data_ : standin_; }
     uint64_t bytes() const { return bytes_; }
     uint64_t capacity() const { return capacity_; }
     bool allocation_pinned() const { return allocation_pinned_; }
 private:
     uint8_t* data_ = nullptr;
     uint64_t bytes_ = 0, capacity_ = 0;
+    uint64_t backed_ = 0;   ///< a reserved range's pinned bytes so far (reserve_pinned); capacity_ once allocated whole
     bool allocation_pinned_ = false;
+    int large_ = 0;          ///< 0 not reserve_large; 1 stand-ins only; 2 large pages; 3 ordinary pages (2 and 3 registered)
+    uint8_t* standin_ = nullptr;
 };
 
 RamPin pin_ram(const RamAllocation& allocation, const std::vector<uint64_t>& bounds, bool mapped,
