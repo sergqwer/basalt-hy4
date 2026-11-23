@@ -145,6 +145,58 @@ struct Scratch {
     }
 };
 
+
+// ---- DIAG (hy4-conv audit): cudaEvent timing of the prompt path's conversions, HY4_CONV_PROF=1
+struct ConvProf {
+    enum { kDenseQ, kDenseQxn, kDenseQqan, kDenseQikn, kDenseMmq, kHeadsQ, kHeadsMmq, kExpGuQ, kExpGuMmq, kExpSwiglu, kExpDQ, kExpDMmq,
+           kAttend, kPrepare, kIdxScore, kIdxPool, kWsum, kRouter, kEmbPut, kEngPut, kProbeXlatOnce, kTotal, kN };
+    bool on = std::getenv("HY4_CONV_PROF") != nullptr;
+    bool active = false;
+    std::vector<cudaEvent_t> pool;
+    size_t used = 0;
+    std::vector<std::pair<int, size_t>> recs;
+    double host_emb_ms = 0;
+    cudaEvent_t ev() {
+        if (used == pool.size()) { cudaEvent_t e; cudaEventCreate(&e); pool.push_back(e); }
+        return pool[used++];
+    }
+    size_t begin(cudaStream_t st) { cudaEvent_t a = ev(); cudaEventRecord(a, st); return used - 1; }
+    void end(int cat, size_t a, cudaStream_t st) { cudaEvent_t b = ev(); cudaEventRecord(b, st); (void) b; recs.push_back({cat, a}); }
+    // the end event is recorded right after the start's partner: begin() then end() always take consecutive pool entries only
+    // when nothing else records in between, so end stores its own index
+    template <class Fn> void time(int cat, cudaStream_t st, Fn&& f) {
+        if (!on || !active) { f(); return; }
+        const size_t a = begin(st);
+        f();
+        cudaEvent_t b = ev();
+        cudaEventRecord(b, st);
+        recs2.push_back({cat, {a, used - 1}});
+    }
+    std::vector<std::pair<int, std::pair<size_t, size_t>>> recs2;
+    void end2(int cat, size_t a, cudaStream_t st) { cudaEvent_t b = ev(); cudaEventRecord(b, st); recs2.push_back({cat, {a, used - 1}}); }
+    void report() {
+        if (!on) return;
+        static const char* names[kN] = {"dense_quant", "dense_quant(xn_)", "dense_quant(qan_)", "dense_quant(ikn_)", "dense_mmq", "heads_quant", "heads_mmq",
+                                        "exp_gu_quant(ids)", "exp_gu_mmq", "exp_swiglu", "exp_d_quant", "exp_d_mmq", "mla_attend", "mla_prepare",
+                                        "idx_scores+select", "idx_pool", "weighted_sum", "router", "emb_put_f32", "engram_put_f32", "probe_xlat_quant_once", "total(run_body)"};
+        cudaDeviceSynchronize();
+        double ms[kN] = {};
+        long cnt[kN] = {};
+        for (auto& r : recs2) {
+            float t = 0;
+            cudaEventElapsedTime(&t, pool[r.second.first], pool[r.second.second]);
+            ms[r.first] += t;
+            ++cnt[r.first];
+        }
+        std::fprintf(stderr, "CONVPROF host_embedding_dequant_ms %.1f\n", host_emb_ms);
+        for (int i = 0; i < kN; ++i) std::fprintf(stderr, "CONVPROF %-24s %9.1f ms %7ld calls\n", names[i], ms[i], cnt[i]);
+        std::fflush(stderr);
+        recs2.clear();
+        used = 0;
+        host_emb_ms = 0;
+    }
+};
+
 class Session final : public model::BatchSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {
@@ -543,6 +595,7 @@ public:
                           t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
         basalt::log::info("basalt hy4flash", "prompt experts: staged from the card %lld, from RAM over the bus %lld, from the second card %lld, on the CPU %lld (its thread %.0f ms, waited for %.0f ms), second card's share waited for %.0f ms, the stream after the launches %.0f ms",
                           (long long) n_stage_dev_, (long long) n_stage_bus_, (long long) n_stage_peer_, (long long) n_cpu_exp_, t_cpu_run_ms_.load(), t_cpu_wait_ms_, t_peer_wait_ms_, t_gpu_wait_ms_);
+        cp_.report();
         use(sc_->dec);
         ring_close();
         big_.release();
@@ -1112,7 +1165,8 @@ private:
             if (loaded_.insert({w->type, n_out}).second) mmq::load(w->type, n_out);
             for (int r0 = 0; r0 < R; r0 += arows_) {
                 const int nb = std::min(arows_, R - r0);
-                mmq::quantize(x + (size_t) r0 * n_in, nullptr, mmq_xq_, w->type, n_in, n_in, nb, stream_);
+                cp_.time(x == xn_ ? ConvProf::kDenseQxn : x == qan_ ? ConvProf::kDenseQqan : x == ikn_ ? ConvProf::kDenseQikn : ConvProf::kDenseQ, stream_, [&] {
+                mmq::quantize(x + (size_t) r0 * n_in, nullptr, mmq_xq_, w->type, n_in, n_in, nb, stream_); });
                 mmq::Product p;
                 p.w = w->ptr;
                 p.type = w->type;
@@ -1127,7 +1181,7 @@ private:
                 p.max_rows = nb;
                 p.dst = y + (size_t) r0 * n_out;
                 p.ld_dst = n_out;
-                mmq_.run(p, stream_);
+                cp_.time(ConvProf::kDenseMmq, stream_, [&] { mmq_.run(p, stream_); });
             }
             return;
         }
@@ -1146,7 +1200,7 @@ private:
             // every head is an "expert" of the product with the R rows of the step: one quantisation and one launch for all heads
             head_major_ids(heads_ids_, heads_bounds_, H, R, stream_);
             const size_t mat = mmq::matrix_bytes(w->type, rows, k);
-            mmq::quantize(x, heads_ids_, mmq_xq_, w->type, k, x_head_stride, (int64_t) H * R, stream_);
+            cp_.time(ConvProf::kHeadsQ, stream_, [&] { mmq::quantize(x, heads_ids_, mmq_xq_, w->type, k, x_head_stride, (int64_t) H * R, stream_); });
             mmq::Product p;
             p.w = (const uint8_t*) w->ptr;
             p.type = w->type;
@@ -1161,7 +1215,7 @@ private:
             p.max_rows = R;
             p.dst = y;
             p.ld_dst = rows;
-            mmq_.run(p, stream_);
+            cp_.time(ConvProf::kHeadsMmq, stream_, [&] { mmq_.run(p, stream_); });
             return;
         }
         q8_0_heads_gemv(w->ptr, x, x_head_stride, x_tok_stride, H, rows, k, R, y, stream_);
@@ -1311,9 +1365,9 @@ private:
         } else {
             uint8_t* cache = cache_[(size_t) l];
             heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
-            if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
-            else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
-            else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+            if (f8) cp_.time(ConvProf::kPrepare, stream_, [&] { mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_); });
+            else if (f32()) cp_.time(ConvProf::kPrepare, stream_, [&] { mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_); });
+            else cp_.time(ConvProf::kPrepare, stream_, [&] { mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_); });
         }
         if (diag(l) && f32() && !swa) {   // the inputs of the attention, for the reference's tensors (fp32 caches only)
             const uint8_t* cache = cache_[(size_t) l];
@@ -1362,9 +1416,9 @@ private:
                 }
                 const float* qc = qcur_ + (size_t) sg.row0 * H * kRowWidth;
                 float* ol = olat_ + (size_t) sg.row0 * H * rank;
-                if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
-                else if (f32()) mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
-                else mla_attend(qc, (const uint16_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
+                if (f8) cp_.time(ConvProf::kAttend, stream_, [&] { mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_); });
+                else if (f32()) cp_.time(ConvProf::kAttend, stream_, [&] { mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_); });
+                else cp_.time(ConvProf::kAttend, stream_, [&] { mla_attend(qc, (const uint16_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_); });
             });
         }
         if (!(phases & kOutput)) return true;
@@ -1411,8 +1465,8 @@ private:
             }
             const int64_t p0 = sg.pos0, last = p0 + sg.rows - 1;
             const int64_t g0 = p0 >= 3 ? (p0 - 3 + P - 1) / P : 0, g1 = last >= 3 ? (last - 3) / P : -1;
-            if (g1 >= g0) idx_pool(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
-                                   a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), c.ipool_[(size_t) l], stream_);
+            if (g1 >= g0) cp_.time(ConvProf::kIdxPool, stream_, [&] { idx_pool(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
+                                   a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), c.ipool_[(size_t) l], stream_); });
         });
         if (!selecting) return;
         const int keep = g_.idx_top_k / P - (g_.idx_select_tail ? 1 : 0);
@@ -1435,8 +1489,8 @@ private:
                 }
                 if (max_pool <= keep) continue;
                 put_i32(iidx_meta_, meta, (size_t) n * 3);
-                idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
-                idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
+                cp_.time(ConvProf::kIdxScore, stream_, [&] { idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
+                idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_); });
             }
         });
     }
@@ -1973,7 +2027,7 @@ private:
             }
         }
         if (time_prompt) t_eng_norm_ms_ += now_ms() - norm_start;
-        put_f32(erows_, h_erows_, (int64_t) R * n_cols * W);
+        cp_.time(ConvProf::kEngPut, stream_, [&] { put_f32(erows_, h_erows_, (int64_t) R * n_cols * W); });
         put_f32(evalid_, h_evalid_, R);
         if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
         cudaEventRecord(eng_ev_, stream_);
@@ -2090,7 +2144,7 @@ private:
             ra.held = lossy_->held_tabs(l - g_.n_dense);
             ra.prior = lossy_->route_prior();
         }
-        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        cp_.time(ConvProf::kRouter, stream_, [&] { bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_); });
         if (lossy && lossy_->route_tail_skip() > 0)   // each group of rows the tier places together
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
@@ -2277,6 +2331,7 @@ private:
             }
             by[(size_t) hid[(size_t) p]].push_back(p);
         }
+        if (gather_xlat_ || cp_.on) cp_.time(ConvProf::kProbeXlatOnce, st, [&] { mmq::quantize(xlat_, nullptr, mmq_xq_, el.gu_type, L, L, R, st); });
         bool ringed = ring_ && R >= kRingRows && tier_ && ring_ready(tl, R);
         // the second card's experts: in a ringed chunk the ones planned with the ring copy (their staging may have started), else
         // the ones its link prices lower for this routing
@@ -2335,7 +2390,9 @@ private:
                           const std::vector<int32_t>& bounds) {
             put_i32(B.tok, tok.data(), tok.size());
             put_i32(B.bounds, bounds.data(), bounds.size());
-            mmq::quantize(xlat_, B.tok, xq1_, el.gu_type, L, L, rows, st);
+            cp_.time(ConvProf::kExpGuQ, st, [&] {
+                if (gather_xlat_) mmq::gather_q8(mmq_xq_, R, B.tok, xq1_, rows, L, st);
+                else mmq::quantize(xlat_, B.tok, xq1_, el.gu_type, L, L, rows, st); });
             mmq::Product p;
             p.w = blobs;
             p.type = el.gu_type;
@@ -2350,12 +2407,12 @@ private:
             p.max_rows = max_rows;
             p.dst = gu_;
             p.ld_dst = p.w_rows;
-            mmq_.run(p, st);
+            cp_.time(ConvProf::kExpGuMmq, st, [&] { mmq_.run(p, st); });
             // an NVFP4 blob's per-expert scales (its last 16 bytes), which the MMQ products leave out
             ExpertTails tails;
             if (el.gu_type == kTypeNvfp4) tails = ExpertTails{blobs, stride_, (size_t) el.blob_bytes - 16, B.bounds, nb};
-            swiglu_split_clamped(gu_, h_, rows, F, g_.clamp_exp[(size_t) l], st, el.gu_type == kTypeNvfp4 ? &tails : nullptr);
-            mmq::quantize(h_, nullptr, xq2_, el.d_type, F, F, rows, st);
+            cp_.time(ConvProf::kExpSwiglu, st, [&] { swiglu_split_clamped(gu_, h_, rows, F, g_.clamp_exp[(size_t) l], st, el.gu_type == kTypeNvfp4 ? &tails : nullptr); });
+            cp_.time(ConvProf::kExpDQ, st, [&] { mmq::quantize(h_, nullptr, xq2_, el.d_type, F, F, rows, st); });
             mmq::Product d;
             d.w = blobs + lay.down_off;
             d.type = el.d_type;
@@ -2370,7 +2427,7 @@ private:
             d.max_rows = max_rows;
             d.dst = pair_rows_;
             d.ld_dst = L;
-            mmq_.run(d, st);
+            cp_.time(ConvProf::kExpDMmq, st, [&] { mmq_.run(d, st); });
             cudaEventRecord(B.done, st);
             pos += rows;
         };
@@ -2463,7 +2520,7 @@ private:
             put_f32(pair_rows_ + (size_t) cpu.at * L, cpu_rows_, (int64_t) cpu.pair.size() * L);
         }
         put_i32(pair_map_, map_h.data(), (size_t) R * K);
-        weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st);
+        cp_.time(ConvProf::kWsum, st, [&] { weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st); });
         const double tg = now_ms();
         cudaStreamSynchronize(st);   // the host's map is read until the copy lands
         t_gpu_wait_ms_ += now_ms() - tg;
@@ -2761,6 +2818,9 @@ private:
         hc.rms_eps = g_.rms_eps;
         hc.hc_eps = g_.hc_eps;
         hc.magnitude = g_.hc_magnitude;
+        cp_.active = cp_.on && R > kMaxWindow;
+        const size_t cp_total = cp_.active ? cp_.begin(stream_) : 0;
+        const double cp_h0 = now_ms();
         for (int t = 0; t < R; ++t)
             if (emb_rows_) {   // [vision] an image row stands in for the token's embedding
                 std::memcpy(h_e_ + (size_t) t * E, emb_rows_ + (size_t) t * E, (size_t) E * 4);
@@ -2768,7 +2828,8 @@ private:
                 err = "no embedding row";
                 return false;
             }
-        put_f32(e_, h_e_, (int64_t) R * E);
+        if (cp_.active) cp_.host_emb_ms += now_ms() - cp_h0;
+        cp_.time(ConvProf::kEmbPut, stream_, [&] { put_f32(e_, h_e_, (int64_t) R * E); });
         if (graphs_) {   // the window's first position, for the graphs' row spans (sliding-window layers)
             *pos_h_ = (int32_t) pos0;
             cudaMemcpyAsync(pos_d_, pos_h_, 4, cudaMemcpyHostToDevice, stream_);
@@ -2827,6 +2888,7 @@ private:
             }
             last_rows_ = head_rows;
         }
+        if (cp_.active) { cp_.end2(ConvProf::kTotal, cp_total, stream_); cp_.active = false; }
         const cudaError_t ce = cudaGetLastError();
         if (ce != cudaSuccess) {
             err = std::string("CUDA: ") + cudaGetErrorString(ce);
@@ -3044,6 +3106,8 @@ private:
     // the joiner thread (moe_group hands it a group's CPU and second-card share; join_moe waits for its result)
     bool use_joiner_ = true;
     bool use_graphs_ = true;
+    ConvProf cp_;
+    bool gather_xlat_ = std::getenv("HY4_CONV_GATHER") != nullptr;
     core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     std::thread joiner_;
     std::mutex jm_;
