@@ -1422,11 +1422,13 @@ private:
         const int E = g_.n_embd, rank = g_.kv_lora;
         const MlaArgs a = mla_args(H, swa ? g_.rope_base_swa : g_.rope_base);
         if (phases & kQuery) {
+            pt_begin(kPtAQkv);
             quant_n(R);
             gemm_n(T(l, "attn_q_a.weight"), qa_, g_.q_lora, R);
             bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
             gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
             gemm_n(T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim, R);
+            pt_end(kPtAQkv);
         }
         if (!(phases & (kCells | kOutput | kAttend))) return true;
         // the cells each row attends
@@ -1438,6 +1440,7 @@ private:
         if ((phases & kCells) && (phases & kDevMeta) && swa) {
             swa_meta(pos_d_, R, g_.window, arows_, meta_d_, stream_);
         } else if (phases & kCells) {   // the cells and positions: a window replays only what comes before and after
+            pt_begin(kPtAMeta);
             for (int t = 0; t < R; ++t) posv[t] = (int32_t) row_pos(pos0, t);
             if (swa) {
                 for (int t = 0; t < R; ++t) {
@@ -1462,6 +1465,7 @@ private:
                 }
             }
             put_i32(meta_d_, meta, (size_t) 4 * arows_);
+            pt_end(kPtAMeta);
         }
         const int ring = swa ? swa_ring() : 0;
         const bool f8 = !swa && fp8();
@@ -1480,10 +1484,14 @@ private:
             });
         } else {
             uint8_t* cache = cache_[(size_t) l];
+            pt_begin(kPtAKb);
             heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
+            pt_end(kPtAKb);
+            pt_begin(kPtAPrep);
             if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
             else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
             else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+            pt_end(kPtAPrep);
         }
         if (diag(l) && f32() && !swa) {   // the inputs of the attention, for the reference's tensors (fp32 caches only)
             const uint8_t* cache = cache_[(size_t) l];
@@ -1545,14 +1553,18 @@ private:
             pt_end(swa ? kPtAttWin : kPtAttSparse);
         }
         if (!(phases & kOutput)) return true;
+        pt_begin(kPtAVb);
         heads_product(T(l, "attn_v_b.weight"), olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_);
+        pt_end(kPtAVb);
         if (diag(l)) dump("attn_kqv-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
+        pt_begin(kPtAOut);
         gemm_n(T(l, "attn_gate.weight"), gate_, H * g_.v_dim, R);   // xn_ as the query phase quantized it
         mul_sigmoid(gate_, vout_, R * H * g_.v_dim, stream_);
         if (diag(l)) dump("attn_gated-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
         gemm(T(l, "attn_output.weight"), vout_, attn_raw_, H * g_.v_dim, E, R);
         if (phases & kRaw) return true;
         bk::rms_norm_rows(attn_raw_, F(l, "post_attention_norm.weight"), attn_, R, E, g_.rms_eps, stream_);
+        pt_end(kPtAOut);
         if (diag(l)) dump("attn_out-" + std::to_string(l), attn_, (int64_t) R * E);
         return true;
     }
@@ -3524,7 +3536,7 @@ private:
     // DIAG BASALT_PROMPT_PROGRESS=1: a line per prompt chunk - its rows, the cells so far, wall ms, and the GPU ms of its phases
     // from event pairs (the indexer, inside it the scores and the top-k select, the sparse and the window layers' attention, the
     // MoE; "rest" = wall - their sum). The events are read once at the chunk's end. Off by default; the output is unchanged.
-    enum { kPtIndexer, kPtScore, kPtSelect, kPtAttSparse, kPtAttWin, kPtMoe, kPtDense, kPtN };
+    enum { kPtIndexer, kPtScore, kPtSelect, kPtAttSparse, kPtAttWin, kPtMoe, kPtDense, kPtAQkv, kPtAMeta, kPtAKb, kPtAPrep, kPtAVb, kPtAOut, kPtN };
     // The stream's timeline in contiguous steps (each mark ends the step before it): every GPU ms of the chunk falls in one
     // step, idle waits included. Steps: the Engram, the hyper-connections and norms, the attention (its projections, the
     // indexer and the attention kernels), the dense layers' FFN, the MoE's head (router, routed_down, shared expert), the
@@ -3544,7 +3556,7 @@ private:
     static bool progress() { static const bool on = [] { const char* e = std::getenv("BASALT_PROMPT_PROGRESS"); return e && *e && *e != '0'; }(); return on; }
     std::vector<cudaEvent_t> pt_ev_;
     std::vector<std::pair<int, int>> pt_open_[kPtN];   // (begin event index, end event index) per phase
-    int pt_used_ = 0, pt_chunk_ = 0, pt_cur_[kPtN] = {-1, -1, -1, -1, -1, -1, -1};
+    int pt_used_ = 0, pt_chunk_ = 0, pt_cur_[kPtN] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     int pt_event() {
         if (pt_used_ == (int) pt_ev_.size()) {
             cudaEvent_t e = nullptr;
@@ -3570,7 +3582,7 @@ private:
         tl_mark(kTlTail);   // closes the chunk's last step
         cudaStreamSynchronize(stream_);
         const double wall = now_ms() - t0;
-        double ms[kPtN] = {0, 0, 0, 0, 0, 0, 0};
+        double ms[kPtN] = {};
         double tl[kTlN] = {}, tl_sum = 0;
         for (size_t k = 0; k + 1 < tl_marks_.size(); ++k) {
             float x = 0;
@@ -3616,6 +3628,10 @@ private:
                           pt_chunk_ - 1, tl_sum, wall, tl[kTlEngram], tl[kTlHc], tl[kTlAttn], tl[kTlDenseFfn], tl[kTlMoeHead], tl[kTlMoe],
                           tl[kTlMoeTail], tl[kTlTail], ms[kPtDense], pt_h2d_bytes_.load() / 1e9, pt_d2d_bytes_.load() / 1e9, cp_ms,
                           cp_ms > 0 ? pt_h2d_bytes_.load() / 1e6 / cp_ms : 0.0, pt_ring_wait_ms_);
+        basalt::log::info("basalt hy4flash", "prompt chunk %d attention steps: q/kv projections %.0f, cells meta %.0f, k_b absorb %.0f, prepare (rope, "
+                          "cache rows, query rows) %.0f, indexer %.0f, sparse %.0f, window %.0f, v_b %.0f, gate+output+norm %.0f ms",
+                          pt_chunk_ - 1, ms[kPtAQkv], ms[kPtAMeta], ms[kPtAKb], ms[kPtAPrep], ms[kPtIndexer], ms[kPtAttSparse], ms[kPtAttWin],
+                          ms[kPtAVb], ms[kPtAOut]);
         pt_h2d_bytes_ = 0;
         pt_d2d_bytes_ = 0;
         pt_ring_wait_ms_ = 0;
