@@ -92,7 +92,7 @@ std::string meta_text(const std::map<std::string, DflyTensor>& t, const std::str
     bool first = true;
     uint64_t off = 1000;
     for (const auto& [n, x] : t) {
-        s += std::string(first ? "" : ",") + "\"" + n + "\":{\"dtype\":\"BF16\",\"shape\":[";
+        s += std::string(first ? "" : ",") + "\"" + n + "\":{\"dtype\":\"" + x.dtype + "\",\"shape\":[";
         for (size_t i = 0; i < x.shape.size(); ++i) s += (i ? "," : "") + std::to_string(x.shape[i]);
         s += "],\"offset\":" + std::to_string(off) + ",\"bytes\":" + std::to_string(x.bytes) + "}";
         off += x.bytes;
@@ -138,8 +138,24 @@ void test_pack_record() {
     s.replace(s.find("\"layers\":5"), 10, "\"layers\":4");
     CHECK(!parse(s, p, err));
     s = meta_text(tensors);
-    s.replace(s.find("\"dtype\":\"BF16\""), 14, "\"dtype\":\"F32\"");
+    s.replace(s.find("\"dtype\":\"BF16\""), 14, "\"dtype\":\"F8\"");
     CHECK(!parse(s, p, err));
+    // a runtime-format record (dfly_attach's default): each tensor in the type it loads to, with that type's bytes
+    CHECK(parse(meta_text(tensors), p, err) && dfly_check_shapes(p.tensors, p.dims, err));   // the dims again
+    auto rt = tensors;
+    for (const DflySpec& sp : dfly_specs(p.dims)) {
+        DflyTensor& t = rt.at(sp.name);
+        t.dtype = sp.f32 ? "F32" : sp.q4 ? "Q4_0" : sp.q8 ? "Q8_0" : "BF16";
+        t.bytes = sp.bytes();
+    }
+    CHECK(parse(meta_text(rt), p, err) && dfly_check_shapes(p.tensors, p.dims, err));
+    CHECK(p.tensors.at("0.mlp.gate_proj.weight").dtype == "Q4_0" && p.tensors.at("0.self_attn.kv_b_proj.weight").dtype == "BF16");
+    bad = rt;   // a projection stored in another runtime type than its own, or with BF16 bytes under a Q8_0 name
+    bad["0.mlp.gate_proj.weight"].dtype = "Q8_0";
+    CHECK(parse(meta_text(bad), p, err) && !dfly_check_shapes(p.tensors, p.dims, err));
+    bad = rt;
+    bad["mtp_fusion.eh_proj.weight"].bytes = 3072ull * 6144 * 2;
+    CHECK(parse(meta_text(bad), p, err) && !dfly_check_shapes(p.tensors, p.dims, err));
 }
 
 void test_source_row() {

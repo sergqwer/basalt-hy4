@@ -164,8 +164,11 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         d.type = t.type;
         d.bytes = t.bytes;
         d.shape = t.shape;
-        // the output head: the pack's BF16 rows rounded to Q8_0 as they load, read by the target and the drafts alike
-        const bool head_q8 = name == "output.weight";
+        // the output head: Q8_0 as stored, or (an older pack) BF16 rows rounded to Q8_0 as they load; read by the target and
+        // the drafts alike
+        const bool head_q8 = name == "output.weight" && t.type != kTypeQ8_0;
+        if (name == "output.weight" && t.type == kTypeQ8_0 && (t.shape.size() != 2 || t.shape[0] % 32 != 0))
+            return {model::Status::Error, "hy4flash: output.weight is not Q8_0 rows"};
         if (head_q8) {
             if (t.type != kTypeBF16 || t.shape.size() != 2 || t.shape[0] % 32 != 0)
                 return {model::Status::Error, "hy4flash: output.weight is not BF16 rows of whole Q8_0 blocks"};

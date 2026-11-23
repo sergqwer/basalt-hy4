@@ -59,11 +59,20 @@ bool parse_dfly_meta(const Json& d, uint64_t section_offset, DflyPack& out, std:
     }
     for (const auto& [name, t] : tj->members) {
         const Json* dt = t.get("dtype");
-        if (!dt || dt->s != "BF16") {
-            err = "meta.dfly2: " + name + " is not BF16";
+        if (!dt || (dt->s != "BF16" && dt->s != "F32" && dt->s != "Q8_0" && dt->s != "Q4_0" && dt->s != "NVFP4P")) {
+            err = "meta.dfly2: " + name + " is not BF16, F32, Q8_0, Q4_0 or NVFP4P";
             return false;
         }
         DflyTensor r;
+        r.dtype = dt->s;
+        if (r.dtype == "NVFP4P") {   // NVFP4 planes under the matrix's FP32 scale
+            const Json* sc = t.get("scale");
+            if (!sc || !(sc->num() > 0.0)) {
+                err = "meta.dfly2: " + name + " (NVFP4P) has no scale";
+                return false;
+            }
+            r.scale = (float) sc->num();
+        }
         const Json *off = t.get("offset"), *by = t.get("bytes"), *sh = t.get("shape");
         if (!off || !by || !sh || !sh->is_array()) {
             err = "meta.dfly2: " + name + " has no offset, bytes or shape";
@@ -139,8 +148,13 @@ bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDim
             err = "dfly: no tensor " + s.name;
             return false;
         }
-        if (it->second.shape != s.shape || it->second.bytes != s.elems() * 2) {
-            err = "dfly: tensor " + s.name + " has another shape than the drafter's";
+        // BF16 as released, or the runtime format the loader would make (dfly_attach's "runtime" section)
+        const std::string& dt = it->second.dtype;
+        const char* rt = s.f32 ? "F32" : s.q4 ? "Q4_0" : s.q8 ? "Q8_0" : "BF16";
+        // NVFP4P: a Q4_0 projection as NVFP4 planes, the same bytes (36 per 64 values), rows of whole 128-row tiles
+        const bool p4 = dt == "NVFP4P" && s.q4 && s.shape.size() == 2 && s.shape[0] % 128 == 0 && s.shape[1] % 256 == 0;
+        if (it->second.shape != s.shape || (dt != "BF16" && dt != rt && !p4) || it->second.bytes != (dt == "BF16" ? s.elems() * 2 : s.bytes())) {
+            err = "dfly: tensor " + s.name + " has another shape or format than the drafter's";
             return false;
         }
     }
