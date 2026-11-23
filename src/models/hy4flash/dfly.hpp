@@ -213,6 +213,9 @@ public:
                 const std::function<bool(const float*, int)>& need = nullptr);
     /// The block's outputs after the final norm, `rows` rows of E floats, to the host (for the tests against a reference).
     void copy_block(float* host, int rows, void* stream) const;
+    /// HY4_BOUNDS_CHECK (core/bounds_check.hpp): the target's backed cells (device and host views of one mapped word) the
+    /// block's gather checks its cells and positions against; null: no checks.
+    void bounds(const int64_t* limit_dev, const int64_t* limit_host);
 
 private:
     DflyRunner() = default;
@@ -250,6 +253,8 @@ public:
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream, const model::ModelSession::DraftNeed& need);
     /// Called in the heads with each draft row's token as it is known (DflyRunner::finish's on_row).
     void on_row(std::function<void(int, int32_t)> f) { on_row_ = std::move(f); }
+    /// HY4_BOUNDS_CHECK: the session's backed cells, for the drafter's gathers (DflyRunner::bounds).
+    void bounds(const int64_t* limit_dev, const int64_t* limit_host) { if (runner_) runner_->bounds(limit_dev, limit_host); }
 
 private:
     std::unique_ptr<DflyTap> tap_;

@@ -262,7 +262,7 @@ endif()
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/elastic_array.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
+add_library(core STATIC src/core/device.cu src/core/bounds_check.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/elastic_array.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
                              src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/prompt_stage.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -1247,6 +1247,13 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_mmq_ids_tail_test PRIVATE mmq core ggml_quants ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_mmq_ids_tail_test COMMAND prefill_mmq_ids_tail_test)
   set_tests_properties(prefill_mmq_ids_tail_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # HY4_BOUNDS_CHECK: each check tripped on purpose (reported once, stepped around), and nothing at all while off
+  add_executable(bounds_check_test tests/cuda/bounds_check_test.cpp)
+  target_link_libraries(bounds_check_test PRIVATE core ${_gpu_runtime_target})
+  basalt_gpu_test(NAME bounds_check_test COMMAND bounds_check_test)
+  set_tests_properties(bounds_check_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  basalt_gpu_test(NAME bounds_check_off_test COMMAND bounds_check_test off)
+  set_tests_properties(bounds_check_off_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "HY4_BOUNDS_CHECK=0")
 endif()
 if(BUILD_TESTING)
   # NVFP4 block decode against the E2M1/UE4M3 spec (exhaustive) and ggml's row dequantizer; with an experts.bin,

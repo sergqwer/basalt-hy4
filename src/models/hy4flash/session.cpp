@@ -7,6 +7,7 @@
 // the tier places in groups of up to 8 rows beside the shared expert, routed_up). A row's result does not depend on the other
 // rows of its call: the dense products take 8 rows at most per launch with the single-row kernels' reduction order, the
 // attention kernels take a block per row, and the experts are run per row.
+#include "basalt/core/bounds_check.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/elastic_array.hpp"
@@ -278,11 +279,16 @@ public:
             err = "out of device memory for the session";
             return false;
         }
+        if (core::bounds::enabled()) {   // HY4_BOUNDS_CHECK: the cells and pooled keys the caches back, for the device checks
+            bk_cells_.open();
+            bk_pools_.open();
+        }
         if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
         use(sc_->dec);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
+        dfly_.bounds(bk_cells_.d, bk_cells_.h);
         dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
         return true;
     }
@@ -885,6 +891,7 @@ public:
         }
         basalt::log::info("basalt hy4flash", "elastic KV: %lld -> %lld positions backed", (long long) backed_, (long long) keep);
         backed_ = keep;
+        bk_set();
     }
 
     ExpertCounts expert_counts() const override {
@@ -1374,6 +1381,9 @@ private:
                 }
                 const float* qc = qcur_ + (size_t) sg.row0 * H * kRowWidth;
                 float* ol = olat_ + (size_t) sg.row0 * H * rank;
+                if (!swa && sg.s->bk_cells_.d)   // HY4_BOUNDS_CHECK: every cell in [0, backed)
+                    core::bounds::check_cells(rs.firsts, const_cast<int32_t*>(rs.counts), const_cast<int32_t*>(rs.cells), rs.cells_stride, rs.fill,
+                                              sg.rows, sg.s->bk_cells_.d, core::bounds::kAttendCells, l, stream_);
                 if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else if (f32()) mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else mla_attend(qc, (const uint16_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
@@ -1423,6 +1433,8 @@ private:
             }
             const int64_t p0 = sg.pos0, last = p0 + sg.rows - 1;
             const int64_t g0 = p0 >= 3 ? (p0 - 3 + P - 1) / P : 0, g1 = last >= 3 ? (last - 3) / P : -1;
+            if (c.bk_pools_.h && g1 >= c.bk_pools_.get())   // HY4_BOUNDS_CHECK: the pooled keys written
+                core::bounds::host_violation(core::bounds::kIndexerPools, l, g1, c.bk_pools_.get());
             if (g1 >= g0) idx_pool(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
                                    a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), c.ipool_[(size_t) l], stream_);
         });
@@ -1446,6 +1458,8 @@ private:
                     max_pool = std::max(max_pool, pools);
                 }
                 if (max_pool <= keep) continue;
+                if (sg.s->bk_pools_.h && max_pool > sg.s->bk_pools_.get())   // HY4_BOUNDS_CHECK: the pooled keys scored
+                    core::bounds::host_violation(core::bounds::kIndexerPools, l, max_pool - 1, sg.s->bk_pools_.get());
                 put_i32(iidx_meta_, meta, (size_t) n * 3);
                 idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
                 idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
@@ -1576,8 +1590,10 @@ private:
                 e += n;
                 continue;
             }
-            if (src.dev) cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
-            else if (src.peer) cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), el.blob_bytes, copy_);
+            if (src.dev) {
+                if (tier_->slot_ok(core::bounds::kTierSource, tl, src.dev, el.blob_bytes))   // HY4_BOUNDS_CHECK; else skipped, reported
+                    cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
+            } else if (src.peer) cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), el.blob_bytes, copy_);
             else return false;
             ++e;
         }
@@ -2541,7 +2557,8 @@ private:
                 uint8_t* dst = B.blobs + stride_ * (size_t) q;
                 const core::ExpertTier::Source src = tier_->locate(tl, e);
                 if (src.dev) {
-                    cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
+                    if (tier_->slot_ok(core::bounds::kTierSource, tl, src.dev, el.blob_bytes))   // HY4_BOUNDS_CHECK; else skipped, reported
+                        cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
                     ++n_stage_dev_;
                 } else if (src.pinned) {
                     cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
@@ -2621,6 +2638,7 @@ private:
                                                            l, g0, cudaGetErrorString(se), cudaGetErrorString(le));
         err = buf;
         basalt::log::error("basalt hy4flash", "%s", buf);
+        bk_take(err);   // HY4_BOUNDS_CHECK: the violation behind it, if a check saw one
         seq_want_ = have;
         return false;
     }
@@ -2848,9 +2866,11 @@ private:
 
     // R rows at pos0..: the whole forward; the logits of the last `head_rows` rows go to logits_.
     bool run_rows(const int32_t* tokens, int R, int64_t pos0, int head_rows, std::string& err) {
+        if (bk_cells_.h && bk_take(err)) return false;   // HY4_BOUNDS_CHECK: a violation of the steps before, landed since
         bool ok = run_rows_impl(tokens, R, pos0, head_rows, err);
         if (!join_moe(err)) ok = false;
         if (!ok) cudaStreamSynchronize(stream_);
+        if (bk_cells_.h && bk_take(err)) ok = false;
         return ok;
     }
     bool run_rows_impl(const int32_t* tokens, int R, int64_t pos0, int head_rows, std::string& err) {
@@ -2987,6 +3007,7 @@ private:
             }
             if (ok) {
                 backed_ = target;
+                bk_set();
                 if (attempt == 2 && !big_.rows) {   // lent here, outside a prompt (which takes its slots back at its end)
                     std::string r;
                     if (!tier_->reclaim(r)) basalt::log::warn("basalt hy4flash", "the latent caches took expert slots at %lld positions: %s", (long long) target, r.c_str());
@@ -3201,6 +3222,21 @@ private:
     DflyHook dfly_;   // DFLY HOOK
     std::vector<std::unique_ptr<core::ElasticArray>> ea_, pea_;
     int64_t backed_ = 0;   // positions the sparse layers' caches are backed for
+    // HY4_BOUNDS_CHECK (core/bounds_check.hpp): the cells and pooled keys backed_ covers, read by the device checks; closed while off
+    core::bounds::Limit bk_cells_, bk_pools_;
+    void bk_set() {
+        bk_cells_.set(backed_);
+        bk_pools_.set(backed_ / g_.idx_pool + 1);
+    }
+    // a violation the checks recorded: to the engine log and the request's error
+    bool bk_take(std::string& err) {
+        std::string m;
+        if (!bk_cells_.h || !core::bounds::take(m)) return false;
+        basalt::log::error("basalt hy4flash", "%s", m.c_str());
+        if (err.empty()) err = m;
+        else err += "; " + m;
+        return true;
+    }
     std::vector<int32_t> hist_, picks_;
     bool bias_on_ = false;
     float *d_bias_ = nullptr, *d_mask_ = nullptr;

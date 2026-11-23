@@ -76,6 +76,8 @@ public:
     void close();
 
     bool valid() const { return base_ != nullptr; }
+    /// The arena's first byte (with mapped_bytes(), the range a copy into a slot may touch).
+    const uint8_t* base() const { return base_; }
     /// The slots usable now: all of them, unless `shrink` gave the tail's VRAM back - then the ones wholly inside the
     /// VRAM still backed, always a prefix.  The prompt path's loan (the last slots) and every report follow this;
     /// `full_slots()` is what `open` allocated.
