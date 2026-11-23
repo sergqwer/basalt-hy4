@@ -829,7 +829,9 @@ public:
         for (int t0 = 0; t0 < r.n_tokens; t0 += chunk) {
             if (r.stop && r.stop()) break;
             const int n = std::min(chunk, r.n_tokens - t0);
+            const double pt0 = progress() ? now_ms() : 0;
             if (!run_rows(r.tokens + t0, n, r.pos + t0, 0, err)) return {grow_failed_ ? model::Status::Refused : model::Status::Error, "hy4flash: " + err};
+            if (progress()) progress_line(n, r.pos + t0 + n, pt0);
             if (r.progress) {
                 cudaStreamSynchronize(stream_);
                 r.progress(t0 + n);
@@ -1501,7 +1503,9 @@ private:
             put("q_pe-" + std::to_string(l), qp);
         }
         if (!swa) {
+            pt_begin(kPtIndexer);
             indexer(l, pos0, R, selecting, pools_of, err);
+            pt_end(kPtIndexer);
             each_seg(pos0, R, [&](const Seg& sg) {   // DFLY HOOK: each row's selection, for its conversation's drafter
                 for (int t = sg.row0; t < sg.row0 + sg.rows; ++t) {
                     const bool sel = pools_of[(size_t) t] > keep;
@@ -1513,6 +1517,7 @@ private:
         if (!(phases & (kOutput | kAttend))) return true;
         if (!(phases & kTail)) {   // each segment over its own cache
             const float* sinks = F(l, "attn_sinks.weight");
+            pt_begin(swa ? kPtAttWin : kPtAttSparse);
             each_seg(pos0, R, [&](const Seg& sg) {
                 const uint8_t* cache = sg.s->cache_[(size_t) l];
                 RowSpans rs;
@@ -1532,6 +1537,7 @@ private:
                 else if (f32()) mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else mla_attend(qc, (const uint16_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
             });
+            pt_end(swa ? kPtAttWin : kPtAttSparse);
         }
         if (!(phases & kOutput)) return true;
         heads_product(T(l, "attn_v_b.weight"), olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_);
@@ -1605,8 +1611,12 @@ private:
                 if (sg.s->bk_pools_.h && max_pool > sg.s->bk_pools_.get())   // HY4_BOUNDS_CHECK: the pooled keys scored
                     core::bounds::host_violation(core::bounds::kIndexerPools, l, max_pool - 1, sg.s->bk_pools_.get());
                 put_i32(iidx_meta_, meta, (size_t) n * 3);
+                pt_begin(kPtScore);
                 idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
+                pt_end(kPtScore);
+                pt_begin(kPtSelect);
                 idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
+                pt_end(kPtSelect);
             }
         });
     }
@@ -2261,7 +2271,10 @@ private:
         const bool prompt = R > kMaxWindow && basalt::prefill::mmq::built();
         moe_head(l, R, prompt);
         if (prompt) {
-            if (!moe_prompt(l, tl, R, lay, err)) return false;
+            pt_begin(kPtMoe);
+            const bool moe_ok = moe_prompt(l, tl, R, lay, err);
+            pt_end(kPtMoe);
+            if (!moe_ok) return false;
         } else {
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 if (!moe_group(l, tl, lay, g0, std::min(kMaxWindow, R - g0), err)) return false;
@@ -3472,6 +3485,55 @@ private:
         if (sp_t1_ < 0) return;
         sp_gap_ms_ += now_ms() - sp_t1_;
         sp_t1_ = -1;
+    }
+    // DIAG BASALT_PROMPT_PROGRESS=1: a line per prompt chunk - its rows, the cells so far, wall ms, and the GPU ms of its phases
+    // from event pairs (the indexer, inside it the scores and the top-k select, the sparse and the window layers' attention, the
+    // MoE; "rest" = wall - their sum). The events are read once at the chunk's end. Off by default; the output is unchanged.
+    enum { kPtIndexer, kPtScore, kPtSelect, kPtAttSparse, kPtAttWin, kPtMoe, kPtN };
+    static bool progress() { static const bool on = [] { const char* e = std::getenv("BASALT_PROMPT_PROGRESS"); return e && *e && *e != '0'; }(); return on; }
+    std::vector<cudaEvent_t> pt_ev_;
+    std::vector<std::pair<int, int>> pt_open_[kPtN];   // (begin event index, end event index) per phase
+    int pt_used_ = 0, pt_chunk_ = 0, pt_cur_[kPtN] = {-1, -1, -1, -1, -1, -1};
+    int pt_event() {
+        if (pt_used_ == (int) pt_ev_.size()) {
+            cudaEvent_t e = nullptr;
+            cudaEventCreate(&e);
+            pt_ev_.push_back(e);
+        }
+        return pt_used_++;
+    }
+    void pt_begin(int ph) {
+        if (!progress() || rows_ <= kMaxWindow) return;
+        const int i = pt_event();
+        cudaEventRecord(pt_ev_[(size_t) i], stream_);
+        pt_cur_[ph] = i;
+    }
+    void pt_end(int ph) {
+        if (!progress() || rows_ <= kMaxWindow || pt_cur_[ph] < 0) return;
+        const int i = pt_event();
+        cudaEventRecord(pt_ev_[(size_t) i], stream_);
+        pt_open_[ph].push_back({pt_cur_[ph], i});
+        pt_cur_[ph] = -1;
+    }
+    void progress_line(int rows, int64_t cells, double t0) {
+        cudaStreamSynchronize(stream_);
+        const double wall = now_ms() - t0;
+        double ms[kPtN] = {0, 0, 0, 0, 0, 0};
+        for (int ph = 0; ph < kPtN; ++ph) {
+            for (auto [b, e] : pt_open_[ph]) {
+                float x = 0;
+                if (cudaEventElapsedTime(&x, pt_ev_[(size_t) b], pt_ev_[(size_t) e]) == cudaSuccess) ms[ph] += x;
+            }
+            pt_open_[ph].clear();
+        }
+        pt_used_ = 0;
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        basalt::log::info("basalt hy4flash", "prompt chunk %d: %d rows, %lld cells, %.0f ms wall; indexer %.0f (scores %.0f, select %.0f), attention sparse %.0f window %.0f, "
+                          "MoE %.0f, rest %.0f ms; %lld positions backed, tier %lld slots, %.2f GiB free",
+                          pt_chunk_++, rows, (long long) cells, wall, ms[kPtIndexer], ms[kPtScore], ms[kPtSelect], ms[kPtAttSparse], ms[kPtAttWin], ms[kPtMoe],
+                          wall - ms[kPtIndexer] - ms[kPtAttSparse] - ms[kPtAttWin] - ms[kPtMoe], (long long) backed_, tier_ ? (long long) tier_->slots() : 0LL,
+                          fr / 1073741824.0);
     }
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
