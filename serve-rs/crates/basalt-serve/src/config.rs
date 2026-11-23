@@ -984,10 +984,15 @@ mod tests {
     #[test]
     fn parse_basics() {
         let ap = build_parser();
-        let (ns, extras) = ap.parse_known_args(&w(&["--port", "9", "--spec", "2", "--grammar", "--no-grammar", "--vision"])).unwrap();
+        let (ns, extras) =
+            ap.parse_known_args(&w(&["--port", "9", "--spec", "2", "--grammar", "--no-grammar", "--vision", "dynamic"])).unwrap();
         assert_eq!(ns["port"], json!(9));
         assert_eq!(extras, w(&["--spec", "2"]));
         assert_eq!(ns["grammar"], json!(false));
+        assert_eq!(ns["vision"], json!("dynamic"));
+        // a bare --vision names no mode; the Python server refuses it the same way
+        let e = ap.parse_known_args(&w(&["--vision"])).unwrap_err();
+        assert!(e.stderr.contains("argument --vision: vision: use one of off, dynamic, cpu or a GPU number"));
         let e = ap.parse_known_args(&w(&["--port", "x"])).unwrap_err();
         assert!(e.stderr.ends_with("server.py: error: argument --port: invalid int value: 'x'\n"));
     }
