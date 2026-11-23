@@ -317,7 +317,7 @@ public:
         }
         sc.xq1 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
         sc.xq2 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
-        sc.heads_ids = (int32_t*) alloc((size_t) max_heads_ * kAttRows * 4, ok);
+        sc.heads_ids = (int32_t*) alloc(((size_t) max_heads_ * kAttRows + mmq::kIdsTail) * 4, ok);   // MMQ reads a tile past the last row
         sc.heads_bounds = (int32_t*) alloc((size_t) (max_heads_ + 1) * 4, ok);
         sc.rowptr_d = (const float**) alloc(kLookupK * sizeof(void*), ok);
         {
@@ -412,8 +412,9 @@ public:
         b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
         b.erows = f((int64_t) A * g_.n_embd); b.ekv = f((int64_t) A * 5 * E); b.evalid = f(A);
         b.pair_rows = f((int64_t) R * g_.n_used * g_.n_latent);
-        b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
-        b.mmq_ident = (int32_t*) f(A);
+        // the identity tables MMQ reads a whole tile of ids from (basalt::prefill::mmq::kIdsTail)
+        b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used + basalt::prefill::mmq::kIdsTail);
+        b.mmq_ident = (int32_t*) f(A + basalt::prefill::mmq::kIdsTail);
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
         if (count) {
             f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
@@ -435,8 +436,8 @@ public:
             return false;
         }
         if (basalt::prefill::mmq::built()) {
-            basalt::prefill::mmq::iota(b.mmq_ident, A, nullptr);
-            basalt::prefill::mmq::iota(b.pair_ident, (int64_t) R * g_.n_used, nullptr);
+            basalt::prefill::mmq::iota(b.mmq_ident, A + basalt::prefill::mmq::kIdsTail, nullptr);
+            basalt::prefill::mmq::iota(b.pair_ident, (int64_t) R * g_.n_used + basalt::prefill::mmq::kIdsTail, nullptr);
         }
         cudaDeviceSynchronize();
         return true;
