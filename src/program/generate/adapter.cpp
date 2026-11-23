@@ -37,6 +37,12 @@ namespace {
 using Clock = std::chrono::steady_clock;
 namespace cli = basalt::program::cli;
 
+#if defined(_WIN32)
+constexpr int kDefaultAdapterReserveMib = 700;   // WDDM pages a full card out to RAM instead of refusing it
+#else
+constexpr int kDefaultAdapterReserveMib = 0;
+#endif
+
 // The name of the engine's expert profile for a model (data/profiles/<key>.prof).
 std::string profile_key(const basalt::core::Json& meta) {
     using T = basalt::core::Json::Type;
@@ -384,7 +390,10 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.pool_affinity_given = o.pool_affinity_given;
         lreq.peer_reserve_mib = o.peer_reserve_mib;
         lreq.prompt_skip = !o.no_prompt_skip;
-        lreq.vram_reserve_mib = o.vram_reserve_given ? o.vram_reserve_mib : 0;
+        // Windows (WDDM) keeps 700 MiB free unless --vram-reserve-mib says otherwise: with less, the driver moves the card's
+        // allocations out to system memory instead of refusing them (E2-9: a prompt's KV grew 1 GiB past the budget and the
+        // sparse attention ran ~15x slower). Elsewhere a full card refuses the map, so nothing is kept back.
+        lreq.vram_reserve_mib = o.vram_reserve_given ? o.vram_reserve_mib : kDefaultAdapterReserveMib;
         lreq.spec = o.spec;
         lreq.draft = o.spec >= 2 && o.spec_oracle.empty();
         lreq.drafter_device = o.drafter_device;

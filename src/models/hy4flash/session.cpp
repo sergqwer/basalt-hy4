@@ -3184,6 +3184,9 @@ private:
         grow_failed_ = false;
         if (positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
+        // The free VRAM a growth step leaves: the tier's floor (--vram-reserve-mib, 700 MiB by default on Windows). A zero
+        // keep skips the check, and under WDDM the map then succeeds past the card's budget: the KV is demoted to system
+        // memory and the sparse attention runs ~15x slower (E2-9). The tier shrinks or lends below for the room, keep included.
         const uint64_t keep = tier_ ? tier_->free_floor() : 256ull << 20;
         for (int attempt = 0; attempt < 3; ++attempt) {
             std::string e;
@@ -3196,6 +3199,9 @@ private:
             if (ok) {
                 backed_ = target;
                 bk_set();
+                if (attempt > 0)
+                    basalt::log::info("basalt hy4flash", "elastic KV: %lld positions backed after the tier %s (%lld slots stay)", (long long) target,
+                                      attempt == 1 ? "shrank" : "lent", tier_ ? (long long) tier_->slots() : 0LL);
                 if (attempt == 2 && !big_.rows) {   // lent here, outside a prompt (which takes its slots back at its end)
                     std::string r;
                     if (!tier_->reclaim(r)) basalt::log::warn("basalt hy4flash", "the latent caches took expert slots at %lld positions: %s", (long long) target, r.c_str());
@@ -3215,7 +3221,7 @@ private:
             if (copy_) cudaStreamSynchronize(copy_);
             cudaStreamSynchronize(stream_);
             if (attempt == 0) tier_->shrink();
-            else if (!tier_->partial_lend() || !tier_->lend(grow_bytes(target))) tier_->lend_all();
+            else if (!tier_->partial_lend() || !tier_->lend(grow_bytes(target) + keep)) tier_->lend_all();
         }
         return false;
     }
