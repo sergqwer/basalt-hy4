@@ -2509,6 +2509,7 @@ private:
         } else {
             bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
         }
+        if (prompt && cmp_router() && bk::router_logits_bf16x3_fits(ra.n_expert, E)) router_compare(l, R, ra);
         if (lossy && lossy_->route_tail_skip() > 0)   // each group of rows the tier places together
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
@@ -2522,6 +2523,57 @@ private:
         bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, stream_);
         gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
     }
+    // DIAG BASALT_HY4_ROUTER_CMP=1: a prompt chunk also runs the other router (fp32 or BF16 tensor cores) into scratch and
+    // counts the rows whose chosen expert set differs; the line is printed per chunk. Slow (a sync a layer); output unchanged.
+    static bool cmp_router() {
+        static const bool on = [] {
+            const char* v = std::getenv("BASALT_HY4_ROUTER_CMP");
+            return v && *v && *v != '0';
+        }();
+        return on;
+    }
+    int32_t* cmp_ids_ = nullptr;
+    float *cmp_rw_ = nullptr, *cmp_log_ = nullptr;
+    size_t cmp_rows_cap_ = 0;
+    long long cmp_rows_ = 0, cmp_changed_ = 0, cmp_experts_ = 0, cmp_top1_ = 0;
+    std::vector<int32_t> cmp_a_, cmp_b_;
+    void router_compare(int l, int R, const bk::RouterArgs& ra) {
+        const int K = ra.k;
+        if ((size_t) R > cmp_rows_cap_) {
+            cudaFree(cmp_ids_); cudaFree(cmp_rw_); cudaFree(cmp_log_);
+            cudaMalloc((void**) &cmp_ids_, (size_t) R * K * 4);
+            cudaMalloc((void**) &cmp_rw_, (size_t) R * K * 4);
+            cudaMalloc((void**) &cmp_log_, (size_t) R * ra.n_expert * 4);
+            cmp_rows_cap_ = (size_t) R;
+        }
+        if (tc_router()) {
+            bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, cmp_log_, cmp_ids_, cmp_rw_, stream_);
+        } else {
+            bk::router_logits_bf16x3(xn_, F(l, "ffn_gate_inp.weight"), R, ra.n_expert, ra.n_embd, cmp_log_, stream_);
+            bk::router_select(cmp_log_, F(l, "exp_probs_b.bias"), R, ra, cmp_ids_, cmp_rw_, stream_);
+        }
+        cmp_a_.resize((size_t) R * K);
+        cmp_b_.resize((size_t) R * K);
+        cudaMemcpyAsync(cmp_a_.data(), ids_, (size_t) R * K * 4, cudaMemcpyDeviceToHost, stream_);
+        cudaMemcpyAsync(cmp_b_.data(), cmp_ids_, (size_t) R * K * 4, cudaMemcpyDeviceToHost, stream_);
+        cudaStreamSynchronize(stream_);
+        for (int r = 0; r < R; ++r) {
+            int32_t* a = cmp_a_.data() + (size_t) r * K;
+            int32_t* b = cmp_b_.data() + (size_t) r * K;
+            const bool top1 = a[0] != b[0];
+            std::sort(a, a + K);
+            std::sort(b, b + K);
+            int same = 0;
+            for (int i = 0, j = 0; i < K && j < K;) {
+                if (a[i] == b[j]) { ++same; ++i; ++j; } else if (a[i] < b[j]) ++i; else ++j;
+            }
+            ++cmp_rows_;
+            cmp_experts_ += K - same;
+            if (same != K) ++cmp_changed_;
+            if (top1) ++cmp_top1_;
+        }
+    }
+
     void moe_tail(int l, int R) {
         gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, g_.n_latent, g_.n_embd, R);
         add_vectors(moe_out_, sh_, mlp_, R * g_.n_embd, stream_);
@@ -3345,6 +3397,12 @@ private:
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
         }
         tl_mark(kTlTail);
+        if (cmp_rows_ > 0) {
+            basalt::log::info("basalt hy4flash", "router cmp (%s used): %lld layer-rows, expert set changed in %lld (%.4f%%), %lld of %lld experts "
+                              "differ (%.4f%%), first id differs in %lld", tc_router() ? "tensor cores" : "fp32", cmp_rows_, cmp_changed_,
+                              100.0 * cmp_changed_ / cmp_rows_, cmp_experts_, cmp_rows_ * g_.n_used, 100.0 * cmp_experts_ / (cmp_rows_ * g_.n_used), cmp_top1_);
+            cmp_rows_ = cmp_changed_ = cmp_experts_ = cmp_top1_ = 0;
+        }
         if (!join_moe(err)) return false;
         if (tier_) tier_->pump(-1, core::ExpertTier::kAllPieces);
         if (head_rows > 0) {
