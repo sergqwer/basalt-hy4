@@ -532,6 +532,26 @@ __device__ __forceinline__ uint4 half8(const uint8_t*, uint4 v, int ch) {
     const __half2 s = __float2half2_rn(__uint_as_float(v.z));
     return make_uint4(e4m3x2_to_h2(v.x & 0xffffu, s), e4m3x2_to_h2(v.x >> 16, s), e4m3x2_to_h2(v.y & 0xffffu, s), e4m3x2_to_h2(v.y >> 16, s));
 }
+int g_i8_mma = -1;   // mla_set_i8_mma: -1 = HY4_I8_MMA decides
+// int8 rows (HY4_I8_MMA): chunks below 64 are eight codes then their group's fp32 scale (one per 128 values), the rest eight
+// fp16 rope values. A code times its scale is rounded to fp16 once, in fp32: the fp16 kernel then runs on the stored row.
+__device__ __forceinline__ uint4 fetch8(const int8_t* cache, size_t cell, int ch) {
+    const uint8_t* row = reinterpret_cast<const uint8_t*>(cache) + cell * kI8RowBytes;
+    if (ch < kI8Latent / 8) {
+        const uint2 c = *reinterpret_cast<const uint2*>(row + ch * 8);
+        return make_uint4(c.x, c.y, __float_as_uint(reinterpret_cast<const float*>(row + kI8ScaleOff)[ch >> 4]), 0);
+    }
+    return *reinterpret_cast<const uint4*>(row + kI8Latent + (ch - kI8Latent / 8) * 16);
+}
+__device__ __forceinline__ uint32_t i8x2_to_h2(uint32_t w, int sh, float s) {
+    const __half2 h = __floats2half2_rn((float) (int8_t) (w >> sh) * s, (float) (int8_t) (w >> (sh + 8)) * s);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+__device__ __forceinline__ uint4 half8(const int8_t*, uint4 v, int ch) {
+    if (ch >= kI8Latent / 8) return v;
+    const float s = __uint_as_float(v.z);
+    return make_uint4(i8x2_to_h2(v.x, 0, s), i8x2_to_h2(v.x, 16, s), i8x2_to_h2(v.y, 0, s), i8x2_to_h2(v.y, 16, s));
+}
 
 // G groups of 16 heads a block share each tile of cells (the cells are the row's for every head: one load, one conversion);
 // every output element sums its products in the same order whatever G is, so the groups only change how the work is shared.
@@ -1026,6 +1046,26 @@ void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok
     if (a.rank != mqa::kLatent || a.rope != 64 || a.heads % 8) throw std::invalid_argument("mla_attend: a 512 + 64 row and heads in eights");
     cudaStream_t st = (cudaStream_t) stream;
     if constexpr (std::is_same_v<C, int8_t>) {
+        // HY4_I8_MMA: a chunk of rows on the fp16 kernel, each tile dequantized as it lands in shared memory (no query split)
+        static const bool env_on = [] { const char* e = std::getenv("HY4_I8_MMA"); return e && *e && *e != '0'; }();
+        const bool f16_math = g_i8_mma >= 0 ? g_i8_mma > 0 : env_on;
+        if (f16_math && n_tok > kAttTok && a.heads % 16 == 0) {
+            const int g = mma_groups(a.heads);
+            static bool raised16[2] = {false, false};
+            if (!raised16[g - 1]) {
+                if (g == 2) cudaFuncSetAttribute(attend_mma_kernel<int8_t, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<2>());
+                else cudaFuncSetAttribute(attend_mma_kernel<int8_t, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<1>());
+                raised16[g - 1] = true;
+            }
+            if (g == 2)
+                attend_mma_kernel<int8_t, 2><<<dim3(a.heads / 32, n_tok), 256, mma_smem<2>(), st>>>(qcur, cache, r.firsts, r.counts, r.cells,
+                                                                                                  r.cells_stride, r.fill, sinks, a, ring, o_lat);
+            else
+                attend_mma_kernel<int8_t, 1><<<dim3(a.heads / 16, n_tok), 256, mma_smem<1>(), st>>>(qcur, cache, r.firsts, r.counts, r.cells,
+                                                                                                  r.cells_stride, r.fill, sinks, a, ring, o_lat);
+            if (!stream) cudaStreamSynchronize(nullptr);
+            return;
+        }
         if (n_tok > kAttTok && a.heads % 32 == 0) {   // a chunk of rows on int8 tensor cores
             static bool raised = false;
             if (!raised) {
@@ -1138,6 +1178,8 @@ void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const 
                  int n_tok, int ring, float* qcur, uint16_t* cache, void* stream) {
     prepare_impl(q, q_abs, kv_raw, kv_norm, a, pos0, n_tok, ring, qcur, cache, stream);
 }
+void mla_set_i8_mma(int on) { g_i8_mma = on; }
+
 void mla_attend(const float* qcur, const float* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 int max_cells, void* work, float* o_lat, void* stream) {
     attend_impl(qcur, cache, r, n_tok, sinks, a, ring, max_cells, work, o_lat, stream);

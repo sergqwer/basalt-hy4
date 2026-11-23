@@ -1349,6 +1349,12 @@ void test_i8_chunk() {
             win.insert(win.end(), w1.begin(), w1.end());
         }
         report(use_cells ? "mla_attend int8 chunk, cells" : "mla_attend int8 chunk, spans", got, ref, 1e-3);
+        {   // the same rows on the fp16 kernel (HY4_I8_MMA): each tile dequantized to fp16, the query fp16
+            mla_set_i8_mma(1);
+            mla_attend(dqcur, dc, rs, T, ds, a, 0, N, work, dlat, nullptr);
+            mla_set_i8_mma(-1);
+            report(use_cells ? "  int8 rows, fp16 math, cells" : "  int8 rows, fp16 math, spans", host(dlat, got.size()), ref, 1e-3);
+        }
         {   // the pre-rounded query (mla_prepare_i8q / mla_attend_i8q): the same bits, and the same cache rows
             void* qp = nullptr;
             int8_t* dc2 = nullptr;

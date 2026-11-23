@@ -65,6 +65,8 @@ struct RowSpans {
     const int32_t* fill = nullptr;
 };
 
+/// The int8 prompt attention on the fp16 kernel (1), on int8 tensor cores (0), or as HY4_I8_MMA says (-1, the default). Tests.
+void mla_set_i8_mma(int on);
 /// o_lat[t][h][c] = sum_j softmax_j(scale * qcur[t][h] . cache[cell_j]) * cache[cell_j][c] for c < rank, j < counts[t], where the
 /// softmax's denominator also holds exp(sinks[h]). cache [cells][rank + rope], rank 512 and rope 64; counts <= max_cells. Up to 8
 /// rows a launch, a block per 64 cells and 8 or 16 heads (all heads read a cell once), the chunks merged by the last block of a row's

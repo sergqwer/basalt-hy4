@@ -1282,6 +1282,8 @@ private:
     bool i8() const { return m_.cache_i8(); }
     /// HY4_Q_DIRECT=1: a chunk's k_b product writes the query rows' latent part straight into qcur_ (no q_abs buffer, no copy);
     /// with --kv int8 the chunk then reads the f32 query rows (attend_i8_kernel<false>) instead of packed ones.
+    // HY4_I8_MMA: a prompt chunk's int8 attention on the fp16 kernel (tiles dequantized in shared memory, the query fp32 rows)
+    static bool i8_mma() { static const bool on = [] { const char* e = std::getenv("HY4_I8_MMA"); return e && *e && *e != '0'; }(); return on; }
     static bool qdirect() { static const bool on = std::getenv("HY4_Q_DIRECT") != nullptr; return on; }
     bool f32() const { return m_.cache_f32(); }
     int elem() const { return f32() ? 4 : 2; }
@@ -1629,7 +1631,13 @@ private:
                 else mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
             } else {
             heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
-            if (i8r) mla_prepare_i8q(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);   // qcur_: packed int8 rows
+            if (i8r && !i8_mma()) mla_prepare_i8q(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);   // qcur_: packed int8 rows
+            else if (i8r) {   // HY4_I8_MMA: fp32 query rows
+                static bool said = false;
+                if (!said) basalt::log::info("basalt hy4flash", "attend path: int8 rows on the fp16 kernel (HY4_I8_MMA)");
+                said = true;
+                mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);
+            }
             else if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
             else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
             else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
@@ -1690,7 +1698,7 @@ private:
                 if (!swa && sg.s->bk_cells_.d)   // HY4_BOUNDS_CHECK: every cell in [0, backed)
                     core::bounds::check_cells(rs.firsts, const_cast<int32_t*>(rs.counts), const_cast<int32_t*>(rs.cells), rs.cells_stride, rs.fill,
                                               sg.rows, sg.s->bk_cells_.d, core::bounds::kAttendCells, l, stream_);
-                if (i8r && R > kMaxWindow && !qdirect()) mla_attend_i8q(qcur_ + (size_t) sg.row0 * H * kI8QRowBytes / 4, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, ol, stream_);
+                if (i8r && R > kMaxWindow && !qdirect() && !i8_mma()) mla_attend_i8q(qcur_ + (size_t) sg.row0 * H * kI8QRowBytes / 4, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, ol, stream_);
                 else if (i8r) mla_attend(qc, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else if (f32()) mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
