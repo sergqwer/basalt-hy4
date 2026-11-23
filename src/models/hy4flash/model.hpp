@@ -22,7 +22,10 @@ struct DevTensor {
     int type = 0;
     uint64_t bytes = 0;
     std::vector<uint64_t> shape;
+    const float* scale = nullptr;   ///< NVFP4 planes (type 45): the matrix's FP32 scale, tensor `<name>.scale` (device)
 };
+/// ggml-style type of a dense NVFP4 matrix in planes (kernels/nvfp4_planes.hpp): read by wgemm (decode) and fp4_dense (prompt)
+constexpr int kTypeNvfp4Planes = 45;
 
 /// The second cards whose expert tiers a start uses; later cards idle.
 constexpr int kMaxSecondCards = 3;
@@ -44,6 +47,8 @@ public:
     /// Device tensor `blk.<layer>.<suffix>` or a global name; null when absent.
     const DevTensor* tensor(const std::string& name) const;
     const DevTensor* tensor(int layer, const char* suffix) const { return tensor("blk." + std::to_string(layer) + "." + suffix); }
+    /// The dense NVFP4 planes matrices (type 45): [K, rows] shapes, for the decode products' workspace.
+    std::vector<const DevTensor*> planes_tensors() const;
     /// One token-embedding row, dequantised into `out` (n_embd floats).
     bool embedding_row(int32_t token, float* out) const;
     ngram::PleReader& engram_reader() const { return *engram_; }
@@ -100,6 +105,7 @@ private:
     std::unique_ptr<ngram::PleReader> engram_;
     int device_ = 0, fd_ = -1;
     bool fp8_ = false, f32_ = false;
+    bool embd_bf16_ = false;   // token_embd stored BF16 (else Q8_0)
     int diag_rows_ = 0;
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DflyWeights> dfly_;   // DFLY HOOK
