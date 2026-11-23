@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -63,6 +64,10 @@ public:
     /// The longest stored prefix of `prompt` (live tokens or a checkpoint, with the same pictures and control-vector
     /// state), at most prompt.size() - 1 tokens; tokens == 0 when there is none.
     Match best(const int32_t* prompt, size_t n, const std::vector<ConversationImageKey>& images, bool cvec) const;
+
+    /// Each stored conversation's held ids without pictures (its live tokens, cut at each checkpoint too) of
+    /// control-vector state `cvec`: `f(ids, n)` runs under the store's lock, so it copies what it keeps.
+    void each_held(bool cvec, const std::function<void(const int32_t*, int64_t)>& f) const;
 
     /// Bytes `load` allocates for `m` (the RAM admission's figure).
     uint64_t load_bytes(const Match& m) const;

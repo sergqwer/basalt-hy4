@@ -180,7 +180,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
             }
             embd_bf16_ = t.type == kTypeBF16;   // BF16 rows (an option): widened exactly, no rounding
             // BASALT_HY4_EMBD_BF16=FILE (a measurement knob): the table as BF16 rows [vocab][n_embd] from a raw file instead
-            // of the pack's, e.g. the checkpoint's model.embed_tokens.weight; +0.35 GB of host RAM against Q8_0
+            // of the pack's, e.g. the checkpoint's model.embed_tokens.weight; +0.35 GB of host RAM against Q8_0; measured no KLD gain (docs/precision/hy4-flash.md)
             if (const char* side = std::getenv("BASALT_HY4_EMBD_BF16"); side != nullptr && *side != '\0') {
                 const uint64_t want = (uint64_t) g.n_vocab * (uint64_t) g.n_embd * 2;
                 uint64_t have = 0;

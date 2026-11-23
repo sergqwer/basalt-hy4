@@ -73,6 +73,7 @@ A decode row's arithmetic does not depend on how many rows share its window.
   prompt or an image.
 - **Pinned for checks.** Identity checks pin the tiers (`--diag-tier-frozen`).
 - **Clamped SwiGLU** on the routed experts (limit 10), not on the shared expert.
+- **Token embedding.** The pack's Q8_0 rows are dequantized on the card, bit-identical to the host path. `BASALT_HY4_EMBD_BF16=FILE` (opt-in, +0.35 GB host RAM) reads BF16 rows instead: the 100-chunk quality set against BF16 (2026-11-23), KLD 0.2093 / top-1 86.29% vs Q8_0 0.2035 / 86.16%, paired BF16 minus Q8_0 +0.0058 +- 0.0065 (95% CI): no gain.
 
 ## Prompt path
 
