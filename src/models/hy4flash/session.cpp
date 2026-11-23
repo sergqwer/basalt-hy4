@@ -2572,8 +2572,9 @@ private:
         bk::native_quantize_q8_1(xlat_ + (size_t) g0 * L, ex_xq_, L, G, stream_);
     }
 
-    // The published ids have landed (the stream goes on meanwhile); a launch that failed never writes them.
-    bool await_ids(std::string& err) {
+    // The published ids have landed (the stream goes on meanwhile); a launch that failed never writes them, so a word that
+    // stays stale names the stream's error (a fault earlier in the step is sticky), the layer, the group and the wait.
+    bool await_ids(int l, int g0, std::string& err) {
         const volatile uint32_t* seq = h_words_;
         for (int s = 0; s < (1 << 22); ++s) {
             if (*seq == seq_want_) {
@@ -2582,10 +2583,19 @@ private:
             }
             platform::cpu_relax();
         }
-        cudaStreamSynchronize(stream_);
-        if (*seq == seq_want_) return true;
-        err = "the router's ids did not arrive";
-        seq_want_ = *seq;
+        const double t0 = now_ms();
+        const cudaError_t se = cudaStreamSynchronize(stream_);
+        const cudaError_t le = cudaGetLastError();
+        const uint32_t have = *seq;
+        if (have == seq_want_ && se == cudaSuccess && le == cudaSuccess) return true;
+        char buf[400];
+        std::snprintf(buf, sizeof buf, "the router's ids did not arrive (layer %d, rows %d.., word %u of %u wanted, the stream drained in %.0f ms: %s; "
+                      "last error: %s)", l, g0, have, seq_want_, now_ms() - t0, cudaGetErrorString(se), cudaGetErrorString(le));
+        if (have == seq_want_) std::snprintf(buf, sizeof buf, "the router's ids arrived but the card failed (layer %d, rows %d..): %s; last error: %s",
+                                                           l, g0, cudaGetErrorString(se), cudaGetErrorString(le));
+        err = buf;
+        basalt::log::error("basalt hy4flash", "%s", buf);
+        seq_want_ = have;
         return false;
     }
 
@@ -2644,7 +2654,7 @@ private:
             pd.peer = peer;
         }
         tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
-        if (!await_ids(err)) return false;
+        if (!await_ids(l, g0, err)) return false;
         int32_t uniq[kLookupK];
         int uidx[kLookupK], nu = 0;
         core::ExpertTier::Use* use = pd.use;
