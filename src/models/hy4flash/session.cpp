@@ -2276,12 +2276,12 @@ private:
     // The routed experts of a prompt chunk, by expert: each used expert's blob is staged on the card (a copy from its slot, its
     // pinned RAM or the second card), its rows (the pairs routed to it, with their activations quantised for MMQ) go through the
     // gate/up product, the clamped SwiGLU and the down product, and a pair's output row is kept for the weighted sum.
-    // The prompt's NVFP4 experts run on the FP4 block-scaled tensor cores (moe_fp4, W4A4) unless BASALT_HY4_PROMPT_MMQ=1 keeps
-    // the int8 MMQ products. The gate/up input is rounded as two FP4 terms (about 8 bits; one term cost KLD +0.022 against
-    // MMQ, two +0.004): BASALT_HY4_FP4_TWO=0 one term, =all H too.
+    // BASALT_HY4_PROMPT_FP4=1 (opt-in until its long-prompt KLD is shown): the prompt's NVFP4 experts on the FP4 block-scaled
+    // tensor cores (moe_fp4, W4A4) instead of the int8 MMQ products. The gate/up input is rounded as two FP4 terms (about 8
+    // bits; one term cost KLD +0.022 against MMQ, two +0.004): BASALT_HY4_FP4_TWO=0 one term, =all H too.
     bool fp4_experts() const {
-        static const bool off = [] { const char* v = std::getenv("BASALT_HY4_PROMPT_MMQ"); return v && *v && *v != '0'; }();
-        if (off) return false;
+        static const bool on = [] { const char* v = std::getenv("BASALT_HY4_PROMPT_FP4"); return v && *v && *v != '0'; }();
+        if (!on) return false;
         for (const ExpertLayer& el : m_.pack().experts)
             if (el.gu_type == kTypeNvfp4 && el.d_type == kTypeNvfp4) return true;
         return false;
