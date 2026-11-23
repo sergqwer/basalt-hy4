@@ -15,6 +15,7 @@ pub mod modelfile;
 pub mod process;
 pub mod progress;
 pub mod py;
+pub mod read_clock;
 pub mod pyfmt;
 pub mod slots;
 pub mod suspend;
