@@ -22,6 +22,8 @@ PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})
+# a model entry's keys for the launcher (basalt serve fetches a missing model: tools/get_model.py); the server skips them
+LAUNCHER_KEYS = frozenset({"hf", "download"})
 MODEL_OPTIONS = frozenset({
     "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
@@ -222,6 +224,8 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> ConfigFile:
         out = ModelEntry(str(here / os.path.expanduser(entry["model"])), list(shared_argv), list(shared_words))
         for key, value in entry.items():
             name = config_name(key)
+            if name in LAUNCHER_KEYS:
+                continue
             if name in ENTRY_OPTIONS or name in MODEL_OPTIONS:
                 out.argv += option_words(where, key, value, known[name], here)
             elif name in known:

@@ -15,6 +15,8 @@ pub const CONFIG_VERSION: i64 = 2;
 pub const PARALLEL_MAX: i64 = 8;
 pub const CONFIG_PATHS: [&str; 3] = ["model", "tokenizer", "image-dir"];
 pub const ENTRY_OPTIONS: [&str; 2] = ["model", "alias"];
+/// A model entry's keys for the launcher (basalt serve fetches a missing model: tools/get_model.py); the server skips them.
+pub const LAUNCHER_KEYS: [&str; 2] = ["hf", "download"];
 pub const MODEL_OPTIONS: [&str; 24] = [
     "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature",
@@ -675,6 +677,9 @@ fn load_config_file(path: &str, ap: &Parser) -> Result<ConfigFile, String> {
         let mut out = ModelEntry { path: join_path(&here, &model), argv: shared_argv.clone(), shared_words: shared_words.clone(), own_words: vec![] };
         for (key, value) in entry {
             let name = config_name(key);
+            if LAUNCHER_KEYS.contains(&name.as_str()) {
+                continue;
+            }
             if ENTRY_OPTIONS.contains(&name.as_str()) || MODEL_OPTIONS.contains(&name.as_str()) {
                 out.argv.extend(option_words(&where_, key, value, find(&name).unwrap(), &here)?);
             } else if find(&name).is_some() {
@@ -965,6 +970,16 @@ mod tests {
         assert_eq!(slot_share(1000, 8), 256);
         assert_eq!(split_engine_extras(&w(&["--a=1", "b"])).unwrap(), w(&["--a", "1", "b"]));
         assert!(split_engine_extras(&w(&["x"])).is_err());
+    }
+    #[test]
+    fn launcher_keys_are_not_engine_flags() {
+        let dir = std::env::temp_dir().join(format!("basalt-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.json");
+        std::fs::write(&p, r#"{"version": 2, "models": [{"model": "a.basalt", "hf": "o/r/a.basalt", "download": false, "kv": "int8"}]}"#).unwrap();
+        let cfg = load_config_file(p.to_str().unwrap(), &build_parser()).unwrap();
+        assert_eq!(cfg.models[0].own_words, w(&["--kv", "int8"]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn parse_basics() {

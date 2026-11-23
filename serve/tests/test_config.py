@@ -169,6 +169,11 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(bfile, ["--kv", "int8", "--pool-workers", "8", "--route-prior", "1"])
         self.assertEqual(b.skipped, ["--spec"])
 
+    def test_launcher_keys_are_not_engine_flags(self):
+        p = conf({"models": [{"model": "a.basalt", "hf": "o/r/a.basalt", "download": False, "kv": "int8"}]})
+        (_, _, afile, _), = model_settings(build_parser(), ["--config", p])
+        self.assertEqual(afile, ["--kv", "int8"])
+
     def test_model_and_alias_do_not_go_with_a_config(self):
         p = conf({"models": [{"model": "a.basalt"}]})
         for extra, text in ((["--model", "b.basalt"], "^--model is not supported when using a config file$"),

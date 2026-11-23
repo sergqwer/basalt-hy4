@@ -47,6 +47,16 @@ class ServeLauncher(unittest.TestCase):
         self.assertEqual(self.served("--max-context", "4096", "--parallel", "4", "--config", "c.json"),
                          ["--max-context", "4096", "--parallel", "4", "--config", str(self.dir / "c.json")])
 
+    def test_no_download_passes_a_missing_model_through(self):
+        self.assertEqual(self.served("missing/Hy4-flash-NVFP4-GPTQ.basalt", "--no-download"),
+                         ["--model", str(self.dir / "missing" / "Hy4-flash-NVFP4-GPTQ.basalt")])
+
+    def test_missing_model_without_source_stops_before_the_server(self):
+        r = subprocess.run([str(ENGINE), "serve", "mine.basalt"], capture_output=True, text=True, cwd=self.dir)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("no known source", r.stderr)
+        self.assertFalse(self.out.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

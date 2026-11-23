@@ -33,8 +33,8 @@ git clone https://github.com/sergqwer/basalt-hy4 && cd basalt-hy4
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
                                         # Windows: add -G Ninja to the first line, from an x64 VS 2022 prompt ([platforms](docs/platforms.md#building-on-windows))
-pip install -r requirements.txt
-hf download jesdga/Hy4-flash-Basalt Hy4-flash-NVFP4.basalt --local-dir models
+pip install -r requirements.txt huggingface_hub hf_xet   # huggingface_hub: the model download (optional, faster)
+bin/basalt download --dir models        # the GPTQ pack, 158.7 GB, checked against the repo's sha256 (optional: serve fetches it too)
 ```
 
 Put the settings in `basalt_config.json`:
@@ -42,7 +42,7 @@ Put the settings in `basalt_config.json`:
 ```json
 {
   "version": 2,
-  "models": [{ "model": "models/Hy4-flash-NVFP4.basalt", "gpu": "0,1" }],
+  "models": [{ "model": "models/Hy4-flash-NVFP4-GPTQ.basalt", "gpu": "0,1" }],
   "server": { "port": 8080 }
 }
 ```
@@ -51,6 +51,11 @@ Put the settings in `basalt_config.json`:
 bin/basalt serve --config basalt_config.json
 ```
 
+When the model file is missing, `basalt serve` fetches it from Hugging Face first: a known pack name needs nothing
+more, any other file names its source in its entry (`"hf": "OWNER/REPO/FILE"`). The download resumes after a failure,
+refuses to start without the disk room, and is checked against the repo's size and sha256 before it gets its name.
+`--no-download` or `"download": false` in the entry turns it off. [Configuration](docs/configuration/index.md#model-and-gpus).
+
 The server listens on 127.0.0.1. Every setting: [configuration](docs/configuration/index.md). More examples:
 [example configurations](docs/configuration/examples.md).
 
@@ -58,7 +63,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 
 | | Hy4-flash |
 |---|---|
-| Pack | `Hy4-flash-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt) |
+| Pack | `Hy4-flash-NVFP4-GPTQ` (default), [Hugging Face](https://huggingface.co/Maximilian228/Hy4-flash-NVFP4-GPTQ-Basalt); round-to-nearest `Hy4-flash-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt) |
 | Context | up to 1,048,576 |
 | Drafting | DFly2, on by default |
 | Images | yes |

@@ -86,6 +86,8 @@ Command line `--name`; the Where column says which config block takes it.
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
 | `gpu` | entry, `basalt`, `basalt-bench`, `basalt-probe` | `"0"`, `"0,1"`, `"auto"` | GPU 0 alone | Cards, numbered as `nvidia-smi`. The first is the main card. `auto` takes every Blackwell card and makes the fastest main. [GPUs](gpus.md) |
+| `hf` | entry | `"OWNER/REPO/FILE"` | known pack names: their repo | Where `basalt serve` fetches the entry's model file when it is missing (`tools/get_model.py`). `Hy4-flash-NVFP4-GPTQ.basalt` and `Hy4-flash-NVFP4.basalt` need none. |
+| `download` | entry; `--no-download` on `basalt serve` | true, false | true | false: a missing model file is an error, not a download. |
 | `peer-reserve-mib` | engine | MiB | 600 | VRAM the second card keeps free after its experts and prompt buffers. Raise it when another program uses the second card's VRAM. [GPUs](gpus.md#two-16-gb-cards) |
 
 ## Context and KV cache

@@ -5,20 +5,46 @@ Tencent's Hy4-flash (`tencent/Hy4-flash`). Runs with the same command as any mod
 
 ## Pack
 
-One file, `Hy4-flash-NVFP4.basalt` (158.7 GB), built from Tencent's BF16 checkpoint (Tencent Hy License 1.0) with the vision
-projector and the DFly2 drafter:
+Two packs of the same format and size (158.7 GB), built from Tencent's BF16 checkpoint (Tencent Hy License 1.0) with the
+vision projector and the DFly2 drafter. They differ only in how the routed experts were rounded to NVFP4:
 
-- Routed experts: NVFP4, rounded once from BF16 (83.6 GB).
+| Pack | Routed experts | Repo |
+| --- | --- | --- |
+| `Hy4-flash-NVFP4-GPTQ.basalt` (**default**) | GPTQ from BF16, calibrated on agentic coding, function calling, code and five languages | [Maximilian228/Hy4-flash-NVFP4-GPTQ-Basalt](https://huggingface.co/Maximilian228/Hy4-flash-NVFP4-GPTQ-Basalt) |
+| `Hy4-flash-NVFP4.basalt` | rounded once (round-to-nearest) | [jesdga/Hy4-flash-Basalt](https://huggingface.co/jesdga/Hy4-flash-Basalt) |
+
+Everything else is byte-identical in the two:
+
 - Attention, latent, shared-expert, dense-FFN, Engram and indexer projections and the token embedding: Q8_0 of the BF16 values.
 - Output head: BF16 in the file; the engine rounds it to Q8_0 as it loads. Norms, hyper-connections, router and biases: F32,
   as stored.
 - Engram table: E4M3 codes, one byte per value, rounded once from BF16 (63.4 GB). It stays in the file and is read by row.
 - Vision projector (BF16, 1.0 GB) and the drafter (BF16 in the file, 1.7 GB), whole.
 
-Download it from [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt)
-(`hf download jesdga/Hy4-flash-Basalt Hy4-flash-NVFP4.basalt --local-dir models`), or build the same file yourself:
-[model file](../model-file.md#hy4-flash-nvfp4-pack). A test pack from AngelSlim's Q4_K_M GGUF converts too
-([model file](../model-file.md#hy4-flash-test-pack)).
+Quality from the GPTQ pack's card: `basalt-bench --quality`, 100 chunks of wikitext-2 (25,500 scored rows) through the
+decode path against the llama.cpp BF16 reference (PPL 18.572), the expert cache frozen, both packs on the same machine and
+night; intervals are 95% paired bootstrap over chunks.
+
+| Pack | KLD mean | KLD median | KLD p99 | Same top-1 | PPL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| round-to-nearest | 0.2048 | 0.0319 | 3.19 | 85.73% | 17.43 |
+| **GPTQ** | **0.1770** | **0.0282** | **2.71** | **86.83%** | 18.99 |
+
+GPTQ minus round-to-nearest: KLD -0.0278 [-0.0370, -0.0192], same top-1 +1.09 pp [+0.66, +1.52]; a noise arm (the
+round-to-nearest pack against itself with another expert placement) moves KLD by +0.0012 [-0.0070, +0.0094]. Both run at
+the same speed.
+
+**Getting it.** `basalt serve` fetches a missing pack by itself: a config entry naming `models/Hy4-flash-NVFP4-GPTQ.basalt`
+(or `Hy4-flash-NVFP4.basalt`) needs nothing more. To fetch it ahead: `bin/basalt download --dir models` (the GPTQ pack) or
+`bin/basalt download Hy4-flash-NVFP4.basalt --dir models`. The download goes into `models/.basalt-download` first, resumes
+after a failure (up to 8 attempts with backoff), refuses to start without the room (the file plus 5 GiB), and the file
+gets its name only after its size and sha256 match the repo's. With `pip install huggingface_hub hf_xet` it uses the
+Hugging Face client (Xet, `HF_XET_HIGH_PERFORMANCE=1`); otherwise plain HTTPS. `--no-download` on `basalt serve`, or
+`"download": false` in the entry, turns it off. `hf download Maximilian228/Hy4-flash-NVFP4-GPTQ-Basalt
+Hy4-flash-NVFP4-GPTQ.basalt --local-dir models` works too.
+
+To build the round-to-nearest file yourself: [model file](../model-file.md#hy4-flash-nvfp4-pack). A test pack from
+AngelSlim's Q4_K_M GGUF converts too ([model file](../model-file.md#hy4-flash-test-pack)).
 
 ## Architecture
 
