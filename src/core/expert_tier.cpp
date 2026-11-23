@@ -1478,6 +1478,14 @@ bool ExpertTier::reopen_base(int64_t n, std::string& err) {
     return true;
 }
 
+namespace {
+bool arena_vmm() {
+    static const bool on = [] { const char* e = std::getenv("BASALT_ARENA_VMM"); return e && *e && *e != '0' && core::vmm::supported(); }();
+    return on;
+}
+int64_t arena_vmm_segment() { return 512ll << 20; }
+}  // namespace
+
 bool ExpertTier::open_base(int64_t per_layer, std::string& err) {
     set_base(per_layer);
     const int64_t nb = base_slots();
@@ -1504,11 +1512,14 @@ bool ExpertTier::open_base(int64_t per_layer, std::string& err) {
     }
     std::vector<int64_t> slot_bytes;
     for (int32_t s : order) slot_bytes.push_back((int64_t) s_.layers[(size_t) layer_of[(size_t) s]].blob_bytes);
-    cache_.set_segment_bytes(seg ? (int64_t) s_.lend_segment : 0);
+    // BASALT_ARENA_VMM=1: the arena is one VMM range in every mode (a plain cudaMalloc arena is slower and erratic under WDDM);
+    // without a partial lend its segments only keep it in one range
+    cache_.set_segment_bytes(seg ? (int64_t) s_.lend_segment : arena_vmm() ? arena_vmm_segment() : 0);
     if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) {
         phys_.clear();
         return false;
     }
+    basalt::log::info(s_.area.c_str(), "VRAM expert tier arena: %s", cache_.segmented() ? (seg ? "one VMM range, lent in segments" : "one VMM range") : "one cudaMalloc");
     if (seg) count_live();
     return true;
 }
@@ -1723,6 +1734,7 @@ void ExpertTier::grow() {
     for (int l = 0; l < n_layers_; ++l)
         for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
     std::string err;
+    ext_.set_segment_bytes(arena_vmm() ? arena_vmm_segment() : 0);
     if (!ext_.open_sized(slot_bytes, n_layers_, n_expert_, err)) {
         basalt::log::warn(s_.area.c_str(), "VRAM expert tier cannot take back its %lld slots per layer beside the prompt workspaces: %s",
                           (long long) n, err.c_str());

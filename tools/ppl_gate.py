@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import struct
 import subprocess
 import sys
@@ -107,9 +108,10 @@ def set_args(args: list[str], extra: list[str]) -> list[str]:
 
 def run(a) -> int:
     n_ctx, n_vocab, n_chunk, chunks = read_base(a.base)
-    first = n_ctx // 2
-    args = ["--model", str(Path(a.model).resolve()), "--spec", "5",
-            "--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--max-context", "4096"]
+    first = int(os.environ.get("BASALT_PPL_FIRST", "0")) or n_ctx // 2   # the engine reads the same variable
+    args = ["--model", str(Path(a.model).resolve()), "--spec", "5", "--max-context", "4096"]
+    if not a.no_adapt_flags:   # a model whose tier has no adaptive swaps (hy4flash) rejects these
+        args += ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
     if gpu_count() > 1:
         args += ["--gpu", "0,1"]
     args = set_args(args, a.engine_args + ["--ppl-base", str(Path(a.base).resolve())])
@@ -134,11 +136,12 @@ def run(a) -> int:
         t_load = time.time() - t0
         hits = look = off = 0
         pp_ms = dec_ms = 0.0
-        nc = min(a.chunks, n_chunk) if a.chunks > 0 else n_chunk
+        nc = min(a.chunks, n_chunk - a.skip) if a.chunks > 0 else n_chunk - a.skip
         t1 = time.time()
-        for k in range(nc):
+        for k in range(a.skip, a.skip + nc):
             ids = ",".join(str(t) for t in chunks[k][:first + 1])
-            eng.stdin.write(f"GEN {n_ctx - 1 - first} ppl={k} ppl_t={a.t} {ids}\n")
+            n_gen = n_ctx - 1 - first if a.rows <= 0 else min(a.rows, n_ctx - 1 - first)
+            eng.stdin.write(f"GEN {n_gen} ppl={k} ppl_t={a.t} {ids}\n")
             eng.stdin.flush()
             for line in eng.stdout:
                 if line.startswith("ERR"):
@@ -187,6 +190,9 @@ def main() -> int:
     ap.add_argument("--out")
     ap.add_argument("--chunks", type=int, default=0, help="the first N chunks (0: all)")
     ap.add_argument("--t", type=int, default=3, help="tokens per verify window")
+    ap.add_argument("--rows", type=int, default=0, help="score only the first N rows of each chunk's second half (0: all)")
+    ap.add_argument("--no-adapt-flags", action="store_true", help="leave out --adapt-swaps / --peer-adapt-swaps")
+    ap.add_argument("--skip", type=int, default=0, help="start at chunk K (a run of a few chunks; join the rows.tsv files for --report)")
     ap.add_argument("--progress", type=int, default=10, help="a progress line every N chunks (0: none)")
     ap.add_argument("--report", help="print the summary of an existing rows.tsv and exit")
     ap.add_argument("--diff", nargs=2, metavar=("A", "B"), help="compare two rows.tsv files row by row and exit")

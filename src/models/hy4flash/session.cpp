@@ -15,6 +15,7 @@
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/core/ram_load.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -48,6 +49,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -274,11 +276,12 @@ public:
         pea_.resize((size_t) g_.n_layers);
         for (int l = 0; ok && l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) {
-                cache_[(size_t) l] = (uint8_t*) alloc((size_t) swa_ring() * kRowWidth * elem(), ok);
+                cache_[(size_t) l] = (uint8_t*) alloc(ring_bytes(), ok);
             } else {
                 ea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 pea_[(size_t) l] = std::make_unique<core::ElasticArray>();
-                if (!ea_[(size_t) l]->open((uint64_t) ctx * sparse_row_bytes(), err) || !pea_[(size_t) l]->open((uint64_t) pools * g_.idx_dim * 2, err)) return false;
+                if (!ea_[(size_t) l]->open((uint64_t) ctx * sparse_row_bytes(), err) || !pea_[(size_t) l]->open((uint64_t) pools * pool_row_bytes(), err)) return false;
+                if (kv_stream()) ea_[(size_t) l]->set_piece(kStreamPiece);   // KV streaming moves the caches a piece at a time
                 cache_[(size_t) l] = ea_[(size_t) l]->data();
                 ipool_[(size_t) l] = (uint16_t*) pea_[(size_t) l]->data();
                 ival_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
@@ -294,9 +297,10 @@ public:
             bk_pools_.open();
         }
         if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
+        stream_report("start");
         use(sc_->dec);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
-        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
+        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err, i8()))
             return false;
         dfly_.bounds(bk_cells_.d, bk_cells_.h);
         dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
@@ -444,7 +448,7 @@ public:
         b.e = f((int64_t) R * E); b.cur = f((int64_t) R * E); b.xn = f((int64_t) R * E); b.attn = f((int64_t) R * E);
         b.attn_raw = f((int64_t) A * E); b.mlp = f((int64_t) R * E); b.mlp2 = f((int64_t) R * E);
         b.qa = f((int64_t) A * g_.q_lora); b.qan = f((int64_t) A * g_.q_lora); b.q = f((int64_t) A * max_heads_ * g_.qk_dim);
-        b.kvraw = f((int64_t) A * kRowWidth); b.qabs = f((int64_t) A * max_heads_ * g_.kv_lora);
+        b.kvraw = f((int64_t) A * kRowWidth); b.qabs = qdirect() ? nullptr : f((int64_t) A * max_heads_ * g_.kv_lora);
         b.qcur = f((int64_t) A * max_heads_ * kRowWidth); b.olat = f((int64_t) A * max_heads_ * g_.kv_lora);
         b.vout = f((int64_t) A * max_heads_ * g_.v_dim); b.gate = f((int64_t) A * max_heads_ * g_.v_dim);
         b.ik = f((int64_t) A * g_.idx_dim); b.ikn = f((int64_t) A * g_.idx_dim); b.ivt = f((int64_t) A * g_.idx_dim);
@@ -612,6 +616,7 @@ public:
         use(sc_->dec);
         ring_close();
         big_.release();
+        stream_out("the prompt's end");
         if (tier_) {
             std::string e;
             if (lent_ && !tier_->reclaim(e, /*restore=*/true)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
@@ -823,6 +828,7 @@ public:
                                                       std::to_string(ceiling) + " fit; --kv fp8 halves a position's bytes)"};
             }
         }
+        if (!big_.rows && kv_stream() && std::max(r.total_tokens, r.n_tokens) > stream_rows()) stream_in();
         if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
         if (tier_) { turn_h0_ = tier_->hits(); turn_l0_ = tier_->lookups(); }
         const int chunk = m_.diag_rows() > 0 ? std::min(rows_, m_.diag_rows()) : rows_;
@@ -914,12 +920,140 @@ public:
     // positions at start; more come out of the expert tier when a prompt or a generation needs them (ensure_positions), and a
     // later prompt that needs fewer gives them back (trim_positions), so a short conversation decodes with the larger tier.
     bool elastic() const { return m_.context() > core::kElasticKvBase; }
+
+    // ---- KV streaming (HY4_KV_STREAM=1, opt-in; one card, an elastic context): the sparse layers' rows outside a sink (the
+    // first piece) and the recent window (kStreamRecent positions) move from the card to CUDA-pinned host memory at the same
+    // addresses (ElasticArray::relocate), after a prompt and as a generation grows, and the expert tier takes the VRAM. Every
+    // kernel reads the same pointers, a row outside the card over the bus. A prompt of more than stream_rows() rows (HY4_KV_STREAM_ROWS,
+    // default 512) moves them back to the card first: its chunks read each row many times. The rows' bytes never change, so
+    // the output is the same as without streaming. HY4_KV_STREAM_CHECK=1 hashes every piece before and after its move.
+    static constexpr uint64_t kStreamPiece = 4ull << 20;
+    static constexpr int64_t kStreamRecent = 32768;
+    bool kv_stream() const {
+        static const bool on = [] {
+            const char* e = std::getenv("HY4_KV_STREAM");
+            return e && *e && *e != '0';
+        }();
+        int n = 0;
+        return on && elastic() && cudaGetDeviceCount(&n) == cudaSuccess && n == 1;
+    }
+    static int64_t stream_rows() {
+        static const int64_t v = [] { const char* e = std::getenv("HY4_KV_STREAM_ROWS"); return e ? std::atoll(e) : (int64_t) 512; }();
+        return v;
+    }
+    // the context a conversation reaches before its rows stream (HY4_KV_STREAM_FROM, default 262,144 positions)
+    static int64_t stream_from() {
+        static const int64_t v = [] { const char* e = std::getenv("HY4_KV_STREAM_FROM"); return e ? std::atoll(e) : (int64_t) 262144; }();
+        return v;
+    }
+    bool stream_engaged_ = false;
+    static bool stream_check() { static const bool on = std::getenv("HY4_KV_STREAM_CHECK") != nullptr; return on; }
+    uint64_t stream_host_bytes() const {
+        uint64_t n = 0;
+        for (int l = 0; l < g_.n_layers; ++l)
+            if (!g_.swa[(size_t) l] && ea_[(size_t) l]) n += ea_[(size_t) l]->host_bytes();
+        return n;
+    }
+    void stream_report(const char* when) {
+        if (!kv_stream()) return;
+        uint64_t allowance = 0;
+        std::string why;
+        const bool known = core::host_pin_budget(allowance, why);
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        basalt::log::info("basalt hy4flash", "KV streaming (%s): %.2f GiB of rows in RAM, %lld positions backed, host registration allowance left %s%s%s; "
+                          "expert tier %lld slots (%s arena), %.2f GiB VRAM free",
+                          when, stream_host_bytes() / 1073741824.0, (long long) backed_,
+                          known ? (std::to_string(allowance >> 20) + " MiB").c_str() : "unbounded", why.empty() ? "" : " - ", why.c_str(),
+                          tier_ ? (long long) tier_->slots() : 0LL, tier_ && tier_->partial_lend() ? "segmented VMM" : "unsegmented",
+                          free_b / 1073741824.0);
+    }
+    // The far pieces of every sparse layer to RAM; the tier takes the VRAM they leave.
+    void stream_out(const char* when) {
+        if (!kv_stream()) return;
+        const int64_t pos = (int64_t) hist_.size();
+        if (pos - kStreamRecent <= 0 || pos < stream_from()) return;
+        if (!stream_engaged_) {
+            stream_engaged_ = true;
+            basalt::log::info("basalt hy4flash", "KV streaming engages at %lld positions (HY4_KV_STREAM_FROM %lld)", (long long) pos, (long long) stream_from());
+        }
+        const uint64_t rb = (uint64_t) sparse_row_bytes(), to = (uint64_t) (pos - kStreamRecent) * rb / kStreamPiece * kStreamPiece;
+        if (to <= kStreamPiece) return;
+        uint64_t need = 0;
+        for (int l = 0; l < g_.n_layers; ++l)
+            if (!g_.swa[(size_t) l]) need += ea_[(size_t) l]->device_bytes_in(kStreamPiece, to);
+        if (need == 0) return;
+        uint64_t allowance = 0;
+        std::string why;
+        if (core::host_pin_budget(allowance, why) && need + (1ull << 30) > allowance) {
+            basalt::log::warn("basalt hy4flash", "KV streaming: %.2f GiB more rows would pass the host registration allowance (%lld MiB left%s%s); they stay on the card",
+                              need / 1073741824.0, (long long) (allowance >> 20), why.empty() ? "" : ": ", why.c_str());
+            return;
+        }
+        ring_join();
+        if (copy_) cudaStreamSynchronize(copy_);
+        cudaStreamSynchronize(stream_);
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t moved = 0;
+        std::string e;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            uint64_t m = 0;
+            const bool ok = ea_[(size_t) l]->relocate(kStreamPiece, to, true, m, e, stream_check());
+            moved += m;
+            if (!ok) {
+                basalt::log::warn("basalt hy4flash", "KV streaming: layer %d keeps rows on the card: %s", l, e.c_str());
+                break;
+            }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (tier_) {
+            std::string r;
+            tier_->reclaim(r, /*restore=*/true);
+            tier_->grow();
+        }
+        basalt::log::info("basalt hy4flash", "KV streaming: %.2f GiB of rows to RAM at %s (%lld positions) in %.0f ms", moved / 1073741824.0, when, (long long) pos, ms);
+        stream_report(when);
+    }
+    // Every piece in RAM back to the card, for a long prompt (the tier lends what the card lacks); what cannot move stays readable in RAM.
+    void stream_in() {
+        const uint64_t bytes = stream_host_bytes();
+        if (bytes == 0) return;
+        ring_join();
+        if (copy_) cudaStreamSynchronize(copy_);
+        cudaStreamSynchronize(stream_);
+        const auto t0 = std::chrono::steady_clock::now();
+        const int64_t slots0 = tier_ ? tier_->slots() : 0;
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const uint64_t floor = tier_ ? tier_->free_floor() : 256ull << 20;
+        if (tier_ && free_b < bytes + floor) {
+            tier_->shrink();
+            cudaMemGetInfo(&free_b, &total_b);
+            if (free_b < bytes + floor && !(tier_->partial_lend() && tier_->lend(bytes + floor - free_b))) tier_->lend_all();
+        }   // the prompt's end (stream_out) moves the rows out again and the tier takes its slots back
+        uint64_t moved = 0;
+        std::string e;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            uint64_t m = 0;
+            const bool ok = ea_[(size_t) l]->relocate(0, ea_[(size_t) l]->capacity(), false, m, e, stream_check());
+            moved += m;
+            if (!ok) {
+                basalt::log::warn("basalt hy4flash", "KV streaming: layer %d reads part of its rows from RAM in this prompt: %s", l, e.c_str());
+                break;
+            }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        basalt::log::info("basalt hy4flash", "KV streaming: %.2f GiB of rows back to the card for a prompt in %.0f ms; expert tier %lld -> %lld slots",
+                          moved / 1073741824.0, ms, (long long) slots0, tier_ ? (long long) tier_->slots() : 0LL);
+    }
     int64_t kv_base() const { return std::min<int64_t>(m_.context(), core::kElasticKvBase); }
     // device bytes a position takes in the sparse layers' caches (its row and a quarter of a pooled key)
     double cell_bytes() const {
         int sparse = 0;
         for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
-        return (double) sparse * ((double) sparse_row_bytes() + (double) g_.idx_dim * 2.0 / (double) g_.idx_pool);
+        return (double) sparse * ((double) sparse_row_bytes() + (double) pool_row_bytes() / (double) g_.idx_pool);
     }
     // the free memory a prompt chunk needs: the expert ring and the buffers of a chunk of attention-step rows
     static constexpr uint64_t kPromptFloorBuffers = 1ull << 30;
@@ -939,7 +1073,7 @@ public:
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
             ea_[(size_t) l]->trim((uint64_t) keep * sparse_row_bytes());
-            pea_[(size_t) l]->trim((uint64_t) (keep / g_.idx_pool + 1) * g_.idx_dim * 2);
+            pea_[(size_t) l]->trim((uint64_t) (keep / g_.idx_pool + 1) * pool_row_bytes());
         }
         basalt::log::info("basalt hy4flash", "elastic KV: %lld -> %lld positions backed", (long long) backed_, (long long) keep);
         backed_ = keep;
@@ -967,7 +1101,7 @@ public:
     }
 
     std::string info_words() const override {
-        const std::string kv = m_.cache_fp8() ? "kv=fp8" : "kv=fp16";   // what a community row records
+        const std::string kv = m_.cache_i8() ? "kv=int8" : m_.cache_fp8() ? "kv=fp8" : "kv=fp16";   // what a community row records
         return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(tier_->spill())
                      : kv + " " + program::spill_words({});   // no tier: every expert is on the card, none read from the file
     }
@@ -1001,8 +1135,8 @@ public:
     // (running_state). A ring holds the last swa_ring() (window layers) or kRawRing (indexer rows) positions, so a checkpoint
     // at `pos` is intact while the session has not run more than kMaxRows rows past it.
 
-    int cell_format() const { return fp8() ? 1 : f32() ? 2 : 3; }   // 3: fp16 rows
-    size_t ring_bytes() const { return (size_t) swa_ring() * kRowWidth * elem(); }
+    int cell_format() const { return i8() ? 4 : fp8() ? 1 : f32() ? 2 : 3; }   // 3: fp16 rows, 4: int8 rows
+    size_t ring_bytes() const { return (size_t) swa_ring() * ring_row_bytes(); }
     size_t raw_bytes() const { return (size_t) kRawRing * g_.idx_dim * 4; }
 
     size_t running_bytes() const override {
@@ -1036,14 +1170,14 @@ public:
     size_t cells_bytes(int64_t positions) const override {
         int sparse = 0;
         for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
-        return ctxp::cache_bytes(positions, sparse, fp8()) * (f32() ? 2 : 1);
+        return ctxp::cache_bytes(positions, sparse, fp8(), i8(), idx_i8()) * (f32() ? 2 : 1);
     }
 
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (positions > backed_) return {model::Status::Error, "hy4flash: positions that were never run"};
         cudaStreamSynchronize(stream_);
         kv.clear();
-        const size_t rb = (size_t) sparse_row_bytes(), pools = (size_t) (positions / g_.idx_pool + 1), pb = (size_t) g_.idx_dim * 2;
+        const size_t rb = (size_t) sparse_row_bytes(), pools = (size_t) (positions / g_.idx_pool + 1), pb = (size_t) pool_row_bytes();
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
             core::ConversationKv k;
@@ -1145,9 +1279,19 @@ private:
     int swa_ring() const { return g_.window + kAttRows; }
     int max_cells(int l) const { return g_.swa[(size_t) l] ? g_.window : cells_stride_; }   // a row's cells in layer l
     bool fp8() const { return m_.cache_fp8(); }
+    bool i8() const { return m_.cache_i8(); }
+    /// HY4_Q_DIRECT=1: a chunk's k_b product writes the query rows' latent part straight into qcur_ (no q_abs buffer, no copy);
+    /// with --kv int8 the chunk then reads the f32 query rows (attend_i8_kernel<false>) instead of packed ones.
+    // HY4_I8_MMA: a prompt chunk's int8 attention on the fp16 kernel (tiles dequantized in shared memory, the query fp32 rows)
+    static bool i8_mma() { static const bool on = [] { const char* e = std::getenv("HY4_I8_MMA"); return e && *e && *e != '0'; }(); return on; }
+    static bool qdirect() { static const bool on = std::getenv("HY4_Q_DIRECT") != nullptr; return on; }
     bool f32() const { return m_.cache_f32(); }
     int elem() const { return f32() ? 4 : 2; }
-    int sparse_row_bytes() const { return fp8() ? kFp8RowBytes : kRowWidth * elem(); }
+    int sparse_row_bytes() const { return i8() ? kI8RowBytes : fp8() ? kFp8RowBytes : kRowWidth * elem(); }
+    // DIAG HY4_IDX_I8=1 with --kv int8: the pooled keys int8 too (E2-5, measured apart)
+    bool idx_i8() const { static const bool on = std::getenv("HY4_IDX_I8") != nullptr; return i8() && on; }
+    int pool_row_bytes() const { return idx_i8() ? kIdxI8RowBytes : g_.idx_dim * 2; }   // a pooled key: fp16, or int8
+    int ring_row_bytes() const { return i8() ? kI8RowBytes : kRowWidth * elem(); }
 
     // A prompt chunk's small inputs from the host: staged in mapped memory and copied by a kernel, so they do not wait on a copy
     // engine behind the expert ring's copies (one piece queued there holds every later copy). A window copies as before.
@@ -1302,7 +1446,9 @@ private:
     }
     // The per-head products of the absorbed attention (k_b: 192 -> 512, v_b: 512 -> 256 per head): a chunk takes MMQ, a head at a time
     // over the rows of the step; a window keeps the kernel that rounds like the other single-row products.
-    void heads_product(const DevTensor* w, const float* x, int x_head_stride, int x_tok_stride, int H, int rows, int k, int R, float* y) {
+    void heads_product(const DevTensor* w, const float* x, int x_head_stride, int x_tok_stride, int H, int rows, int k, int R, float* y,
+                       int ld_y = 0) {   // ld_y: y's row stride (0: rows); only a chunk's MMQ honours it
+        if (ld_y == 0) ld_y = rows;
         namespace mmq = basalt::prefill::mmq;
         if (R > kMaxWindow && R <= arows_ && mmq::built() && mmq::fits(w->type, rows)) {
             if (loaded_.insert({w->type, rows}).second) mmq::load(w->type, rows);
@@ -1323,10 +1469,11 @@ private:
             p.total_rows = (int64_t) H * R;
             p.max_rows = R;
             p.dst = y;
-            p.ld_dst = rows;
+            p.ld_dst = ld_y;
             mmq_.run(p, stream_);
             return;
         }
+        if (ld_y != rows) throw std::runtime_error("heads_product: a row stride needs the MMQ path");
         q8_0_heads_gemv(w->ptr, x, x_head_stride, x_tok_stride, H, rows, k, R, y, stream_);
     }
     // A window's normed input xn_ quantized once for the products that read it (gemm quantizes per call): the same kernels and
@@ -1459,7 +1606,7 @@ private:
             put_i32(meta_d_, meta, (size_t) 4 * arows_);
         }
         const int ring = swa ? swa_ring() : 0;
-        const bool f8 = !swa && fp8();
+        const bool f8 = !swa && fp8(), i8r = i8();   // --kv int8: the window rings hold int8 rows too
         const float* kvn = F(l, "attn_kv_a_norm.weight");
         if (phases & kCells) {
         if (R <= kMaxWindow) {   // a window: the k_b product, the query rows and the cache rows in one launch (a segment's)
@@ -1469,16 +1616,32 @@ private:
                 const int32_t* pos_d = meta_d_ + 3 * arows_ + sg.row0;
                 const float *q = q_ + (size_t) sg.row0 * H * g_.qk_dim, *kv = kvraw_ + (size_t) sg.row0 * kRowWidth;
                 float* qc = qcur_ + (size_t) sg.row0 * H * kRowWidth;
-                if (f8) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, cache, stream_);
+                if (i8r) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, (int8_t*) cache, stream_);
+                else if (f8) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, cache, stream_);
                 else if (f32()) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, (float*) cache, stream_);
                 else mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, (uint16_t*) cache, stream_);
             });
         } else {
             uint8_t* cache = cache_[(size_t) l];
+            if (qdirect()) {   // the latent part lands in qcur_'s rows; prepare adds the rope part and the cache rows
+                heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qcur_, kRowWidth);
+                if (i8r) mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);
+                else if (f8) mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
+                else if (f32()) mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
+                else mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+            } else {
             heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
-            if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
+            if (i8r && !i8_mma()) mla_prepare_i8q(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);   // qcur_: packed int8 rows
+            else if (i8r) {   // HY4_I8_MMA: fp32 query rows
+                static bool said = false;
+                if (!said) basalt::log::info("basalt hy4flash", "attend path: int8 rows on the fp16 kernel (HY4_I8_MMA)");
+                said = true;
+                mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);
+            }
+            else if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
             else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
             else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+            }
         }
         if (diag(l) && f32() && !swa) {   // the inputs of the attention, for the reference's tensors (fp32 caches only)
             const uint8_t* cache = cache_[(size_t) l];
@@ -1513,6 +1676,8 @@ private:
                 }
             });
         }
+        if (R > kMaxWindow && bsegs_.empty()) kv_dump(l, pos0, R, H, swa, selecting, counts);   // DIAG HY4_KV_DUMP
+        if (!swa && bsegs_.empty()) pick_dump(l, pos0, R, pools_of, keep, counts);   // DIAG HY4_PICK_DUMP
         }
         if (!(phases & (kOutput | kAttend))) return true;
         if (!(phases & kTail)) {   // each segment over its own cache
@@ -1533,7 +1698,9 @@ private:
                 if (!swa && sg.s->bk_cells_.d)   // HY4_BOUNDS_CHECK: every cell in [0, backed)
                     core::bounds::check_cells(rs.firsts, const_cast<int32_t*>(rs.counts), const_cast<int32_t*>(rs.cells), rs.cells_stride, rs.fill,
                                               sg.rows, sg.s->bk_cells_.d, core::bounds::kAttendCells, l, stream_);
-                if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
+                if (i8r && R > kMaxWindow && !qdirect() && !i8_mma()) mla_attend_i8q(qcur_ + (size_t) sg.row0 * H * kI8QRowBytes / 4, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, ol, stream_);
+                else if (i8r) mla_attend(qc, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
+                else if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else if (f32()) mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else mla_attend(qc, (const uint16_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
             });
@@ -1585,8 +1752,12 @@ private:
             const int64_t g0 = p0 >= 3 ? (p0 - 3 + P - 1) / P : 0, g1 = last >= 3 ? (last - 3) / P : -1;
             if (c.bk_pools_.h && g1 >= c.bk_pools_.get())   // HY4_BOUNDS_CHECK: the pooled keys written
                 core::bounds::host_violation(core::bounds::kIndexerPools, l, g1, c.bk_pools_.get());
-            if (g1 >= g0) idx_pool(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
-                                   a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), c.ipool_[(size_t) l], stream_);
+            if (g1 >= g0 && idx_i8())
+                idx_pool_i8(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
+                            a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), (uint8_t*) c.ipool_[(size_t) l], stream_);
+            else if (g1 >= g0)
+                idx_pool(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
+                         a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), c.ipool_[(size_t) l], stream_);
         });
         if (!selecting) return;
         const int keep = g_.idx_top_k / P - (g_.idx_select_tail ? 1 : 0);
@@ -1612,7 +1783,8 @@ private:
                     core::bounds::host_violation(core::bounds::kIndexerPools, l, max_pool - 1, sg.s->bk_pools_.get());
                 put_i32(iidx_meta_, meta, (size_t) n * 3);
                 pt_begin(kPtScore);
-                idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
+                if (idx_i8()) idx_scores_rows_i8(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, (const uint8_t*) sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
+                else idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
                 pt_end(kPtScore);
                 pt_begin(kPtSelect);
                 idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
@@ -2675,7 +2847,9 @@ private:
             d.dst = pair_rows_;
             d.ld_dst = L;
             mmq_.run(d, st);
-            cudaEventRecord(B.done, st);
+            // B.done frees the staging blobs for the copy stream (the unringed launches below); a ringed launch reads the ring,
+            // and its other inputs are ordered on st itself, so it records nothing: one call fewer per launch under WDDM
+            if (!ringed) cudaEventRecord(B.done, st);
             pos += rows;
         };
         if (ringed) {
@@ -3194,7 +3368,7 @@ private:
             for (int l = 0; ok && l < g_.n_layers; ++l) {
                 if (g_.swa[(size_t) l]) continue;
                 ok = ea_[(size_t) l]->ensure((uint64_t) target * sparse_row_bytes(), keep, e) &&
-                     pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2, keep, e);
+                     pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * pool_row_bytes(), keep, e);
             }
             if (ok) {
                 backed_ = target;
@@ -3206,6 +3380,7 @@ private:
                     std::string r;
                     if (!tier_->reclaim(r)) basalt::log::warn("basalt hy4flash", "the latent caches took expert slots at %lld positions: %s", (long long) target, r.c_str());
                 }
+                if (!big_.rows) stream_out("a generation's growth");
                 return true;
             }
             if (!tier_ || attempt == 2) {
@@ -3263,6 +3438,103 @@ private:
 
     // diagnostic: a layer whose inner tensors are dumped (the first three)
     bool diag(int l) const { return !m_.diag_dump().empty() && l < 3; }
+
+    // DIAG HY4_KV_DUMP=DIR (with --kv f32): a prompt chunk's cache rows (the sparse layers and window layers 2/14/26/38), every
+    // 256th row's query rows, cells and indexer query, the pooled keys and the sinks, appended to DIR/<what>-<layer>.bin.
+    // DIAG HY4_PICK_DUMP=DIR (E2-7's sizing): the indexer's picks of every sparse layer as 64-cell blocks, any --kv. A window
+    // (decode) appends a record per row to picks-L.bin: int32 pos, int32 n, n sorted distinct blocks (n = -1: no selection,
+    // the row reads all its cells). A chunk appends one record to chunks-L.bin: int32 pos0, R, the distinct blocks of the
+    // union of its rows, the rows' mean distinct blocks.
+    void pick_dump(int l, int64_t pos0, int R, const std::vector<int>& pools_of, int keep, const int32_t* counts) {
+        static const char* dir = std::getenv("HY4_PICK_DUMP");
+        if (!dir) return;
+        cudaStreamSynchronize(stream_);
+        const auto put = [&](const char* what, const void* p, size_t n) {
+            const std::string path = std::string(dir) + "/" + what + "-" + std::to_string(l) + ".bin";
+            if (std::FILE* f = std::fopen(path.c_str(), "ab")) { std::fwrite(p, 1, n, f); std::fclose(f); }
+        };
+        std::vector<int32_t> cl((size_t) cells_stride_), rec;
+        std::vector<int32_t> uni;
+        double per_row = 0;
+        int sel_rows = 0;
+        for (int t = 0; t < R; ++t) {
+            const int32_t p32 = (int32_t) (pos0 + t);
+            std::vector<int32_t> blk;
+            const bool sel = pools_of[(size_t) t] > keep;
+            if (sel) {
+                cudaMemcpy(cl.data(), icells_ + (size_t) t * cells_stride_, (size_t) counts[t] * 4, cudaMemcpyDeviceToHost);
+                for (int i = 0; i < counts[t]; ++i)
+                    if (cl[(size_t) i] >= 0) blk.push_back(cl[(size_t) i] >> 6);
+                std::sort(blk.begin(), blk.end());
+                blk.erase(std::unique(blk.begin(), blk.end()), blk.end());
+                per_row += (double) blk.size();
+                ++sel_rows;
+            }
+            if (R <= kMaxWindow) {
+                const int32_t n = sel ? (int32_t) blk.size() : -1;
+                rec = {p32, n};
+                rec.insert(rec.end(), blk.begin(), blk.end());
+                put("picks", rec.data(), rec.size() * 4);
+            } else {
+                uni.insert(uni.end(), blk.begin(), blk.end());
+            }
+        }
+        if (R > kMaxWindow) {
+            std::sort(uni.begin(), uni.end());
+            uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
+            const int32_t r4[4] = {(int32_t) pos0, R, (int32_t) uni.size(), (int32_t) (sel_rows ? per_row / sel_rows : 0)};
+            put("chunks", r4, sizeof r4);
+        }
+    }
+    void kv_dump(int l, int64_t pos0, int R, int H, bool swa, bool selecting, const int32_t* counts) {
+        static const char* dir = std::getenv("HY4_KV_DUMP");
+        if (!dir || !f32() || (swa && l != 2 && l != 14 && l != 26 && l != 38)) return;
+        cudaStreamSynchronize(stream_);
+        const auto put = [&](const char* what, const void* p, size_t n, const char* mode = "ab") {
+            const std::string path = std::string(dir) + "/" + what + "-" + std::to_string(l) + ".bin";
+            if (std::FILE* f = std::fopen(path.c_str(), mode)) { std::fwrite(p, 1, n, f); std::fclose(f); }
+        };
+        const int ring = swa ? swa_ring() : 0;
+        std::vector<float> rows((size_t) R * kRowWidth);
+        for (int t = 0; t < R; ++t) {
+            const int64_t cell = ring ? (pos0 + t) % ring : pos0 + t;
+            cudaMemcpy(rows.data() + (size_t) t * kRowWidth, (const float*) cache_[(size_t) l] + (size_t) cell * kRowWidth, kRowWidth * 4, cudaMemcpyDeviceToHost);
+        }
+        put("rows", rows.data(), rows.size() * 4);
+        if (pos0 == 0) {
+            std::vector<float> s((size_t) H);
+            cudaMemcpy(s.data(), F(l, "attn_sinks.weight"), (size_t) H * 4, cudaMemcpyDeviceToHost);
+            put("sinks", s.data(), s.size() * 4, "wb");
+        }
+        const int D = g_.idx_dim, IH = g_.idx_heads;
+        for (int t = 0; t < R; ++t) {
+            const int64_t pos = pos0 + t;
+            if (pos % 256 != 255) continue;
+            std::vector<float> q((size_t) H * kRowWidth);
+            cudaMemcpy(q.data(), qcur_ + (size_t) t * H * kRowWidth, q.size() * 4, cudaMemcpyDeviceToHost);
+            const int32_t p32 = (int32_t) pos;
+            put("qpos", &p32, 4);
+            put("q", q.data(), q.size() * 4);
+            if (swa) continue;
+            std::vector<int32_t> cl((size_t) cells_stride_ + 1, -1);
+            cl[0] = counts[t];
+            const bool sel = selecting && (pos / g_.idx_pool) > (g_.idx_top_k / g_.idx_pool - (g_.idx_select_tail ? 1 : 0));
+            if (sel) cudaMemcpy(cl.data() + 1, icells_ + (size_t) t * cells_stride_, (size_t) cells_stride_ * 4, cudaMemcpyDeviceToHost);
+            put("cells", cl.data(), cl.size() * 4);
+            std::vector<float> iq((size_t) IH * D + IH, 0.f);
+            if (sel) {
+                cudaMemcpy(iq.data(), iq_ + (size_t) t * IH * D, (size_t) IH * D * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(iq.data() + (size_t) IH * D, iw_ + (size_t) t * IH, (size_t) IH * 4, cudaMemcpyDeviceToHost);
+            }
+            put("iq", iq.data(), iq.size() * 4);
+        }
+        if (!swa && !idx_i8()) {
+            const size_t pools = (size_t) ((pos0 + R) / g_.idx_pool);
+            std::vector<uint16_t> pk(pools * D);
+            cudaMemcpy(pk.data(), ipool_[(size_t) l], pk.size() * 2, cudaMemcpyDeviceToHost);
+            put("pool", pk.data(), pk.size() * 2, "wb");
+        }
+    }
 
     // diagnostic: the stream drained. A window's weighted sum waits on the device for the word join_moe writes, so the MoE is
     // joined first: a wait for the stream before it would never end.

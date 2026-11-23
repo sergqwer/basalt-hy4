@@ -114,6 +114,16 @@ __global__ void gather_fp8_kernel(const uint8_t* __restrict__ cache, const int32
     }
 }
 
+// An int8 row: 512 codes, 64 fp16 rope values, then four fp32 scales (one per 128 codes).
+__global__ void gather_i8_kernel(const uint8_t* __restrict__ cache, const int32_t* __restrict__ cells, uint16_t* __restrict__ out) {
+    const int j = blockIdx.x;
+    const uint8_t* src = cache + (size_t) (cells ? cells[j] : j) * kI8RowBytes;
+    const float* scale = reinterpret_cast<const float*>(src + kI8ScaleOff);
+    for (int c = threadIdx.x; c < kDflyRowWidth; c += blockDim.x)
+        out[(size_t) j * kDflyRowWidth + c] = c < kDflyRank ? __half_as_ushort(__float2half_rn((float) (int8_t) src[c] * scale[c >> 7]))
+                                                            : reinterpret_cast<const uint16_t*>(src + kDflyRank)[c - kDflyRank];
+}
+
 __global__ void gate_add_kernel(const float* __restrict__ base, const float* __restrict__ fused, const float* __restrict__ gate, int n,
                                 float* __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -143,6 +153,12 @@ void dfly_gather_rows(const uint16_t* cache, const int32_t* cells, int n, int wi
 void dfly_gather_rows_fp8(const uint8_t* cache, const int32_t* cells, int n, uint16_t* out, void* stream) {
     if (n < 1) return;
     gather_fp8_kernel<<<n, 192, 0, (cudaStream_t) stream>>>(cache, cells, out);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void dfly_gather_rows_i8(const uint8_t* cache, const int32_t* cells, int n, uint16_t* out, void* stream) {
+    if (n < 1) return;
+    gather_i8_kernel<<<n, 192, 0, (cudaStream_t) stream>>>(cache, cells, out);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

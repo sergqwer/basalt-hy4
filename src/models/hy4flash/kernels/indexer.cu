@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace basalt::models::hy4flash {
@@ -14,6 +15,11 @@ namespace {
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int m = 16; m; m >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, m));
     return v;
 }
 
@@ -37,9 +43,10 @@ __device__ __forceinline__ int axis_pos(const A& a, int cell, int i) {
     return p[0];
 }
 
-// One block of `dim` threads: the pooled key of a group.
+// One block of `dim` threads: the pooled key of a group (I8: as an int8 row of kIdxI8RowBytes, else fp16).
+template <bool I8>
 __global__ void pool_kernel(const float* __restrict__ values, const float* __restrict__ gates, const float* __restrict__ ape,
-                            const float* __restrict__ norm_w, IndexerArgs a, int ring, int first_pos, __half* __restrict__ pooled) {
+                            const float* __restrict__ norm_w, IndexerArgs a, int ring, int first_pos, void* __restrict__ pooled) {
     __shared__ float row[128];
     __shared__ float red[4];
     const int d = threadIdx.x;
@@ -67,7 +74,18 @@ __global__ void pool_kernel(const float* __restrict__ values, const float* __res
     __syncthreads();
     if (d < a.rope / 2) rot_pair(row + a.dim - a.rope, d, a.rope, a.rope_base, axis_pos(a, group_pos, d));
     __syncthreads();
-    pooled[(size_t) (group_pos / a.pool) * a.dim + d] = __float2half_rn(row[d]);
+    if constexpr (I8) {
+        const float v = row[d];
+        const float m = warp_max(fabsf(v));
+        if ((d & 31) == 0) red[d >> 5] = m;
+        __syncthreads();
+        const float s = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3])) / 127.f;
+        uint8_t* out = reinterpret_cast<uint8_t*>(pooled) + (size_t) (group_pos / a.pool) * kIdxI8RowBytes;
+        out[d] = (uint8_t) (int8_t) (s > 0.f ? __float2int_rn(__fdiv_rn(v, s)) : 0);
+        if (d < 4) reinterpret_cast<float*>(out + 128)[d] = d == 0 ? s : 0.f;
+    } else {
+        reinterpret_cast<__half*>(pooled)[(size_t) (group_pos / a.pool) * a.dim + d] = __float2half_rn(row[d]);
+    }
 }
 
 __global__ void rope_heads_kernel(float* __restrict__ q, IndexerArgs a, int pos0) {
@@ -156,6 +174,89 @@ __global__ void __launch_bounds__(128) scores_mma_kernel(const float* __restrict
             const int p = p0 + lane * 2;
             if (p < n_pool) scores[p] = v0;
             if (p + 1 < n_pool) scores[p + 1] = v1;
+        }
+    }
+}
+
+// The same over int8 pooled keys: S = Q K^T per 8 pooled keys on mma.m16n8k32 s8 with the query as two int8 terms per head
+// (q ~ s (c1 + c2 / 128): 128 I1 + I2 is the exact int32 dot product), times the head's and the key's scales.
+__device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// RPB rows a block (a decode window's rows, or rows of a prompt step): each pooled key is read once for all of them; a row's
+// scores are its own whatever RPB is (exact int32 sums, the same fp32 epilogue).
+template <int RPB>
+__global__ void __launch_bounds__(128) scores_i8_kernel(const float* __restrict__ q, const float* __restrict__ w, const uint8_t* __restrict__ pooled,
+                                                        const int32_t* __restrict__ meta, int rows, int stride, float* __restrict__ scores) {
+    __shared__ __align__(16) int8_t qc[2][RPB * 16][144];   // the query's two terms, a (row, head) a line
+    __shared__ float qw[RPB * 16];                          // w[h] * s / 128
+    __shared__ int np[RPB];
+    const int r0 = blockIdx.y * RPB, nr = min(RPB, rows - r0);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x < RPB) np[threadIdx.x] = threadIdx.x < nr ? meta[(r0 + threadIdx.x) * 3] : 0;
+    for (int i = warp; i < nr * 16; i += 4) {   // a warp a (row, head), a lane 4 values
+        const int r = i >> 4, h = i & 15;
+        const float4 v = *reinterpret_cast<const float4*>(q + ((size_t) (r0 + r) * 16 + h) * 128 + lane * 4);
+        const float amax = warp_max(fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+        const float s = amax / 127.f, inv = s > 0.f ? 1.f / s : 0.f;
+        const float x[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int c1 = max(-127, min(127, __float2int_rn(x[e] * inv)));
+            const int c2 = max(-127, min(127, __float2int_rn((x[e] - (float) c1 * s) * inv * 128.f)));
+            qc[0][i][lane * 4 + e] = (int8_t) c1;
+            qc[1][i][lane * 4 + e] = (int8_t) c2;
+        }
+        if (lane == 0) qw[i] = w[(size_t) (r0 + r) * 16 + h] * (s * (1.f / 128.f));
+    }
+    __syncthreads();
+    int max_np = 0;
+    for (int r = 0; r < nr; ++r) max_np = max(max_np, np[r]);
+    if ((int) blockIdx.x * 512 >= max_np) return;
+    const int g = lane >> 2, q4 = lane & 3;
+    const int base = blockIdx.x * 512 + warp * 128;
+    for (int nt = 0; nt < 16; ++nt) {
+        const int p0 = base + nt * 8;
+        if (p0 >= max_np) break;
+        const uint8_t* kr = pooled + (size_t) min(p0 + g, max_np - 1) * kIdxI8RowBytes;
+        uint32_t b[4][2];
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            b[ks][0] = *reinterpret_cast<const uint32_t*>(kr + ks * 32 + q4 * 4);
+            b[ks][1] = *reinterpret_cast<const uint32_t*>(kr + ks * 32 + 16 + q4 * 4);
+        }
+        const float k0 = *reinterpret_cast<const float*>(pooled + (size_t) min(p0 + 2 * q4, max_np - 1) * kIdxI8RowBytes + 128);
+        const float k1 = *reinterpret_cast<const float*>(pooled + (size_t) min(p0 + 2 * q4 + 1, max_np - 1) * kIdxI8RowBytes + 128);
+        for (int r = 0; r < nr; ++r) {
+            const int n_pool = np[r];
+            if (p0 >= n_pool) continue;
+            int i1[4] = {0, 0, 0, 0}, i2[4] = {0, 0, 0, 0};
+#pragma unroll
+            for (int ks = 0; ks < 4; ++ks) {
+                uint32_t a1[4], a2[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int hr = r * 16 + g + (j & 1) * 8, c = ks * 32 + q4 * 4 + (j >> 1) * 16;
+                    a1[j] = *reinterpret_cast<const uint32_t*>(&qc[0][hr][c]);
+                    a2[j] = *reinterpret_cast<const uint32_t*>(&qc[1][hr][c]);
+                }
+                mma_s8(i1, a1, b[ks][0], b[ks][1]);
+                mma_s8(i2, a2, b[ks][0], b[ks][1]);
+            }
+            const float wr0 = qw[r * 16 + g], wr1 = qw[r * 16 + g + 8];
+            float v0 = wr0 * fmaxf((float) (128 * i1[0] + i2[0]) * k0, 0.f) + wr1 * fmaxf((float) (128 * i1[2] + i2[2]) * k0, 0.f);
+            float v1 = wr0 * fmaxf((float) (128 * i1[1] + i2[1]) * k1, 0.f) + wr1 * fmaxf((float) (128 * i1[3] + i2[3]) * k1, 0.f);
+            for (int o = 4; o < 32; o <<= 1) {
+                v0 += __shfl_xor_sync(0xffffffffu, v0, o);
+                v1 += __shfl_xor_sync(0xffffffffu, v1, o);
+            }
+            if (lane < 4) {
+                float* sr = scores + (size_t) (r0 + r) * stride;
+                const int p = p0 + lane * 2;
+                if (p < n_pool) sr[p] = v0;
+                if (p + 1 < n_pool) sr[p + 1] = v1;
+            }
         }
     }
 }
@@ -284,7 +385,27 @@ __global__ void select_kernel(const float* __restrict__ scores, int n, int k, in
 void idx_pool(const float* values, const float* gates, const float* ape, const float* norm_w, const IndexerArgs& a, int ring,
               int first_pos, int n_groups, uint16_t* pooled, void* stream) {
     if (a.dim != 128 || a.pool > 8 || ring % a.pool || first_pos % a.pool) throw std::invalid_argument("idx_pool: geometry");
-    if (n_groups > 0) pool_kernel<<<n_groups, a.dim, 0, (cudaStream_t) stream>>>(values, gates, ape, norm_w, a, ring, first_pos, reinterpret_cast<__half*>(pooled));
+    if (n_groups > 0) pool_kernel<false><<<n_groups, a.dim, 0, (cudaStream_t) stream>>>(values, gates, ape, norm_w, a, ring, first_pos, pooled);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void idx_pool_i8(const float* values, const float* gates, const float* ape, const float* norm_w, const IndexerArgs& a, int ring,
+                 int first_pos, int n_groups, uint8_t* pooled, void* stream) {
+    if (a.dim != 128 || a.pool > 8 || ring % a.pool || first_pos % a.pool) throw std::invalid_argument("idx_pool_i8: geometry");
+    if (n_groups > 0) pool_kernel<true><<<n_groups, a.dim, 0, (cudaStream_t) stream>>>(values, gates, ape, norm_w, a, ring, first_pos, pooled);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void idx_scores_rows_i8(const float* q, const float* w, const uint8_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
+                        float* scores, int stride, void* stream) {
+    if (a.heads != 16 || a.dim != 128) throw std::invalid_argument("idx_scores_rows_i8: 16 heads of 128");
+    static const int rpb = [] { const char* e = std::getenv("HY4_IDX_RPB"); return e ? std::atoi(e) : 8; }();   // DIAG: rows a block
+    const dim3 grid((max_pool + 511) / 512, (rows + rpb - 1) / rpb);
+    cudaStream_t st = (cudaStream_t) stream;
+    if (rpb == 1) scores_i8_kernel<1><<<grid, 128, 0, st>>>(q, w, pooled, meta, rows, stride, scores);
+    else if (rpb == 2) scores_i8_kernel<2><<<grid, 128, 0, st>>>(q, w, pooled, meta, rows, stride, scores);
+    else if (rpb == 4) scores_i8_kernel<4><<<grid, 128, 0, st>>>(q, w, pooled, meta, rows, stride, scores);
+    else scores_i8_kernel<8><<<dim3(grid.x, (rows + 7) / 8), 128, 0, st>>>(q, w, pooled, meta, rows, stride, scores);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

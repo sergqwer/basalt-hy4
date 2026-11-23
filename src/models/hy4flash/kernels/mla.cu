@@ -83,6 +83,26 @@ __device__ __forceinline__ void store_cell(uint8_t* cache, size_t cell, const fl
     __syncthreads();
 }
 
+// The int8 row (--kv int8, kI8RowBytes): the 512 latent values as int8 codes, the 64 rope values as fp16, then four fp32 scales,
+// one per 128 latent values, each amax / 127, a code round(v / scale) (nearest even). Needs a block of at least 512 threads.
+__device__ __forceinline__ void store_cell(int8_t* cache, size_t cell, const float* lat, const float* rp, const MlaArgs& a, float* red) {
+    uint8_t* row = reinterpret_cast<uint8_t*>(cache) + cell * kI8RowBytes;
+    float* sc = reinterpret_cast<float*>(row + kI8ScaleOff);
+    const int c = threadIdx.x, g = c >> 7;
+    const float v = c < kI8Latent ? lat[c] : 0.f;
+    const float amax = warp_max(fabsf(v));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (c < kI8Latent) {
+        const float m = fmaxf(fmaxf(red[g * 4], red[g * 4 + 1]), fmaxf(red[g * 4 + 2], red[g * 4 + 3]));
+        const float s = m / 127.f;
+        row[c] = (uint8_t) (int8_t) (s > 0.f ? __float2int_rn(__fdiv_rn(v, s)) : 0);
+        if ((c & 127) == 0) sc[g] = s;
+    }
+    if (c < kI8Rope) reinterpret_cast<uint16_t*>(row + kI8Latent)[c] = f16_bits(rp[c]);
+    __syncthreads();
+}
+
 // One tile of a per-head product: rows r0..r0 + tr of head h for n_tok tokens, y[t][h][r] (at y + t * y_tok + h * y_head + r)
 // = w[h * rows + r] . x[t][h] (x at x + t * x_tok + h * x_head), nb Q8_0 blocks a row. The activation is rounded to q8_1 per
 // 32 values, as every other product of the model's Q8_0 weights does: d = amax / 127, codes round half away from zero; a
@@ -263,16 +283,18 @@ __device__ __forceinline__ void cache_row(const float* __restrict__ kv_raw, cons
     store_cell(cache, (size_t) (ring ? pos % ring : pos), lat, rp, a, red);
 }
 
-// Block h < heads: the head's query row; block `heads`: the cache row. y = the token.
+// Block h < heads: the head's query row (q_abs null: only its rope part); block `heads`: the cache row. y = the token.
 template <typename C>
 __global__ void prepare_kernel(const float* __restrict__ q, const float* __restrict__ q_abs, const float* __restrict__ kv_raw,
                                const float* __restrict__ kv_norm, MlaArgs a, int pos0, int ring, float* __restrict__ qcur,
                                C* __restrict__ cache) {
     const int h = blockIdx.x, t = blockIdx.y, W = a.rank + a.rope, pos = pos0 + t;
     if (h < a.heads) {
-        const float* qa = q_abs + (size_t) t * a.heads * a.rank;
-        float* out = qcur + (size_t) t * a.heads * W;
-        for (int c = threadIdx.x; c < a.rank; c += blockDim.x) out[(size_t) h * W + c] = qa[(size_t) h * a.rank + c];
+        if (q_abs) {   // null: the k_b product wrote the latent part in place
+            const float* qa = q_abs + (size_t) t * a.heads * a.rank;
+            float* out = qcur + (size_t) t * a.heads * W;
+            for (int c = threadIdx.x; c < a.rank; c += blockDim.x) out[(size_t) h * W + c] = qa[(size_t) h * a.rank + c];
+        }
         query_rope(q, a, pos, t, h, qcur);
         return;
     }
@@ -366,6 +388,33 @@ struct RowFp8 {
         k[1] = fp8_value((v.x >> 8) & 0xffu, sc);
     }
     static __device__ __forceinline__ void cvtr(const RawR& v, float k[2]) { bf16x2(v, k); }
+};
+// the int8 row: a code times its block's scale (load4's j is its block: values 4 (lane + 32 j)..; load2 carries the scale); the
+// rope part fp16
+__device__ __forceinline__ float i8_at(uint32_t v, int byte) { return (float) (int8_t) (uint8_t) (v >> (8 * byte)); }
+struct RowI8 {
+    using Raw4 = uint32_t;
+    using Raw2 = uint2;   // two codes, the scale's bits
+    using RawR = uint32_t;
+    using Scales = float4;
+    static constexpr int kRowBytes = kI8RowBytes;
+    static __device__ __forceinline__ Scales scales(const uint8_t* r) { return *reinterpret_cast<const float4*>(r + kI8ScaleOff); }
+    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) { return reinterpret_cast<const uint32_t*>(r)[i]; }
+    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) {
+        return make_uint2(reinterpret_cast<const uint16_t*>(r)[i], __float_as_uint(reinterpret_cast<const float*>(r + kI8ScaleOff)[i >> 6]));
+    }
+    static __device__ __forceinline__ RawR loadr(const uint8_t* r, int i) { return reinterpret_cast<const uint32_t*>(r + kI8Latent)[i]; }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales& s, int j, float k[4]) {
+        const float sc = j == 0 ? s.x : j == 1 ? s.y : j == 2 ? s.z : s.w;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) k[e] = i8_at(v, e) * sc;
+    }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) {
+        const float sc = __uint_as_float(v.y);
+        k[0] = i8_at(v.x, 0) * sc;
+        k[1] = i8_at(v.x, 1) * sc;
+    }
+    static __device__ __forceinline__ void cvtr(const RawR& v, float k[2]) { f16x2(v, k); }
 };
 
 // The rows a window row attends (RowSpans): row t's j-th cell.
@@ -482,6 +531,26 @@ __device__ __forceinline__ uint4 half8(const uint8_t*, uint4 v, int ch) {
     if (ch >= kFp8Codes / 8) return make_uint4(bf2_to_h2(v.x), bf2_to_h2(v.y), bf2_to_h2(v.z), bf2_to_h2(v.w));
     const __half2 s = __float2half2_rn(__uint_as_float(v.z));
     return make_uint4(e4m3x2_to_h2(v.x & 0xffffu, s), e4m3x2_to_h2(v.x >> 16, s), e4m3x2_to_h2(v.y & 0xffffu, s), e4m3x2_to_h2(v.y >> 16, s));
+}
+int g_i8_mma = -1;   // mla_set_i8_mma: -1 = HY4_I8_MMA decides
+// int8 rows (HY4_I8_MMA): chunks below 64 are eight codes then their group's fp32 scale (one per 128 values), the rest eight
+// fp16 rope values. A code times its scale is rounded to fp16 once, in fp32: the fp16 kernel then runs on the stored row.
+__device__ __forceinline__ uint4 fetch8(const int8_t* cache, size_t cell, int ch) {
+    const uint8_t* row = reinterpret_cast<const uint8_t*>(cache) + cell * kI8RowBytes;
+    if (ch < kI8Latent / 8) {
+        const uint2 c = *reinterpret_cast<const uint2*>(row + ch * 8);
+        return make_uint4(c.x, c.y, __float_as_uint(reinterpret_cast<const float*>(row + kI8ScaleOff)[ch >> 4]), 0);
+    }
+    return *reinterpret_cast<const uint4*>(row + kI8Latent + (ch - kI8Latent / 8) * 16);
+}
+__device__ __forceinline__ uint32_t i8x2_to_h2(uint32_t w, int sh, float s) {
+    const __half2 h = __floats2half2_rn((float) (int8_t) (w >> sh) * s, (float) (int8_t) (w >> (sh + 8)) * s);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+__device__ __forceinline__ uint4 half8(const int8_t*, uint4 v, int ch) {
+    if (ch >= kI8Latent / 8) return v;
+    const float s = __uint_as_float(v.z);
+    return make_uint4(i8x2_to_h2(v.x, 0, s), i8x2_to_h2(v.x, 16, s), i8x2_to_h2(v.y, 0, s), i8x2_to_h2(v.y, 16, s));
 }
 
 // G groups of 16 heads a block share each tile of cells (the cells are the row's for every head: one load, one conversion);
@@ -638,6 +707,299 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
     }
 }
 
+// ---- int8 tensor-core attention over an int8 cache ----------------------------------------------------------------------------
+// A block per row and 32 heads, 8 warps; the row's cells go through shared memory 32 at a time as stored (the latent codes also
+// transposed for P V). The latent part of S = Q K^T and O += P V run on mma.m16n8k32 s8 with int32 sums: the query as two int8
+// terms per (head, 128 values), q ~ s (c1 + c2 / 128), so 128 I1 + I2 is a block's exact int32 sum, times s and the cell's
+// scale in fp32; P times the cell's value scale likewise as two terms per (head, value block, tile). The rope part of S (fp16
+// in the row) runs on mma.m16n8k16 f16 with the query's rope part in fp16, fp32 sums. The softmax is a running one in fp32,
+// the sink its first element.
+constexpr int kI8Cells = 32;
+constexpr int kI8QLd = 656, kI8Q2Ld = 656, kI8KLd = 656;   // smem row strides in bytes (bank-conflict free for ldmatrix)
+constexpr int kI8VLd = 32, kI8PLd = 48, kI8SLd = 33;         // V^T rows of 32 cells (16-byte halves swizzled), P rows, S (floats)
+struct I8Smem {
+    static constexpr int q1 = 0, q2 = q1 + 32 * kI8QLd, k = q2 + 32 * kI8Q2Ld, vt = k + kI8Cells * kI8KLd, p8 = vt + kI8Latent * kI8VLd,
+                         ksc = p8 + 2 * 4 * 32 * kI8PLd, qsc = ksc + kI8Cells * 4 * 4, sp = qsc + 32 * 4 * 4, psc = sp + 32 * kI8SLd * 4,
+                         alpha = psc + 4 * 32 * 4, lsum = alpha + 32 * 4, bytes = lsum + 32 * 4;
+};
+static_assert(I8Smem::bytes <= 99 * 1024, "the int8 attention's shared memory fits a block");
+// V^T row d's 16-byte half h (cells 16 h ..) sits at half h ^ ((d >> 2) & 1): ldmatrix's 8 rows then hit 8 bank groups
+__device__ __forceinline__ int vt_at(int d, int half) { return d * kI8VLd + 16 * (half ^ ((d >> 2) & 1)); }
+
+__device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void ldsm2(uint32_t (&r)[2], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
+}
+// two int8 terms of x with step s: c1 = rn(x / s), c2 = rn((x - c1 s) * 128 / s); |c2| <= 64
+__device__ __forceinline__ void i8_terms(float x, float inv, float s, int& c1, int& c2) {
+    c1 = max(-127, min(127, __float2int_rn(x * inv)));
+    c2 = max(-127, min(127, __float2int_rn((x - (float) c1 * s) * inv * 128.f)));
+}
+// 4x4 bytes: w[r] holds 4 values of cell r; out[d] the 4 cells' values of byte d
+__device__ __forceinline__ void transpose4(const uint32_t (&w)[4], uint32_t (&o)[4]) {
+    const uint32_t t0 = __byte_perm(w[0], w[1], 0x5140), t1 = __byte_perm(w[2], w[3], 0x5140);
+    const uint32_t t2 = __byte_perm(w[0], w[1], 0x7362), t3 = __byte_perm(w[2], w[3], 0x7362);
+    o[0] = __byte_perm(t0, t1, 0x5410);
+    o[1] = __byte_perm(t0, t1, 0x7632);
+    o[2] = __byte_perm(t2, t3, 0x5410);
+    o[3] = __byte_perm(t2, t3, 0x7632);
+}
+// a head's query row (576 fp32 at qr) into the int8 terms of its latent blocks, its fp16 rope part, and s * scale / 128
+// (a warp; the packed row and the kernel's own quantisation share it, so both give the same bits)
+__device__ __forceinline__ void query_terms(const float* qr, const MlaArgs& a, uint8_t* c1row, uint8_t* c2row, uint16_t* rope, uint16_t* rope_lo,
+                                            float* qsc) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const float4 v4 = *reinterpret_cast<const float4*>(qr + b * 128 + lane * 4);
+        const float v[4] = {v4.x, v4.y, v4.z, v4.w};
+        const float amax = warp_max(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))));
+        const float s = amax / 127.f, inv = s > 0.f ? 1.f / s : 0.f;
+        uint32_t w1 = 0, w2 = 0;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            int c1, c2;
+            i8_terms(v[e], inv, s, c1, c2);
+            w1 |= (uint32_t) (uint8_t) (int8_t) c1 << (8 * e);
+            w2 |= (uint32_t) (uint8_t) (int8_t) c2 << (8 * e);
+        }
+        reinterpret_cast<uint32_t*>(c1row)[b * 32 + lane] = w1;
+        reinterpret_cast<uint32_t*>(c2row)[b * 32 + lane] = w2;
+        if (lane == 0) qsc[b] = s * a.scale * (1.f / 128.f);
+    }
+    const float2 r = *reinterpret_cast<const float2*>(qr + kI8Latent + 2 * lane);
+    const __half2 h = __floats2half2_rn(r.x, r.y);
+    const float2 hf = __half22float2(h);
+    const __half2 lo = __floats2half2_rn(r.x - hf.x, r.y - hf.y);   // the fp16 remainder: the rope part as two fp16 terms
+    reinterpret_cast<uint32_t*>(rope)[lane] = *reinterpret_cast<const uint32_t*>(&h);
+    reinterpret_cast<uint32_t*>(rope_lo)[lane] = *reinterpret_cast<const uint32_t*>(&lo);
+}
+
+// Packed: the query rows come as mla_prepare_i8q wrote them (kI8QRowBytes a head), else as fp32 rows.
+template <bool Packed>
+__global__ void __launch_bounds__(256) attend_i8_kernel(const float* __restrict__ qcur, const uint8_t* __restrict__ cache, const int32_t* __restrict__ firsts,
+                                                        const int32_t* __restrict__ counts, const int32_t* __restrict__ cells, int cells_stride,
+                                                        const int32_t* __restrict__ fill, const float* __restrict__ sinks, MlaArgs a, int ring,
+                                                        float* __restrict__ o_lat) {
+    extern __shared__ __align__(16) unsigned char sm[];
+    uint8_t *q1 = sm + I8Smem::q1, *q2 = sm + I8Smem::q2, *ks = sm + I8Smem::k, *vt = sm + I8Smem::vt, *p8 = sm + I8Smem::p8;
+    float *ksc = (float*) (sm + I8Smem::ksc), *qsc = (float*) (sm + I8Smem::qsc), *sp = (float*) (sm + I8Smem::sp);
+    float *psc = (float*) (sm + I8Smem::psc), *alpha_s = (float*) (sm + I8Smem::alpha), *l_s = (float*) (sm + I8Smem::lsum);
+    constexpr int W = 576;
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    const int t = blockIdx.y, h0 = blockIdx.x * 32;
+    const int n = counts[t], first = firsts[t];
+    const int32_t* cl = cells && !(fill && fill[t] > 0) ? cells + (size_t) t * cells_stride : nullptr;
+    if constexpr (Packed) {   // c1 (512), c2 (512), rope fp16 hi and lo (128 bytes each), 4 scales: 81 pieces of 16 bytes a head
+        const uint8_t* qp = reinterpret_cast<const uint8_t*>(qcur) + ((size_t) t * a.heads + h0) * kI8QRowBytes;
+        for (int i = tid; i < 32 * (kI8QRowBytes / 16); i += 256) {
+            const int h = i / (kI8QRowBytes / 16), c = i - h * (kI8QRowBytes / 16);
+            const uint4 v = *reinterpret_cast<const uint4*>(qp + (size_t) h * kI8QRowBytes + c * 16);
+            if (c < 32) *reinterpret_cast<uint4*>(q1 + h * kI8QLd + c * 16) = v;
+            else if (c < 64) *reinterpret_cast<uint4*>(q2 + h * kI8Q2Ld + (c - 32) * 16) = v;
+            else if (c < 72) *reinterpret_cast<uint4*>(q1 + h * kI8QLd + kI8Latent + (c - 64) * 16) = v;
+            else if (c < 80) *reinterpret_cast<uint4*>(q2 + h * kI8Q2Ld + kI8Latent + (c - 72) * 16) = v;
+            else *reinterpret_cast<uint4*>(qsc + h * 4) = v;
+        }
+    } else {
+        for (int hh = 0; hh < 4; ++hh) {   // a warp 4 heads
+            const int h = w * 4 + hh;
+            query_terms(qcur + ((size_t) t * a.heads + h0 + h) * W, a, q1 + h * kI8QLd, q2 + h * kI8Q2Ld,
+                        reinterpret_cast<uint16_t*>(q1 + h * kI8QLd + kI8Latent), reinterpret_cast<uint16_t*>(q2 + h * kI8Q2Ld + kI8Latent), qsc + h * 4);
+        }
+    }
+    float m[4], l[4];
+#pragma unroll
+    for (int hh = 0; hh < 4; ++hh) {
+        m[hh] = sinks[h0 + w * 4 + hh];
+        l[hh] = 1.f;
+    }
+    if (tid < 32) l_s[tid] = 1.f;
+    const int mt = w & 1, nt = w >> 1;   // S: heads 16 mt.., cells 8 nt..; P V: heads 16 mt.., value block nt (dims 128 nt..)
+    const int g = lane >> 2, q4 = lane & 3;
+    float acc[16][4];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    // a thread's share of a tile, loaded a tile ahead: latent dims 16 dc.. of cells 4 cg..4 cg + 3; pieces 0..255 of the rest:
+    // the rope part (cell i / 8, piece i % 8), 256..287 the scales (cell i - 256)
+    const int cg = tid & 7, dc = tid >> 3;
+    uint4 pre[4], prx, prs;
+    auto cell_of = [&](int j) { return cl ? cl[j] : ring ? (first + j) % ring : first + j; };
+    auto fetch = [&](int j0) {
+        const int tn = min(kI8Cells, n - j0);
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int c = 4 * cg + r;
+            pre[r] = c < tn ? *reinterpret_cast<const uint4*>(cache + (size_t) cell_of(j0 + c) * kI8RowBytes + dc * 16) : make_uint4(0, 0, 0, 0);
+        }
+        prx = make_uint4(0, 0, 0, 0);
+        if ((tid >> 3) < tn) prx = *reinterpret_cast<const uint4*>(cache + (size_t) cell_of(j0 + (tid >> 3)) * kI8RowBytes + kI8Latent + (tid & 7) * 16);
+        prs = make_uint4(0, 0, 0, 0);
+        if (tid < tn) prs = *reinterpret_cast<const uint4*>(cache + (size_t) cell_of(j0 + tid) * kI8RowBytes + kI8ScaleOff);
+    };
+    fetch(0);
+    for (int j0 = 0; j0 < n; j0 += kI8Cells) {
+        const int tn = min(kI8Cells, n - j0);
+        __syncthreads();
+        {   // the tile into shared memory: K rows as stored, the latent also transposed ([dim][cell]) for P V
+#pragma unroll
+            for (int r = 0; r < 4; ++r) *reinterpret_cast<uint4*>(ks + (4 * cg + r) * kI8KLd + dc * 16) = pre[r];
+            const int rot = dc & 3;   // lanes of other dc store other dims at once: the banks spread
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t wv[4] = {(&pre[0].x)[k], (&pre[1].x)[k], (&pre[2].x)[k], (&pre[3].x)[k]};
+                uint32_t o[4];
+                transpose4(wv, o);
+#pragma unroll
+                for (int d0 = 0; d0 < 4; ++d0) {
+                    const int d = (d0 + rot) & 3, dim = dc * 16 + k * 4 + d;
+                    const uint32_t v = d == 0 ? o[0] : d == 1 ? o[1] : d == 2 ? o[2] : o[3];
+                    *reinterpret_cast<uint32_t*>(vt + vt_at(dim, cg >> 2) + (cg & 3) * 4) = v;
+                }
+            }
+            *reinterpret_cast<uint4*>(ks + (tid >> 3) * kI8KLd + kI8Latent + (tid & 7) * 16) = prx;
+            if (tid < kI8Cells) *reinterpret_cast<uint4*>(ksc + tid * 4) = prs;
+        }
+        __syncthreads();
+        if (j0 + kI8Cells < n) fetch(j0 + kI8Cells);
+        {   // S for heads 16 mt.., cells 8 nt..
+            const int hr = mt * 16, cr = nt * 8;
+            const int ar = hr + (lane & 7) + ((lane >> 3) & 1) * 8, br = cr + (lane & 7);
+            float s[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                int i1[4] = {0, 0, 0, 0}, i2[4] = {0, 0, 0, 0};
+#pragma unroll
+                for (int st = 0; st < 4; ++st) {
+                    const int kb = b * 128 + st * 32;
+                    uint32_t a1[4], a2[4], bb[2];
+                    ldsm4(a1, q1 + ar * kI8QLd + kb + (lane >> 4) * 16);
+                    ldsm4(a2, q2 + ar * kI8Q2Ld + kb + (lane >> 4) * 16);
+                    ldsm2(bb, ks + br * kI8KLd + kb + ((lane >> 3) & 1) * 16);
+                    mma_s8(i1, a1, bb[0], bb[1]);
+                    mma_s8(i2, a2, bb[0], bb[1]);
+                }
+                const float qa = qsc[(hr + g) * 4 + b], qb = qsc[(hr + g + 8) * 4 + b];
+                const float k0 = ksc[(cr + 2 * q4) * 4 + b], k1 = ksc[(cr + 2 * q4 + 1) * 4 + b];
+                s[0] = fmaf((float) (128 * i1[0] + i2[0]), qa * k0, s[0]);
+                s[1] = fmaf((float) (128 * i1[1] + i2[1]), qa * k1, s[1]);
+                s[2] = fmaf((float) (128 * i1[2] + i2[2]), qb * k0, s[2]);
+                s[3] = fmaf((float) (128 * i1[3] + i2[3]), qb * k1, s[3]);
+            }
+            float r[4] = {0.f, 0.f, 0.f, 0.f};   // the rope part, fp16: the query's two terms
+#pragma unroll
+            for (int st = 0; st < 4; ++st) {
+                const int kb = kI8Latent + st * 32;
+                uint32_t ah[4], al[4], bb[2];
+                ldsm4(ah, q1 + ar * kI8QLd + kb + (lane >> 4) * 16);
+                ldsm4(al, q2 + ar * kI8Q2Ld + kb + (lane >> 4) * 16);
+                ldsm2(bb, ks + br * kI8KLd + kb + ((lane >> 3) & 1) * 16);
+                mma16816h(r, ah, bb[0], bb[1]);
+                mma16816h(r, al, bb[0], bb[1]);
+            }
+#pragma unroll
+            for (int e = 0; e < 4; ++e) s[e] = fmaf(r[e], a.scale, s[e]);
+            sp[(hr + g) * kI8SLd + cr + 2 * q4] = s[0];
+            sp[(hr + g) * kI8SLd + cr + 2 * q4 + 1] = s[1];
+            sp[(hr + g + 8) * kI8SLd + cr + 2 * q4] = s[2];
+            sp[(hr + g + 8) * kI8SLd + cr + 2 * q4 + 1] = s[3];
+        }
+        __syncthreads();
+        // the running softmax, a lane a cell; P times the cell's value scale as two int8 terms a (head, value block)
+#pragma unroll
+        for (int hh = 0; hh < 4; ++hh) {
+            const int h = w * 4 + hh;
+            const bool valid = lane < tn;
+            const float sc = valid ? sp[h * kI8SLd + lane] : -INFINITY;
+            const float mx = warp_max(sc);
+            const float nm = fmaxf(m[hh], mx);
+            const float al = expf(m[hh] - nm);
+            const float p = valid ? expf(sc - nm) : 0.f;
+            const float sum = warp_sum(p);
+            l[hh] = l[hh] * al + sum;
+            m[hh] = nm;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const float x = p * ksc[lane * 4 + b];
+                const float amax = warp_max(x);
+                const float st = amax / 127.f, inv = st > 0.f ? 1.f / st : 0.f;
+                int c1, c2;
+                i8_terms(x, inv, st, c1, c2);
+                p8[((0 * 4 + b) * 32 + h) * kI8PLd + lane] = (uint8_t) (int8_t) c1;
+                p8[((1 * 4 + b) * 32 + h) * kI8PLd + lane] = (uint8_t) (int8_t) c2;
+                if (lane == 0) psc[b * 32 + h] = st * (1.f / 128.f);
+            }
+            if (lane == 0) {
+                alpha_s[h] = al;
+                l_s[h] = l[hh];
+            }
+        }
+        __syncthreads();
+        {   // O = O * alpha + P V for heads 16 mt.., dims 128 nt..
+            const int hr = mt * 16;
+            const float a0 = alpha_s[hr + g], a1 = alpha_s[hr + g + 8];
+            const float s0 = psc[nt * 32 + hr + g], s1 = psc[nt * 32 + hr + g + 8];
+            uint32_t pa1[4], pa2[4];
+            const int ar = hr + (lane & 7) + ((lane >> 3) & 1) * 8, ac = (lane >> 4) * 16;
+            ldsm4(pa1, p8 + ((0 * 4 + nt) * 32 + ar) * kI8PLd + ac);
+            ldsm4(pa2, p8 + ((1 * 4 + nt) * 32 + ar) * kI8PLd + ac);
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) {   // two n-tiles of 8 dims a load
+                uint32_t bv[4];
+                ldsm4(bv, vt + vt_at(nt * 128 + jj * 16 + (lane & 7) + (lane >> 4) * 8, (lane >> 3) & 1));
+#pragma unroll
+                for (int u = 0; u < 2; ++u) {
+                    int j1[4] = {0, 0, 0, 0}, j2[4] = {0, 0, 0, 0};
+                    mma_s8(j1, pa1, bv[2 * u], bv[2 * u + 1]);
+                    mma_s8(j2, pa2, bv[2 * u], bv[2 * u + 1]);
+                    float* o = acc[2 * jj + u];
+                    o[0] = fmaf((float) (128 * j1[0] + j2[0]), s0, o[0] * a0);
+                    o[1] = fmaf((float) (128 * j1[1] + j2[1]), s0, o[1] * a0);
+                    o[2] = fmaf((float) (128 * j1[2] + j2[2]), s1, o[2] * a1);
+                    o[3] = fmaf((float) (128 * j1[3] + j2[3]), s1, o[3] * a1);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const int hr = mt * 16;
+    const float i0 = 1.f / l_s[hr + g], i1 = 1.f / l_s[hr + g + 8];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int d = nt * 128 + j * 8 + 2 * q4;
+        float* o0 = o_lat + ((size_t) t * a.heads + h0 + hr + g) * a.rank + d;
+        float* o1 = o_lat + ((size_t) t * a.heads + h0 + hr + g + 8) * a.rank + d;
+        *reinterpret_cast<float2*>(o0) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        *reinterpret_cast<float2*>(o1) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
+    }
+}
+
+// Block h < heads: head h's query row packed for attend_i8_kernel<true> (query_terms of q_abs and the rotated rope part); block
+// `heads`: the cache row. y = the token.
+__global__ void prepare_i8q_kernel(const float* __restrict__ q, const float* __restrict__ q_abs, const float* __restrict__ kv_raw,
+                                   const float* __restrict__ kv_norm, MlaArgs a, int pos0, int ring, uint8_t* __restrict__ qpack,
+                                   int8_t* __restrict__ cache) {
+    const int h = blockIdx.x, t = blockIdx.y, pos = pos0 + t;
+    if (h < a.heads) {
+        __shared__ __align__(16) float row[576];
+        const float* qa = q_abs + ((size_t) t * a.heads + h) * a.rank;
+        for (int c = threadIdx.x; c < a.rank; c += blockDim.x) row[c] = qa[c];
+        if (threadIdx.x < a.rope / 2) {
+            const int i = threadIdx.x;
+            const float* p = q + ((size_t) t * a.heads + h) * (a.nope + a.rope) + a.nope + 2 * i;
+            rope_pair(p[0], p[1], i, a.rope, a.rope_base, axis_pos(a, pos, i), row[a.rank + 2 * i], row[a.rank + 2 * i + 1]);
+        }
+        __syncthreads();
+        uint8_t* out = qpack + ((size_t) t * a.heads + h) * kI8QRowBytes;
+        if (threadIdx.x < 32)
+            query_terms(row, a, out, out + 512, reinterpret_cast<uint16_t*>(out + 1024), reinterpret_cast<uint16_t*>(out + 1152), reinterpret_cast<float*>(out + 1280));
+        return;
+    }
+    cache_row(kv_raw, kv_norm, a, pos, ring, t, cache);
+}
 
 __global__ void head_major_ids_kernel(int32_t* ids, int32_t* bounds, int heads, int rows) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -656,6 +1018,7 @@ template <typename C> struct RowOf;
 template <> struct RowOf<float> { using T = RowF32; };
 template <> struct RowOf<uint16_t> { using T = RowF16; };
 template <> struct RowOf<uint8_t> { using T = RowFp8; };
+template <> struct RowOf<int8_t> { using T = RowI8; };
 
 // 16-head groups a block of the tensor-core kernel takes: 2 when the heads come in 32s
 int mma_groups(int heads) {
@@ -682,7 +1045,39 @@ void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok
                  int max_cells, void* work, float* o_lat, void* stream) {
     if (a.rank != mqa::kLatent || a.rope != 64 || a.heads % 8) throw std::invalid_argument("mla_attend: a 512 + 64 row and heads in eights");
     cudaStream_t st = (cudaStream_t) stream;
-    if constexpr (!std::is_same_v<C, float>) {
+    if constexpr (std::is_same_v<C, int8_t>) {
+        // HY4_I8_MMA: a chunk of rows on the fp16 kernel, each tile dequantized as it lands in shared memory (no query split)
+        static const bool env_on = [] { const char* e = std::getenv("HY4_I8_MMA"); return e && *e && *e != '0'; }();
+        const bool f16_math = g_i8_mma >= 0 ? g_i8_mma > 0 : env_on;
+        if (f16_math && n_tok > kAttTok && a.heads % 16 == 0) {
+            const int g = mma_groups(a.heads);
+            static bool raised16[2] = {false, false};
+            if (!raised16[g - 1]) {
+                if (g == 2) cudaFuncSetAttribute(attend_mma_kernel<int8_t, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<2>());
+                else cudaFuncSetAttribute(attend_mma_kernel<int8_t, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<1>());
+                raised16[g - 1] = true;
+            }
+            if (g == 2)
+                attend_mma_kernel<int8_t, 2><<<dim3(a.heads / 32, n_tok), 256, mma_smem<2>(), st>>>(qcur, cache, r.firsts, r.counts, r.cells,
+                                                                                                  r.cells_stride, r.fill, sinks, a, ring, o_lat);
+            else
+                attend_mma_kernel<int8_t, 1><<<dim3(a.heads / 16, n_tok), 256, mma_smem<1>(), st>>>(qcur, cache, r.firsts, r.counts, r.cells,
+                                                                                                  r.cells_stride, r.fill, sinks, a, ring, o_lat);
+            if (!stream) cudaStreamSynchronize(nullptr);
+            return;
+        }
+        if (n_tok > kAttTok && a.heads % 32 == 0) {   // a chunk of rows on int8 tensor cores
+            static bool raised = false;
+            if (!raised) {
+                cudaFuncSetAttribute(attend_i8_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, I8Smem::bytes);
+                raised = true;
+            }
+            attend_i8_kernel<false><<<dim3(a.heads / 32, n_tok), 256, I8Smem::bytes, st>>>(qcur, (const uint8_t*) cache, r.firsts, r.counts, r.cells,
+                                                                                 r.cells_stride, r.fill, sinks, a, ring, o_lat);
+            if (!stream) cudaStreamSynchronize(nullptr);
+            return;
+        }
+    } else if constexpr (!std::is_same_v<C, float>) {
         if (n_tok > kAttTok && a.heads % 16 == 0) {   // a chunk of rows; a window keeps the kernel below
             const int g = mma_groups(a.heads);
             static bool raised[2] = {false, false};
@@ -783,6 +1178,8 @@ void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const 
                  int n_tok, int ring, float* qcur, uint16_t* cache, void* stream) {
     prepare_impl(q, q_abs, kv_raw, kv_norm, a, pos0, n_tok, ring, qcur, cache, stream);
 }
+void mla_set_i8_mma(int on) { g_i8_mma = on; }
+
 void mla_attend(const float* qcur, const float* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 int max_cells, void* work, float* o_lat, void* stream) {
     attend_impl(qcur, cache, r, n_tok, sinks, a, ring, max_cells, work, o_lat, stream);
@@ -811,6 +1208,37 @@ void mla_attend(const float* qcur, const uint8_t* cache, const RowSpans& r, int 
 void mla_query(const void* w_kb, const float* q, const float* kv_raw, const float* kv_norm, const MlaArgs& a, const int32_t* pos, int n_tok,
                int ring, float* qcur, uint8_t* cache, void* stream) {
     query_impl(w_kb, q, kv_raw, kv_norm, a, pos, n_tok, ring, qcur, cache, stream);
+}
+
+void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                 int n_tok, int ring, float* qcur, int8_t* cache, void* stream) {
+    prepare_impl(q, q_abs, kv_raw, kv_norm, a, pos0, n_tok, ring, qcur, cache, stream);
+}
+void mla_attend(const float* qcur, const int8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                int max_cells, void* work, float* o_lat, void* stream) {
+    attend_impl(qcur, cache, r, n_tok, sinks, a, ring, max_cells, work, o_lat, stream);
+}
+void mla_query(const void* w_kb, const float* q, const float* kv_raw, const float* kv_norm, const MlaArgs& a, const int32_t* pos, int n_tok,
+               int ring, float* qcur, int8_t* cache, void* stream) {
+    query_impl(w_kb, q, kv_raw, kv_norm, a, pos, n_tok, ring, qcur, cache, stream);
+}
+
+void mla_prepare_i8q(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                     int n_tok, int ring, void* qpack, int8_t* cache, void* stream) {
+    prepare_i8q_kernel<<<dim3(a.heads + 1, n_tok), kThreads, 0, (cudaStream_t) stream>>>(q, q_abs, kv_raw, kv_norm, a, pos0, ring, (uint8_t*) qpack, cache);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+void mla_attend_i8q(const void* qpack, const int8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                    float* o_lat, void* stream) {
+    if (a.rank != 512 || a.rope != 64 || a.heads % 32) throw std::invalid_argument("mla_attend_i8q: a 512 + 64 row and heads in 32s");
+    static bool raised = false;
+    if (!raised) {
+        cudaFuncSetAttribute(attend_i8_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, I8Smem::bytes);
+        raised = true;
+    }
+    attend_i8_kernel<true><<<dim3(a.heads / 32, n_tok), 256, I8Smem::bytes, (cudaStream_t) stream>>>((const float*) qpack, (const uint8_t*) cache, r.firsts,
+                                                                                                    r.counts, r.cells, r.cells_stride, r.fill, sinks, a, ring, o_lat);
+    if (!stream) cudaStreamSynchronize(nullptr);
 }
 
 }  // namespace basalt::models::hy4flash

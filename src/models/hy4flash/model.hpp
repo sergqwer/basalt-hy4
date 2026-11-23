@@ -83,6 +83,8 @@ public:
     int device() const { return device_; }
     /// --kv fp8: the sparse layers' latent rows as FP8 (default fp16).
     bool cache_fp8() const { return fp8_; }
+    /// --kv int8: every latent row (the sparse layers' and the window rings') as int8 codes with block scales (kI8RowBytes).
+    bool cache_i8() const { return i8_; }
     /// --kv f32 (diagnostic): every latent row as fp32, the reference's own precision.
     bool cache_f32() const { return f32_; }
     /// --diag-rows: the rows of one forward call of a prompt (0: the largest the session takes).
@@ -109,7 +111,7 @@ private:
     std::string diag_dump_;
     std::unique_ptr<ngram::PleReader> engram_;
     int device_ = 0, fd_ = -1;
-    bool fp8_ = false, f32_ = false;
+    bool fp8_ = false, f32_ = false, i8_ = false;
     bool embd_bf16_ = false;   // token_embd stored BF16 (else Q8_0)
     int diag_rows_ = 0;
     mutable ImageEncoder vis_;   // [vision]

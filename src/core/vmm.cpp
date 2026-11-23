@@ -261,6 +261,15 @@ void unmap_only(uint8_t* va, uint64_t bytes) {
     if (v.ok && va != nullptr && bytes > 0) v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes);
 }
 
+unsigned long long create_host(uint64_t bytes) {
+    const Fns& v = fns();
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    if (!host_prop(prop, g) || bytes % g != 0) return 0;
+    CUmemGenericAllocationHandle h = 0;
+    return v.create(&h, (size_t) bytes, &prop, 0) == CUDA_SUCCESS ? (unsigned long long) h : 0;
+}
+
 void release(unsigned long long handle) {
     const Fns& v = fns();
     if (v.ok && handle != 0) v.release((CUmemGenericAllocationHandle) handle);

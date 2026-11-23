@@ -27,6 +27,9 @@ void dfly_gather_rows(const uint16_t* cache, const int32_t* cells, int n, int wi
 /// The same from FP8 rows (--kv fp8: kFp8RowBytes each, kernels.hpp) to fp16 rows of 576: a code times its power-of-two scale
 /// is an fp16 value, so the decoded latent is exact (the BF16 rope values round to fp16).
 void dfly_gather_rows_fp8(const uint8_t* cache, const int32_t* cells, int n, uint16_t* out, void* stream);
+/// The same from int8 rows (--kv int8: kI8RowBytes each, kernels.hpp) to fp16 rows of 576: a code times its block's scale, rounded
+/// to fp16 (the drafter's own attention reads fp16); the rope part as stored.
+void dfly_gather_rows_i8(const uint8_t* cache, const int32_t* cells, int n, uint16_t* out, void* stream);
 
 /// out[i] = base[i] + gate[i] * fused[i] for i < n (the Gated Fusion's residual).
 void dfly_gate_add(const float* base, const float* fused, const float* gate, int n, float* out, void* stream);
