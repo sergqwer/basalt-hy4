@@ -180,6 +180,7 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
         it.dev = w->slot(s.name);
         it.device = device;
         // a runtime-format tensor is copied as stored; a BF16 one is rounded as it loads (an older pack)
+        w->converts = w->converts || (t.dtype == "BF16" && (s.f32 || s.q4 || s.q8));
         it.conv = t.dtype != "BF16" ? core::Conv::Copy
                   : s.f32 ? core::Conv::Bf16ToF32 : s.q4 ? core::Conv::Bf16ToQ4_0 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
         reads.add(it);
