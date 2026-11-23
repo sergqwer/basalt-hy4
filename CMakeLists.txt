@@ -327,6 +327,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/mhc.cu
                         src/kernels/cuda/mhc_plain.cu
                         src/kernels/cuda/router.cu
+                        src/kernels/cuda/router_tc.cu
                         src/kernels/cuda/route_tail_skip.cu
                         src/kernels/cuda/row_norm.cu
                         src/ngram/ple_reader.cpp)
@@ -418,6 +419,11 @@ if(BUILD_TESTING)
   add_executable(hy4_fp4_moe_test tests/prefill/hy4_fp4_moe_test.cpp)
   target_link_libraries(hy4_fp4_moe_test PRIVATE prefill_fp4 ${_gpu_runtime_target})
   basalt_gpu_test(NAME hy4_fp4_moe_test COMMAND hy4_fp4_moe_test)
+  # the prompt router's logits on BF16 tensor cores (two terms) against double and router()'s fp32
+  add_executable(router_tc_test tests/kernels/router_tc_test.cpp)
+  target_link_libraries(router_tc_test PRIVATE kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME router_tc_test COMMAND router_tc_test)
+  set_tests_properties(router_tc_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   set_tests_properties(hy4_fp4_moe_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the SwiGLU epilogue's branch-free SiLU quotient against the plain expression on every float
   add_executable(silu_parity tests/kernels/silu_parity.cu)

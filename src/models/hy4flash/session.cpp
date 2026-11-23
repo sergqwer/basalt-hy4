@@ -2087,6 +2087,15 @@ private:
 
     // The router, routed_down and, for a window, its first group to the host; the shared expert behind them, which runs while
     // the host places the experts. No position in it: a decode window replays it from a graph.
+    // BASALT_HY4_ROUTER_TC=1 (opt-in until its KLD is measured): a prompt chunk's router logits on the BF16 tensor cores (two
+    // terms each of x and the gate) instead of the fp32 sums; a window always takes the fp32 router.
+    static bool tc_router() {
+        static const bool on = [] {
+            const char* v = std::getenv("BASALT_HY4_ROUTER_TC");
+            return v && *v && *v != '0';
+        }();
+        return on;
+    }
     void moe_head(int l, int R, bool prompt) {
         const int E = g_.n_embd, K = g_.n_used, L = g_.n_latent;
         bk::RouterArgs ra;
@@ -2100,7 +2109,12 @@ private:
             ra.held = lossy_->held_tabs(l - g_.n_dense);
             ra.prior = lossy_->route_prior();
         }
-        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        if (prompt && tc_router() && bk::router_logits_bf16x3_fits(ra.n_expert, E)) {   // a chunk's logits on the BF16 tensor cores
+            bk::router_logits_bf16x3(xn_, F(l, "ffn_gate_inp.weight"), R, ra.n_expert, E, rlog_, stream_);
+            bk::router_select(rlog_, F(l, "exp_probs_b.bias"), R, ra, ids_, rw_, stream_);
+        } else {
+            bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        }
         if (lossy && lossy_->route_tail_skip() > 0)   // each group of rows the tier places together
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,

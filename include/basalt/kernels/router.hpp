@@ -36,4 +36,9 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
 void router_select(const float* logits, const float* bias, int n_tokens, const RouterArgs& a, int32_t* ids, float* weights,
                    void* stream);
 
+/// A prompt chunk's logits (router_select's input) on the BF16 tensor cores: x and gate as two BF16 terms each,
+/// hi.hi + hi.lo + lo.hi in fp32 (router_tc.cu). Close to router()'s fp32 logits, not the same bits; n_expert % 128, n_embd % 32.
+bool router_logits_bf16x3_fits(int n_expert, int n_embd);
+void router_logits_bf16x3(const float* x, const float* gate, int n_tokens, int n_expert, int n_embd, float* logits, void* stream);
+
 }  // namespace basalt::kernels
