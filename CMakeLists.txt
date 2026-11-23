@@ -423,6 +423,9 @@ if(BUILD_TESTING)
   add_executable(hy4_fp4_moe_test tests/prefill/hy4_fp4_moe_test.cpp)
   target_link_libraries(hy4_fp4_moe_test PRIVATE prefill_fp4 ${_gpu_runtime_target})
   basalt_gpu_test(NAME hy4_fp4_moe_test COMMAND hy4_fp4_moe_test)
+  # E1-8 microbench (not a ctest): MMQ Q8_0 dense products at a prompt chunk
+  add_executable(dense_mmq_bench tests/prefill/dense_mmq_bench.cpp)
+  target_link_libraries(dense_mmq_bench PRIVATE mmq ${_gpu_runtime_target})
   # the prompt router's logits on BF16 tensor cores (two terms) against double and router()'s fp32
   add_executable(router_tc_test tests/kernels/router_tc_test.cpp)
   target_link_libraries(router_tc_test PRIVATE kernels ${_gpu_runtime_target})
