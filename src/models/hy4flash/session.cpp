@@ -1524,6 +1524,7 @@ private:
             });
         }
         if (R > kMaxWindow && bsegs_.empty()) kv_dump(l, pos0, R, H, swa, selecting, counts);   // DIAG HY4_KV_DUMP
+        if (!swa && bsegs_.empty()) pick_dump(l, pos0, R, pools_of, keep, counts);   // DIAG HY4_PICK_DUMP
         }
         if (!(phases & (kOutput | kAttend))) return true;
         if (!(phases & kTail)) {   // each segment over its own cache
@@ -3260,6 +3261,51 @@ private:
 
     // DIAG HY4_KV_DUMP=DIR (with --kv f32): a prompt chunk's cache rows (the sparse layers and window layers 2/14/26/38), every
     // 256th row's query rows, cells and indexer query, the pooled keys and the sinks, appended to DIR/<what>-<layer>.bin.
+    // DIAG HY4_PICK_DUMP=DIR (E2-7's sizing): the indexer's picks of every sparse layer as 64-cell blocks, any --kv. A window
+    // (decode) appends a record per row to picks-L.bin: int32 pos, int32 n, n sorted distinct blocks (n = -1: no selection,
+    // the row reads all its cells). A chunk appends one record to chunks-L.bin: int32 pos0, R, the distinct blocks of the
+    // union of its rows, the rows' mean distinct blocks.
+    void pick_dump(int l, int64_t pos0, int R, const std::vector<int>& pools_of, int keep, const int32_t* counts) {
+        static const char* dir = std::getenv("HY4_PICK_DUMP");
+        if (!dir) return;
+        cudaStreamSynchronize(stream_);
+        const auto put = [&](const char* what, const void* p, size_t n) {
+            const std::string path = std::string(dir) + "/" + what + "-" + std::to_string(l) + ".bin";
+            if (std::FILE* f = std::fopen(path.c_str(), "ab")) { std::fwrite(p, 1, n, f); std::fclose(f); }
+        };
+        std::vector<int32_t> cl((size_t) cells_stride_), rec;
+        std::vector<int32_t> uni;
+        double per_row = 0;
+        int sel_rows = 0;
+        for (int t = 0; t < R; ++t) {
+            const int32_t p32 = (int32_t) (pos0 + t);
+            std::vector<int32_t> blk;
+            const bool sel = pools_of[(size_t) t] > keep;
+            if (sel) {
+                cudaMemcpy(cl.data(), icells_ + (size_t) t * cells_stride_, (size_t) counts[t] * 4, cudaMemcpyDeviceToHost);
+                for (int i = 0; i < counts[t]; ++i)
+                    if (cl[(size_t) i] >= 0) blk.push_back(cl[(size_t) i] >> 6);
+                std::sort(blk.begin(), blk.end());
+                blk.erase(std::unique(blk.begin(), blk.end()), blk.end());
+                per_row += (double) blk.size();
+                ++sel_rows;
+            }
+            if (R <= kMaxWindow) {
+                const int32_t n = sel ? (int32_t) blk.size() : -1;
+                rec = {p32, n};
+                rec.insert(rec.end(), blk.begin(), blk.end());
+                put("picks", rec.data(), rec.size() * 4);
+            } else {
+                uni.insert(uni.end(), blk.begin(), blk.end());
+            }
+        }
+        if (R > kMaxWindow) {
+            std::sort(uni.begin(), uni.end());
+            uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
+            const int32_t r4[4] = {(int32_t) pos0, R, (int32_t) uni.size(), (int32_t) (sel_rows ? per_row / sel_rows : 0)};
+            put("chunks", r4, sizeof r4);
+        }
+    }
     void kv_dump(int l, int64_t pos0, int R, int H, bool swa, bool selecting, const int32_t* counts) {
         static const char* dir = std::getenv("HY4_KV_DUMP");
         if (!dir || !f32() || (swa && l != 2 && l != 14 && l != 26 && l != 38)) return;
