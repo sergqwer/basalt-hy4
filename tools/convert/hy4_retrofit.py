@@ -9,6 +9,8 @@ tensors need no conversion at load.
   --dense-nvfp4 RE  the Q8_0 dense matrices whose names match RE (and whose shapes the FP4 kernels take: [K % 256, rows % 128])
                   as NVFP4 planes (type 45) plus their `<name>.scale`: an RTN rounding of the Q8_0 values (fp4_round's
                   least-squares scales), for testing the engine's dense NVFP4 path; a GPTQ pack rounds from BF16 instead
+  --planes-from DIR with --dense-nvfp4: each matched matrix's planes from DIR/<name>.planes and its scale from DIR/<name>.json
+                  ("gs"), made elsewhere (e.g. GPTQ from the BF16 checkpoint); every matched matrix must have them
   --embd-bf16 DIR the token embedding as BF16 rows from the checkpoint DIR (model.embed_tokens.weight), copied as stored
                   (an option: +0.35 GB of host RAM against the Q8_0 rows; checked to round to the pack's Q8_0 bytes)
 
@@ -35,6 +37,7 @@ from model_file import TENSOR_ALIGN, ModelFile, ModelWriter, Stream  # noqa: E40
 
 HEAD = "output.weight"
 CHUNK_VALUES = 1 << 24   # BF16 values per head chunk (whole Q8_0 blocks)
+PLANES_FROM = None       # --planes-from: precomputed planes instead of the RTN rounding
 
 
 def die(msg: str):
@@ -118,12 +121,20 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
                 and int(t["shape"][0]) % 256 == 0 and int(t["shape"][1]) % 128 == 0 and t.get("section", "gguf") == "gguf"]
         if not todo:
             die(f"--dense-nvfp4 {dense_re!r} matches no Q8_0 matrix of [K % 256, rows % 128]")
-        jobs = [(src, gg_off + t["offset"], int(t["shape"][0]), int(t["shape"][1])) for _, t in todo]
-        spill = str(Path(out).parent / (Path(out).name + ".planes.tmp"))   # beside the output: RAM holds one matrix per worker
-        with multiprocessing.Pool(workers) as pool, open(spill, "wb") as sf:
-            for (n, _), (pb, sc) in zip(todo, pool.imap(_planes_job, jobs)):
-                planes[n] = ((spill, sf.tell(), len(pb)), len(pb), sc)
-                sf.write(pb)
+        if PLANES_FROM:
+            for n, t in todo:
+                f, j = Path(PLANES_FROM) / (n + ".planes"), Path(PLANES_FROM) / (n + ".json")
+                nb = int(t["shape"][0]) * int(t["shape"][1]) // 64 * 36
+                if not f.exists() or not j.exists() or f.stat().st_size != nb:
+                    die(f"--planes-from {PLANES_FROM}: no planes of {nb} bytes (and .json) for {n}")
+                planes[n] = ((str(f), 0, nb), nb, float(np.float32(json.loads(j.read_text())["gs"])))
+        else:
+            jobs = [(src, gg_off + t["offset"], int(t["shape"][0]), int(t["shape"][1])) for _, t in todo]
+            spill = str(Path(out).parent / (Path(out).name + ".planes.tmp"))   # beside the output: RAM holds one matrix per worker
+            with multiprocessing.Pool(workers) as pool, open(spill, "wb") as sf:
+                for (n, _), (pb, sc) in zip(todo, pool.imap(_planes_job, jobs)):
+                    planes[n] = ((spill, sf.tell(), len(pb)), len(pb), sc)
+                    sf.write(pb)
         print(f"  {len(planes)} dense matrices to NVFP4 planes", flush=True)
     embd = None   # (file, offset, bytes) of the BF16 embedding
     if embd_ckpt:
@@ -184,7 +195,8 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
                     meta.setdefault("quantized_from", {})["token_embd"] = "BF16 (the checkpoint's rows)"
                 if planes:
                     meta.setdefault("quantized_from", {})["dense_nvfp4"] = {"pattern": dense_re, "tensors": len(planes),
-                                                                            "rounding": "RTN of the Q8_0 values (test)"}
+                                                                            "rounding": ("precomputed planes from " + str(PLANES_FROM)) if PLANES_FROM
+                                                                            else "RTN of the Q8_0 values (test)"}
                 print(f"  gguf: head {head}, {len(planes)} NVFP4 planes, {len(order)} tensors laid out again", flush=True)
             elif name == "dfly" and dfly != "keep":
                 tmpd = tempfile.mkdtemp(dir=str(Path(out).parent))
@@ -279,11 +291,16 @@ def main() -> None:
     ap.add_argument("--head", choices=("q8", "keep"), default="q8")
     ap.add_argument("--dfly", choices=("runtime", "nvfp4", "keep"), default="runtime")
     ap.add_argument("--dense-nvfp4", metavar="RE", help="Q8_0 dense matrices matching RE as NVFP4 planes (a test rounding)")
+    ap.add_argument("--planes-from", metavar="DIR", help="with --dense-nvfp4: the planes and scales from DIR (<name>.planes, .json)")
     ap.add_argument("--embd-bf16", metavar="DIR", help="the token embedding as BF16 from this safetensors checkpoint")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--dfly-from", help="take the safetensors drafter from this pack (read only)")
     ap.add_argument("--in-place", action="store_true", help="rewrite --from itself (a copy made for it); --out is not used")
     a = ap.parse_args()
+    global PLANES_FROM
+    PLANES_FROM = a.planes_from
+    if PLANES_FROM and not a.dense_nvfp4:
+        die("--planes-from needs --dense-nvfp4 RE")
     if a.in_place:
         in_place(a.src, a.head, a.dfly, a.dense_nvfp4, a.workers, a.embd_bf16, a.dfly_from)
     else:
