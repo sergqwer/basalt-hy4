@@ -690,12 +690,16 @@ public:
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         rope_forget(pos);
+        dd_mark(0);
         const model::Result r = dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
+        dd_mark(1);
         early_window(anchor, pos);   // while the card runs the block
         return r;
     }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
-        return dfly_.draft_end(ids, conf, max_n, n, stream_, need);
+        const model::Result r = dfly_.draft_end(ids, conf, max_n, n, stream_, need);
+        dd_mark(2);
+        return r;
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
@@ -3979,12 +3983,38 @@ private:
                                   (long long) dp_windows_, dp_rows_ / n, dp_ms_[kDpWin] / n, dp_ms_[kDpSq] / n, dp_ms_[kDpScells] / n,
                                   dp_ms_[kDpSatt] / n, dp_ms_[kDpMoe] / n, dp_host_moe_ / n, dp_ms_[kDpUp] / n, dp_ms_[kDpEngram] / n,
                                   dp_ms_[kDpDense] / n, dp_ms_[kDpGap] / n, gpu / n, dp_wall_ / n);
+                if (dd_n_ > 0)
+                    basalt::log::info("basalt hy4flash", "decode profile: drafter %lld blocks, ms a block: block pass on the card %.2f, heads span %.2f, "
+                                      "host wall draft_begin to draft_end %.2f", (long long) dd_n_, dd_block_ / dd_n_, dd_heads_ / dd_n_, dd_wall_ / dd_n_);
             }
         }
         dp_cat_.clear();
     }
+    // DIAG HY4_DECODE_PROFILE, the drafter (kDpDraft): per block, the block pass's GPU ms (draft_begin's launches), the
+    // heads' span on the card (draft_end: the per-draft heads and the host round trips between them) and the host wall from
+    // draft_begin to draft_end's return. Its work runs between the windows, outside their steps.
+    cudaEvent_t dd_ev_[3] = {};
+    double dd_t0_ = 0, dd_block_ = 0, dd_heads_ = 0, dd_wall_ = 0;
+    int64_t dd_n_ = 0;
+    void dd_mark(int k) {
+        if (dp_every() <= 0) return;
+        if (!dd_ev_[k]) cudaEventCreate(&dd_ev_[k]);
+        cudaEventRecord(dd_ev_[k], stream_);
+        if (k == 0) dd_t0_ = now_ms();
+        if (k < 2) return;
+        cudaEventSynchronize(dd_ev_[2]);
+        float a = 0, b = 0;
+        if (cudaEventElapsedTime(&a, dd_ev_[0], dd_ev_[1]) == cudaSuccess && cudaEventElapsedTime(&b, dd_ev_[1], dd_ev_[2]) == cudaSuccess) {
+            dd_block_ += a;
+            dd_heads_ += b;
+            dd_wall_ += now_ms() - dd_t0_;
+            ++dd_n_;
+        }
+    }
     void dp_reset() {
         if (dp_on_) dp_flush();
+        dd_block_ = dd_heads_ = dd_wall_ = 0;
+        dd_n_ = 0;
         std::fill(std::begin(dp_ms_), std::end(dp_ms_), 0.0);
         dp_host_moe_ = dp_wall_ = 0;
         dp_windows_ = dp_rows_ = 0;
