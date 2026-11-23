@@ -1,0 +1,263 @@
+[
+ {
+  "id": "t01-pyinv-fix",
+  "seed": "pyinv",
+  "lang": "en",
+  "prompt": "The tests in test_inventory.py fail. Run them with `python -m pytest -q`, find the bugs in inventory.py and fix them. Keep the public API unchanged and run the tests again at the end."
+ },
+ {
+  "id": "t02-rustq-fix",
+  "seed": "rustq",
+  "lang": "uk",
+  "prompt": "У цьому Rust-крейті тест `wraps` падає. Запусти `cargo test`, знайди причину в src/lib.rs, виправ її і додай ще один тест на порожній буфер та на ємність 1. Наприкінці коротко поясни українською, що було не так."
+ },
+ {
+  "id": "t03-cppstat",
+  "seed": "cppstat",
+  "lang": "en",
+  "prompt": "stats.cpp prints the wrong median and the README expects the sample standard deviation. Fix both, build it with `g++ -O2 -std=c++17 stats.cpp -o stats.exe`, run it on data.txt and check the output against README.md."
+ },
+ {
+  "id": "t04-webtodo-new",
+  "seed": "empty",
+  "lang": "uk",
+  "prompt": "Створи в цій теці односторінковий застосунок «Нотатки»: index.html, styles.css, app.js. Можливості: додати нотатку із заголовком і текстом, редагувати, видалити, пошук за текстом, збереження в localStorage, темна тема через prefers-color-scheme. Без зовнішніх бібліотек. Перевір синтаксис JS командою `node --check app.js`."
+ },
+ {
+  "id": "t05-landing",
+  "seed": "empty",
+  "lang": "en",
+  "prompt": "Build a responsive landing page for a fictional open-source database called \"Quartzdb\": index.html and style.css only. Hero section, a 3-column feature grid that collapses to one column under 700px, a pricing table with 3 tiers, an FAQ with <details>, and a footer. Use CSS custom properties for colors and include a light and a dark theme."
+ },
+ {
+  "id": "t06-nodecli",
+  "seed": "nodecli",
+  "lang": "en",
+  "prompt": "parse.js misses some log lines (other HTTP methods, HTTP/2.0). Fix the regex, add per-path byte totals to the summary, and write tests in parse.test.js using the built-in `node:test` module. Run them with `node --test`."
+ },
+ {
+  "id": "t07-ps-backup",
+  "seed": "empty",
+  "lang": "uk",
+  "prompt": "Напиши PowerShell-скрипт backup.ps1, який архівує теку, передану параметром -Source, у zip з датою й часом у назві в теку -Dest (створи її, якщо немає), і залишає лише N останніх архівів (параметр -Keep, типово 5). Додай коментарі-довідку (Get-Help). Створи тестову теку sample з кількома файлами і перевір скрипт командою `pwsh -NoProfile -File ./backup.ps1 -Source ./sample -Dest ./out -Keep 2` тричі."
+ },
+ {
+  "id": "t08-refactor",
+  "seed": "messy",
+  "lang": "en",
+  "prompt": "Refactor report.py into readable functions with type hints and a main() guarded by __name__ == '__main__'. Output must stay byte-identical for sales.csv: capture the current output first with `python report.py sales.csv`, refactor, then compare. Add a small pytest test file."
+ },
+ {
+  "id": "t09-jsasync",
+  "seed": "jsasync",
+  "lang": "en",
+  "prompt": "`node test.js` fails. Fix cache.js so concurrent gets share one in-flight load and failed loads are not cached. Do not change test.js."
+ },
+ {
+  "id": "t10-htmlfix",
+  "seed": "htmlfix",
+  "lang": "uk",
+  "prompt": "Сторінка галереї зламана: розмітка, CSS і JS мають помилки, кнопки Grid/List не працюють. Знайди й виправ усі помилки в index.html, style.css та app.js. Потім додай третій режим перегляду «Large» з одним стовпцем. Перевір JS через `node --check app.js`."
+ },
+ {
+  "id": "t11-htmlparse",
+  "seed": "htmlparse",
+  "lang": "uk",
+  "prompt": "Напиши Python-скрипт extract.py, який читає cities.html (лише стандартна бібліотека, html.parser), витягує таблицю й записує cities.csv з колонками city,population,area_km2 (числа без пробілів), а також виводить густоту населення для кожного міста. Запусти його й покажи результат."
+ },
+ {
+  "id": "t12-secsrv",
+  "seed": "secsrv",
+  "lang": "en",
+  "prompt": "Review server.py for security problems. It serves ./public. Fix every issue you find (path traversal, symlinks, directory handling, error leaks), keeping it standard-library only. Then write test_server.py that starts the server on a free port in a thread and proves `/../server.py` and encoded variants are refused. Run the tests."
+ },
+ {
+  "id": "t13-cssvars",
+  "seed": "cssvars",
+  "lang": "uk",
+  "prompt": "Переведи site.css на CSS custom properties: винеси всі кольори в :root, додай темну тему через @media (prefers-color-scheme: dark) і ручний перемикач через атрибут data-theme на <html>. Додай у index.html кнопку перемикання теми з невеликим скриптом, що пам'ятає вибір."
+ },
+ {
+  "id": "t14-sqlbug",
+  "seed": "sqlbug",
+  "lang": "en",
+  "prompt": "app.py is vulnerable to SQL injection and crashes on a name with an apostrophe and on an empty table. Fix it with parameterized queries, handle the empty case, add a delete_user() and an update_age() function, and write tests with an in-memory database. Run them."
+ },
+ {
+  "id": "t15-cppcmake",
+  "seed": "cppcmake",
+  "lang": "en",
+  "prompt": "Add a CMakeLists.txt that builds src/strutil.cpp as a static library and a test executable tests/test_strutil.cpp registered with CTest (no external test framework, just assert-style checks that return non-zero). Fix the trim() crash on all-whitespace input. Configure and build with `cmake -S . -B build -G \"MinGW Makefiles\"` and `cmake --build build`, then run `ctest --test-dir build --output-on-failure`."
+ },
+ {
+  "id": "t16-git-review",
+  "seed": "gitrepo",
+  "lang": "uk",
+  "prompt": "Подивись `git status` і `git diff --cached` у цьому репозиторії, перевір, чи зміни правильні (запусти тести `python -m pytest -q`), виправ решту помилок, якщо є, і зроби коміт з гарним повідомленням англійською у форматі conventional commits. Покажи `git log --oneline` наприкінці."
+ },
+ {
+  "id": "t17-todo-edit",
+  "seed": "todoapp",
+  "lang": "uk",
+  "prompt": "Додай у цей застосунок справ: редагування справи подвійним кліком, фільтри «Усі / Активні / Виконані», кнопку «Очистити виконані» і захист від XSS (зараз текст вставляється через innerHTML). Збережи стиль коду. Перевір `node --check app.js`."
+ },
+ {
+  "id": "t18-rust-cli",
+  "seed": "empty",
+  "lang": "en",
+  "prompt": "Create a Rust command-line tool in this folder with `cargo init --name wfreq`: it reads text files given as arguments (or stdin), counts word frequencies case-insensitively with Unicode-aware splitting, and prints the top N (flag -n, default 10) as an aligned table. No external crates. Add unit tests, then run `cargo test` and `cargo run -- README.md`."
+ },
+ {
+  "id": "t19-explain-py",
+  "seed": "pyinv",
+  "lang": "uk",
+  "prompt": "Поясни українською, як працює inventory.py, рядок за рядком для ключових методів, і склади список проблем коду (без виправлень). Потім додай до файлу докстрінги до кожного методу англійською."
+ },
+ {
+  "id": "t20-bash-rotate",
+  "seed": "empty",
+  "lang": "en",
+  "prompt": "Write a bash script rotate.sh that rotates *.log files in ./logs: a file over a size limit (first argument, in KiB) is renamed to name.1.log, older ones shift up to .5 and the oldest is removed, then a new empty file is created. Make a test that creates sample logs with `head -c` and runs the script twice, and show `ls -l logs` after each run."
+ },
+ {
+  "id": "t21-pyinv-feature",
+  "seed": "pyinv",
+  "lang": "en",
+  "prompt": "Plan with a todo list, then implement in inventory.py: (1) a low_stock(threshold) method, (2) CSV export, (3) a command-line interface with argparse subcommands `load FILE`, `report`, `low N`. Fix the existing bugs on the way so the tests pass, add tests for the new features, and run everything."
+ },
+ {
+  "id": "t22-node-server",
+  "seed": "empty",
+  "lang": "uk",
+  "prompt": "Зроби на Node.js (лише вбудовані модулі) маленький REST API для нотаток у server.js: GET/POST/PUT/DELETE /notes, зберігання у notes.json, валідація JSON, коди помилок 400/404. Напиши тест test.js, який запускає сервер на вільному порту, проходить усі маршрути через fetch і завершує процес. Запусти `node test.js`."
+ },
+ {
+  "id": "t23-rust-review",
+  "seed": "rustq",
+  "lang": "en",
+  "prompt": "Review src/lib.rs as a senior Rust reviewer: list problems (correctness, API, performance, idioms) with line references, then implement the fixes, add `Iterator` and `Default`-style conveniences where they make sense, and make sure `cargo test` passes."
+ },
+ {
+  "id": "t24-web-chart",
+  "seed": "empty",
+  "lang": "en",
+  "prompt": "Create chart.html: a self-contained page that draws an SVG bar chart (no libraries) from a JS array of monthly values, with axis labels, hover tooltips, a sort toggle and keyboard focus for each bar. Put the JS in chart.js and styles in chart.css, and check the JS with `node --check chart.js`.",
+  "eval": true
+ },
+ {
+  "id": "t25-py-fix-eval",
+  "seed": "sqlbug",
+  "lang": "uk",
+  "prompt": "Виправ у app.py SQL-ін'єкцію та падіння на порожній таблиці, додай тести pytest і запусти їх.",
+  "eval": true
+ },
+ {
+  "id": "t26-rust-eval",
+  "seed": "rustq",
+  "lang": "en",
+  "prompt": "Fix the failing test in this crate (`cargo test`) with the smallest correct change and explain the bug in two sentences.",
+  "eval": true
+ },
+ {
+  "id": "t27-messy-uk",
+  "seed": "messy",
+  "lang": "uk",
+  "prompt": "Перепиши report.py так, щоб він приймав аргументи --sort-by (total|count|mean) і --top N через argparse, обробляв порожній CSV і некоректні числа з попередженням у stderr. Перевір на sales.csv і на навмисно зіпсованому файлі."
+ },
+ {
+  "id": "t28-cppstat-ext",
+  "seed": "cppstat",
+  "lang": "en",
+  "prompt": "Extend stats.cpp with min, max, quartiles (Q1/Q3 with linear interpolation) and a --json flag that prints the result as JSON. Keep it single-file C++17, build with g++ and test on data.txt and on a file with one value."
+ },
+ {
+  "id": "t29-nodecli-uk",
+  "seed": "nodecli",
+  "lang": "uk",
+  "prompt": "Додай у parse.js підрахунок запитів за IP і за годиною, вивід у вигляді таблиці в консоль та опцію --json. Напиши тести на node:test і запусти їх."
+ },
+ {
+  "id": "t30-secsrv-review",
+  "seed": "secsrv",
+  "lang": "uk",
+  "prompt": "Проведи аудит безпеки server.py: опиши кожну вразливість (CWE, вплив, як відтворити) і виправ код. Додай заголовки безпеки (X-Content-Type-Options, Content-Security-Policy) і правильні Content-Type за розширенням."
+ },
+ {
+  "id": "t31-todo-tests",
+  "seed": "todoapp",
+  "lang": "en",
+  "prompt": "Refactor app.js into a pure model module (todos.js, CommonJS, no DOM) plus the DOM glue, and write node:test tests for the model (add, toggle, remove, filter, clearDone). Run `node --test`."
+ },
+ {
+  "id": "t32-htmlfix-a11y",
+  "seed": "htmlfix",
+  "lang": "en",
+  "prompt": "Make the gallery page accessible: proper landmarks, buttons instead of links for the view toggles with aria-pressed, alt text strategy for the color tiles, focus styles and a skip link. Fix the existing bugs first."
+ },
+ {
+  "id": "t33-rust-iter",
+  "seed": "rustq",
+  "lang": "uk",
+  "prompt": "Додай до Ring<T> реалізацію IntoIterator для &Ring<T>, метод drain(), Extend<T> та Debug. Напиши тести для кожного й переконайся, що `cargo test` проходить. Виправ і наявну помилку."
+ },
+ {
+  "id": "t34-sql-cli",
+  "seed": "sqlbug",
+  "lang": "en",
+  "prompt": "Turn app.py into a small CLI (argparse) over a sqlite file: add, find, delete, list --older-than N, with parameterized queries, a migration that adds an email column if missing, and tests using a temporary database file."
+ },
+ {
+  "id": "t35-css-dark",
+  "seed": "cssvars",
+  "lang": "en",
+  "prompt": "Add a print stylesheet section and a high-contrast mode (@media (prefers-contrast: more)) to site.css, move colors into custom properties, and document every variable in a comment block at the top."
+ },
+ {
+  "id": "t36-pyinv-uk",
+  "seed": "pyinv",
+  "lang": "uk",
+  "prompt": "Додай у inventory.py збереження й завантаження з JSON-файлу з перевіркою схеми, історію змін (хто/коли/скільки) і команду undo. Виправ наявні помилки, онови тести й запусти їх."
+ },
+ {
+  "id": "t37-cpp-split",
+  "seed": "cppcmake",
+  "lang": "uk",
+  "prompt": "Виправ trim(), додай функції starts_with, ends_with, replace_all і to_lower з UTF-8 безпечною поведінкою для ASCII, напиши тести, CMakeLists.txt і зібери через cmake з \"MinGW Makefiles\", запусти ctest.",
+  "eval": true
+ },
+ {
+  "id": "t38-web-calc",
+  "seed": "empty",
+  "lang": "uk",
+  "prompt": "Зроби калькулятор іпотеки на HTML/CSS/JS (без бібліотек): сума, ставка, строк, щомісячний платіж, таблиця графіка платежів, перевірка введення, адаптивна верстка. Логіку розрахунку винеси в calc.js (CommonJS + браузер) і протестуй через node:test.",
+  "eval": true
+ },
+ {
+  "id": "t39-py-parser",
+  "seed": "empty",
+  "lang": "en",
+  "prompt": "Write a small recursive-descent parser in Python for arithmetic expressions with + - * / ^, unary minus, parentheses and variables, that builds an AST and evaluates it with a variables dict; clear error messages with the column. Add pytest tests and run them.",
+  "eval": true
+ },
+ {
+  "id": "t40-git-uk",
+  "seed": "gitrepo",
+  "lang": "en",
+  "prompt": "Inspect this repository's state (status, staged diff, log), finish the staged change so the tests pass, then commit it. After that, add a CHANGELOG entry and a second commit for a low_stock() method with a test.",
+  "eval": true
+ },
+ {
+  "id": "t41-rust-wc",
+  "seed": "empty",
+  "lang": "uk",
+  "prompt": "Створи на Rust (cargo init --name lc) утиліту підрахунку рядків коду за мовами в теці: розширення -> мова, пропуск порожніх рядків і коментарів для rs/py/js, вивід таблицею. Без зовнішніх crate. Тести й `cargo run -- .`.",
+  "eval": true
+ },
+ {
+  "id": "t42-js-validate",
+  "seed": "empty",
+  "lang": "en",
+  "prompt": "Write validate.js (CommonJS): a tiny JSON-schema-like validator supporting type, required, properties, items, enum, minLength/maxLength, minimum/maximum, returning a list of errors with JSON paths. Add node:test tests covering every keyword and run them.",
+  "eval": true
+ }
+]
