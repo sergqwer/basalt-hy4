@@ -641,6 +641,7 @@ public:
         std::string err;
         release_prompt();
         prof_t0 = prof_.on ? now_ms() : 0;
+        prof_.last = 0;
         // the lossy routing flags apply to decode windows only: prompts route as the model does
         struct Lossy {
             core::ExpertTier*& t;
@@ -689,7 +690,16 @@ public:
         // sums over the windows since the last line
         int64_t windows = 0, tokens = 0, layers = 0, cpu_layers = 0, late_n = 0, cpu_exp = 0, uniq = 0, fetch = 0, gsteer = 0;
         double wall = 0, wait_ids = 0, steer = 0, launch = 0, cpu = 0, stall = 0, host_gap = 0, fetch_stall = 0;
+        // the host between two MoE layers, in parts: graph 2, Engram + ring, graph 0, the cells, graph 1, the rest to the ids wait
+        double last = 0, gap[6] = {};
+        int64_t nodes[3] = {}, graphs[3] = {};   // over the run: nodes and graphs captured, by part (never reset)
     } prof_;
+    void prof_mark(int k) {
+        if (!prof_.on || prof_.last == 0) return;
+        const double t = now_ms();
+        prof_.gap[k] += t - prof_.last;
+        prof_.last = t;
+    }
     double prof_t0 = 0;
     void prof_window(int n_tokens, double wall) {
         Prof& p = prof_;
@@ -742,10 +752,20 @@ public:
                           (long long) p.windows, p.tokens / w, p.wall / w, p.wait_ids / w, p.steer / w, p.launch / w, p.host_gap / w,
                           p.cpu / w, p.cpu_layers / w, p.cpu_exp / w, p.cpu > 0 ? (double) p.cpu_exp * (double) p.bytes / (p.cpu * 1e6) : 0.0,
                           p.stall / w, p.fetch_stall / w, p.layers ? 100.0 * p.late_n / p.layers : 0.0, p.uniq / w, p.fetch / w, p.gsteer / w);
+        basalt::log::info("basalt hy4flash",
+                          "decode host between layers, ms a window: graph 2 %.2f, Engram and ring %.2f, graph 0 %.2f, cells %.2f, graph 1 %.2f, "
+                          "the rest %.2f",
+                          p.gap[0] / w, p.gap[1] / w, p.gap[2] / w, p.gap[3] / w, p.gap[4] / w, p.gap[5] / w);
+        basalt::log::info("basalt hy4flash", "decode graphs captured so far: graph 0 %lld (%.1f nodes each), graph 1 %lld (%.1f), graph 2 %lld (%.1f)",
+                          (long long) p.graphs[0], p.graphs[0] ? (double) p.nodes[0] / p.graphs[0] : 0.0, (long long) p.graphs[1],
+                          p.graphs[1] ? (double) p.nodes[1] / p.graphs[1] : 0.0, (long long) p.graphs[2], p.graphs[2] ? (double) p.nodes[2] / p.graphs[2] : 0.0);
         const bool on = p.on;
         uint64_t *h = p.h, *d = p.d;
         std::FILE* trace = p.trace;
+        int64_t nodes[3], graphs[3];
+        for (int k = 0; k < 3; ++k) nodes[k] = p.nodes[k], graphs[k] = p.graphs[k];
         p = Prof{};
+        for (int k = 0; k < 3; ++k) p.nodes[k] = nodes[k], p.graphs[k] = graphs[k];
         p.promo0 = promo;
         p.trace = trace;
         p.on = on;
@@ -2257,6 +2277,12 @@ private:
             cudaGraph_t g = nullptr;
             const cudaError_t ce = cudaStreamEndCapture(stream_, &g);
             const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&ex, g, 0) : ce;
+            if (prof_.on && g && part < 3) {   // the decode profile: a graph's nodes (kernels, copies, waits) by part
+                size_t nn = 0;
+                cudaGraphGetNodes(g, nullptr, &nn);
+                prof_.nodes[part] += (int64_t) nn;
+                ++prof_.graphs[part];
+            }
             if (g) cudaGraphDestroy(g);
             if (ci != cudaSuccess) {
                 ex = nullptr;
@@ -2299,6 +2325,7 @@ private:
                     moe_head(l, R, false);
                 }, err))
                 return false;
+            prof_mark(2);
             seq_want_ = seq0 + 1;
         } else {
         if (!replay(l, R, 0, [&] {
@@ -2308,7 +2335,9 @@ private:
                 attention_step(l, pos0, R, 0, e, kQuery);
             }, err))
             return false;
+        prof_mark(2);
         if (!attention_step(l, pos0, R, 0, err, kCells)) return false;
+        prof_mark(3);
         const uint32_t seq0 = seq_want_;
         if (!replay(l, R, 1, [&] {
                 std::string e;
@@ -2319,6 +2348,7 @@ private:
                 moe_head(l, R, false);
             }, err))
             return false;
+        prof_mark(4);
         seq_want_ = seq0 + 1;   // the doorbell in the graph rings once a replay
         }
         std::swap(X_, Xn_);
@@ -2330,6 +2360,7 @@ private:
                 add_norm_hc_post(moe_out_, sh_, F(l, "post_ffw_norm.weight"), g_.rms_eps, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
             }, err))
             return false;
+        prof_mark(0);
         std::swap(X_, Xn_);
         return true;
     }
@@ -2688,7 +2719,11 @@ private:
         }
         tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
         const bool prof = prof_.on && tl < kProfLayers && g0 == 0;
-        if (prof) prof_.enter[tl] = now_ms();
+        if (prof) {
+            prof_mark(5);
+            prof_.last = 0;
+            prof_.enter[tl] = now_ms();
+        }
         if (!await_ids(err)) return false;
         if (prof) {
             prof_.ids[tl] = now_ms();
@@ -2812,7 +2847,7 @@ private:
         tier_->publish_table(tl, st);   // BASALT_GPU_STEER: this lookup's landings and evictions, before the layer's next plan
         // the rows land and the word is written on the joiner thread, while this thread queues the next layer's work: the
         // card goes on as soon as the CPU's and the second card's rows are in, not once the next launches are out
-        if (prof) prof_.ret[tl] = now_ms();
+        if (prof) prof_.ret[tl] = prof_.last = now_ms();
         if (use_joiner_ && pd.word && !pd.reading) {
             if (!joiner_.joinable()) joiner_ = std::thread([this] { joiner_loop(); });
             {
@@ -2945,6 +2980,7 @@ private:
             basalt::core::progress_tick();   // a layer issued: the watchdog tells a slow window from a stopped one
             ring_ahead(l, R);
             if (!engram(l, pos0, R, tokens, err)) return false;
+            prof_mark(1);
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             if (graphs_ && l >= g_.n_dense) {
                 if (!(bsegs_.empty() ? layer_replayed(l, pos0, R, hc, err) : layer_batched(l, pos0, R, hc, err))) return false;
