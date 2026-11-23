@@ -123,6 +123,7 @@ public:
     /// dfly_specs order of those tensors; the layers' *_s point into them. False with err when the scales do not fit.
     bool set_fp4(const std::vector<float>& scales, std::string& err);
     bool fp4 = false;
+    bool converts = false;   ///< some tensor is BF16 in the pack (an older layout): rounded as it loads
     uint64_t bytes() const { return bytes_; }
     /// Packs the head's copy from head_q8 (once its bytes are on the card).
     bool pack_screen(void* stream, std::string& err);
