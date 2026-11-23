@@ -1375,10 +1375,10 @@ private:
         const MlaArgs a = mla_args(H, swa ? g_.rope_base_swa : g_.rope_base);
         if (phases & kQuery) {
             quant_n(R);
-            gemm_n(T(l, "attn_q_a.weight"), qa_, g_.q_lora, R);
+            // q_a and kv_a read xn_: a chunk quantises it once for both (kv_a ahead of q_b, which reuses the buffer)
+            gemm_shared(xn_, E, {{T(l, "attn_q_a.weight"), qa_, g_.q_lora}, {T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim}}, R);
             bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
             gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
-            gemm_n(T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim, R);
         }
         if (!(phases & (kCells | kOutput | kAttend))) return true;
         // the cells each row attends
@@ -2232,11 +2232,17 @@ private:
                 bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
                                     lossy_->route_tail_skip(), g_.n_expert, lossy_->route_counts(), stream_);
         quant_n(R);
-        gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
-        if (!prompt) publish(0, std::min(kMaxWindow, R));
         float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
-        gemm_n(T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp, R);
-        gemm_n(T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp, R);
+        if (R > kMaxWindow) {   // a chunk: xn_ quantised once for the three products that read it
+            gemm_shared(xn_, E, {{T(l, "ffn_routed_down.weight"), xlat_, L}, {T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp},
+                                 {T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp}}, R);
+            if (!prompt) publish(0, std::min(kMaxWindow, R));
+        } else {
+            gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
+            if (!prompt) publish(0, std::min(kMaxWindow, R));
+            gemm_n(T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp, R);
+            gemm_n(T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp, R);
+        }
         bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, stream_);
         gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
     }

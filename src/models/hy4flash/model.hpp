@@ -105,6 +105,7 @@ private:
     std::unique_ptr<ngram::PleReader> engram_;
     int device_ = 0, fd_ = -1;
     bool fp8_ = false, f32_ = false;
+    bool embd_bf16_ = false;   // token_embd stored BF16 (else Q8_0)
     int diag_rows_ = 0;
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DflyWeights> dfly_;   // DFLY HOOK
