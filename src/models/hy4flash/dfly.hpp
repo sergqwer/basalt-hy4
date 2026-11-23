@@ -71,6 +71,9 @@ struct DflyDims {
 struct DflyTensor {
     uint64_t offset = 0, bytes = 0;   ///< absolute in the file
     std::vector<uint64_t> shape;      ///< safetensors order, outermost first
+    std::string dtype = "BF16";       ///< BF16 (rounded as it loads), or the runtime format stored (F32, Q8_0, Q4_0): copied;
+                                      ///< NVFP4P: a Q4_0 projection as NVFP4 planes (nvfp4_planes.hpp) under `scale`
+    float scale = 0.0f;
 };
 
 struct DflyPack {
@@ -101,7 +104,8 @@ bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDim
 
 struct DflyLayer {
     const void *q_a, *q_b, *kv_a;                        // Q8_0
-    const void *gate, *o, *mlp_gate, *mlp_up, *mlp_down;  // Q4_0
+    const void *gate, *o, *mlp_gate, *mlp_up, *mlp_down;  // Q4_0, or NVFP4 planes (DflyWeights::fp4)
+    const float *gate_s = nullptr, *o_s = nullptr, *mlp_gate_s = nullptr, *mlp_up_s = nullptr, *mlp_down_s = nullptr;   // their scales
     const uint16_t* kv_b;                                                    // BF16: the per-head kernels read it
     const float *in_ln, *q_a_ln, *kv_a_ln, *post_proj_ln, *post_attn_ln, *sink;
 };
@@ -115,6 +119,10 @@ public:
     /// Device memory for every tensor of `dims` and the head's copy on the current device; `slot` then says where each goes.
     bool allocate(const DflyDims& dims, std::string& err);
     void* slot(const std::string& name) const;   ///< null for an unknown name
+    /// The Q4_0 set as NVFP4 planes (every layer's gate, output and MLP): the matrices' FP32 scales on the card, in
+    /// dfly_specs order of those tensors; the layers' *_s point into them. False with err when the scales do not fit.
+    bool set_fp4(const std::vector<float>& scales, std::string& err);
+    bool fp4 = false;
     uint64_t bytes() const { return bytes_; }
     /// Packs the head's copy from head_q8 (once its bytes are on the card).
     bool pack_screen(void* stream, std::string& err);
@@ -130,6 +138,7 @@ public:
 private:
     std::map<std::string, void*> slots_;
     uint64_t bytes_ = 0;
+    float* fp4_scales_ = nullptr;
 };
 
 /// The pack's drafter queued onto `reads` (file `file`, device `device`) when `pack` has one: `out` is null otherwise.

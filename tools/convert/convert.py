@@ -821,7 +821,10 @@ def main():
     ap.add_argument("--hf-dir", metavar="DIR", help="hy_v4_flash: the tencent/Hy4-flash directory (LICENSE, config.json)")
     ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
-    ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored whole as dfly")
+    ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored as dfly in "
+                    "the formats the engine runs (F32 vectors, Q4_0 / Q8_0 projections, BF16 kv_b; the loader's roundings)")
+    ap.add_argument("--dfly-bf16", action="store_true", help="with --dfly: store the drafter's safetensors whole (the engine rounds it at load)")
+    ap.add_argument("--dfly-nvfp4", action="store_true", help="with --dfly: the drafter's Q4_0 projections as NVFP4 planes (FP4 window products)")
     ap.add_argument("--nvfp4", action="store_true",
                     help="hy4flash: from the BF16 GGUF, the routed experts as NVFP4, projections Q8_0, the Engram table E4M3 (needs --hf-dir)")
     ap.add_argument("--dense-q6k", action="store_true", help="with --nvfp4: the attention, shared-expert and dense FFN projections as Q6_K")
