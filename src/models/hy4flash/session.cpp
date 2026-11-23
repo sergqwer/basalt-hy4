@@ -635,6 +635,7 @@ public:
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        rope_forget(pos);
         const model::Result r = dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
         early_window(anchor, pos);   // while the card runs the block
         return r;
@@ -647,6 +648,7 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
+        rope_forget(r.pos);   // [vision] a picture rewound out of the session: the windows run as graphs again
         // the lossy routing flags apply to decode windows only: prompts route as the model does
         struct Lossy {
             core::ExpertTier*& t;
@@ -3036,6 +3038,7 @@ private:
     // cell on the host and, once a picture is in the session, on the device where the kernels read them (MlaArgs::cell_rope).
     void sync_rope(int64_t pos) {
         rope_.rewind(pos);
+        rope_forget(pos);
         while (rope_.size() < pos) rope_.push_text();   // cells the session never placed (a restored history) count as text
     }
     // The rotary position a text token at cell `pos` takes, the track left as it is (the drafter's block, before its window).
@@ -3043,11 +3046,19 @@ private:
         const int64_t have = std::min<int64_t>(pos, rope_.size());
         return (have > 0 ? rope_.at(have - 1).last() + 1 : 0) + (pos - have);
     }
+    // No picture cell left below `pos`: the text cells' positions are their cells again, and the kernels go back to them.
+    void rope_forget(int64_t pos) {
+        if (rope_on_ && pos <= img_cell0_) { rope_on_ = false; img_cell0_ = INT64_MAX; }
+    }
     void place_rope(int64_t pos0, int R) {
         sync_rope(pos0);
         const bool was_on = rope_on_;
         for (int t = 0; t < R; ++t) {
-            if (emb_rows_) { rope_.push_row(img_start_, img_nx_, img_j_ + t); rope_on_ = true; }
+            if (emb_rows_) {
+                img_cell0_ = std::min(img_cell0_, rope_.size());
+                rope_.push_row(img_start_, img_nx_, img_j_ + t);
+                rope_on_ = true;
+            }
             else rope_.push_text();
         }
         if (!rope_on_) return;
@@ -3250,6 +3261,7 @@ private:
     RopeTrack rope_;
     int32_t* rope_dev_ = nullptr;
     bool rope_on_ = false;               // a picture has been fed: the kernels read the rotary table
+    int64_t img_cell0_ = INT64_MAX;      // the first cell of a picture in the session (rope_on_)
     const float* emb_rows_ = nullptr;    // the embeddings of the rows being run, in place of the tokens'
     int32_t img_start_ = 0;              // the first position of the block being fed
     int img_nx_ = 1, img_j_ = 0;         // its columns (newline included) and the row of its first run row
