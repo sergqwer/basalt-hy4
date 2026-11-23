@@ -1,6 +1,8 @@
 // src/models/hy4flash/kernels/kernels_parity.cpp - the Hy4-flash decode kernels against plain CPU references (double
 // accumulation) at the model's geometry: the identity hyper-connections, the per-head Q8_0 products, the MLA
 // preparation and attention with a sink, the router and the Engram apply. Exit 77 without a GPU.
+#include "basalt/core/vmm.hpp"
+#include "basalt/core/elastic_array.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/router.hpp"
@@ -1751,6 +1753,37 @@ void test_q_direct() {
     cudaFree(xq);
 }
 
+// KV streaming (HY4_KV_STREAM): an elastic array's pieces moved to host memory and back at the same addresses keep every byte,
+// whole pieces only, and trim and growth work with pieces in RAM.
+void test_kv_relocate() {
+    if (!basalt::core::vmm::supported() || !basalt::core::vmm::host_granularity()) {
+        std::printf("%-30s skipped (no host VMM)\n", "kv relocate");
+        return;
+    }
+    const uint64_t MiB = 1ull << 20, piece = 4 * MiB;
+    basalt::core::ElasticArray a;
+    std::string err;
+    bool ok = a.open(64 * MiB, err);
+    a.set_piece(piece);
+    ok = ok && a.ensure(40 * MiB, 0, err);
+    std::vector<uint8_t> pat(40 * MiB);
+    for (size_t i = 0; i < pat.size(); ++i) pat[i] = (uint8_t) (i * 2654435761u >> 13);
+    ok = ok && cudaMemcpy(a.data(), pat.data(), pat.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+    uint64_t moved = 0;
+    ok = ok && a.relocate(piece, 30 * MiB, true, moved, err, true);   // the pieces wholly inside [4, 30) MiB: 4..28
+    const bool out = ok && moved == 24 * MiB && a.host_bytes() == 24 * MiB && host(a.data(), pat.size()) == pat;
+    ok = ok && a.relocate(0, 64 * MiB, false, moved, err, true);
+    const bool back = ok && moved == 24 * MiB && a.host_bytes() == 0 && host(a.data(), pat.size()) == pat;
+    ok = ok && a.relocate(piece, 40 * MiB, true, moved, err);
+    a.trim(16 * MiB);   // pieces past 16 MiB go, those in RAM too
+    const bool trimmed = ok && a.backed() == 16 * MiB && a.host_bytes() == 12 * MiB;
+    ok = ok && a.ensure(32 * MiB, 0, err);
+    std::vector<uint8_t> head(pat.begin(), pat.begin() + 16 * MiB), got = host(a.data(), 32 * MiB);
+    const bool grown = ok && std::equal(head.begin(), head.end(), got.begin()) && std::all_of(got.begin() + 16 * MiB, got.end(), [](uint8_t c) { return c == 0; });
+    std::printf("%-30s %s%s%s\n", "kv relocate to RAM and back", out && back && trimmed && grown ? "bitwise" : "FAIL", err.empty() ? "" : ": ", err.c_str());
+    failures += !(out && back && trimmed && grown);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) return 77;
@@ -1771,6 +1804,7 @@ int main() {
     test_indexer_i8();
     test_mmq_dense();
     test_q_direct();
+    test_kv_relocate();
     test_mmq_expert(12, "mmq experts Q4_K");
     test_mmq_expert(14, "mmq experts Q6_K");
     test_prompt_vs_decode_nvfp4();

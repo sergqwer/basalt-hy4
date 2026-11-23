@@ -43,5 +43,8 @@ bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle);
 /// Unmaps `[va, va + bytes)` without releasing any handle (the mapping's reference goes with it).
 void unmap_only(uint8_t* va, uint64_t bytes);
 void release(unsigned long long handle);
+/// A CUDA-pinned host (NUMA) allocation of `bytes`, mapped nowhere yet (0 without host VMM or on failure): map_handle puts it
+/// under a range the current device reads over the bus, at the same addresses a device allocation had (KV streaming).
+unsigned long long create_host(uint64_t bytes);
 
 }  // namespace basalt::core::vmm
