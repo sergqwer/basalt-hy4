@@ -14,6 +14,7 @@
 #include "basalt/core/expert_source.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/large_pages.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
@@ -497,13 +498,35 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     // first as before; BASALT_RAM_AHEAD=0 / 1 forces either way.
     const char* ahead_env = std::getenv("BASALT_RAM_AHEAD");
     bool ahead = cover_ > 0 && (ahead_env != nullptr && *ahead_env != '\0' ? *ahead_env != '0' : peers_.empty());
+    // BASALT_RAM_LARGE_PAGES=1: the plan writes to stand-in addresses (reserved only) and the backing thread takes each
+    // layer's large pages, registers them with CUDA and opens the gate, which hands the readers the real address
+    // (platform/large_pages.hpp); a refusal moves that and the later layers to 4 KB pages, registered.  A process that
+    // cannot have large pages (SeLockMemoryPrivilege not held) keeps host VMM.
+    bool large = false;
+    if (ahead) {
+        const char* lp = std::getenv("BASALT_RAM_LARGE_PAGES");
+        std::string why;
+        large = platform::use_large_pages(lp != nullptr && *lp != '\0' && *lp != '0', platform::large_page_support(), why);
+        if (!why.empty()) basalt::log::info(s_.area.c_str(), "RAM expert tier: %s", why.c_str());
+    }
     if (ahead) {   // the address ranges now, their pages on the backing thread
         for (int l = 0; ahead && l < n_layers_; ++l) {
             const uint64_t span = s_.layers[(size_t) l].blob_bytes * (uint64_t) (cover_ + 1);
-            ahead = ram_allocations_[(size_t) l].reserve_pinned(span);
+            ahead = large ? ram_allocations_[(size_t) l].reserve_large(span, platform::large_page_support().page)
+                          : ram_allocations_[(size_t) l].reserve_pinned(span);
         }
-        if (!ahead)
+        if (!ahead) {
             for (auto& a : ram_allocations_) a.reset();
+            if (large) {   // no address space for the stand-ins: host VMM as before
+                basalt::log::info(s_.area.c_str(), "RAM expert tier: no stand-in address range for large pages: host VMM pages");
+                large = false;
+                ahead = true;
+                for (int l = 0; ahead && l < n_layers_; ++l)
+                    ahead = ram_allocations_[(size_t) l].reserve_pinned(s_.layers[(size_t) l].blob_bytes * (uint64_t) (cover_ + 1));
+                if (!ahead)
+                    for (auto& a : ram_allocations_) a.reset();
+            }
+        }
     }
     for (int l = 0; l < n_layers_; ++l) {
         const ExpertTierSpec::Layer& el = s_.layers[(size_t) l];
@@ -521,24 +544,36 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
         b->thread = std::thread([this, b, main_device_ = [] { int d = 0; return cudaGetDevice(&d) == cudaSuccess ? d : 0; }()] {
             (void) cudaSetDevice(main_device_);
             const auto t0 = std::chrono::steady_clock::now();
+            // a test knob: BASALT_RAM_LARGE_PAGES_REFUSE_AT=N takes the refusal path (as error 1450) from layer N on
+            const char* ra = std::getenv("BASALT_RAM_LARGE_PAGES_REFUSE_AT");
+            const int refuse_at = ra != nullptr && *ra != '\0' ? std::atoi(ra) : -1;
             for (int l = 0; l < n_layers_; ++l) {
-                const bool ok = ram_allocations_[(size_t) l].back(main_device_);
+                std::string note;
+                if (l == refuse_at && b->large_ok) {
+                    b->large_ok = false;
+                    note = "large pages refused (error 1450 forced by BASALT_RAM_LARGE_PAGES_REFUSE_AT=" + std::to_string(l) +
+                           "): this and the later layers take 4 KB pages, registered";
+                }
+                const bool ok = ram_allocations_[(size_t) l].back(main_device_, b->large_ok, note);
                 std::lock_guard<std::mutex> lk(b->mu);
+                if (!note.empty()) b->notes += (b->notes.empty() ? "" : "; ") + note;
                 if (!ok) { b->failed = true; b->cv.notify_all(); return; }
                 b->done = l + 1;
                 b->cv.notify_all();
             }
             b->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         });
-        plan.set_host_gate([this, b](const uint8_t* p, uint64_t n) {
+        plan.set_host_gate([this, b](uint8_t* p, uint64_t n) -> uint8_t* {
             for (int l = 0; l < n_layers_; ++l) {
-                const uint8_t* base = ram_[(size_t) l];
-                if (base == nullptr || p < base || p + n > base + ram_allocations_[(size_t) l].capacity()) continue;
+                const core::RamAllocation& a = ram_allocations_[(size_t) l];
+                const uint8_t* base = ram_[(size_t) l];   // the address the plan writes to (a stand-in with large pages)
+                if (base == nullptr || p < base || p + n > base + a.capacity()) continue;
                 std::unique_lock<std::mutex> lk(b->mu);
                 b->cv.wait(lk, [&] { return b->done > l || b->failed; });
-                return b->done > l;
+                if (b->done <= l) return nullptr;
+                return a.holds_standin(p, n) ? a.real(p) : p;
             }
-            return true;
+            return p;
         });
     }
     if (cover_ > 0) {
@@ -705,6 +740,7 @@ bool ExpertTier::finish_backing(std::string& err) {
     if (!backing_) return true;
     if (backing_->thread.joinable()) backing_->thread.join();
     const bool ok = !backing_->failed;
+    if (!backing_->notes.empty()) basalt::log::info(s_.area.c_str(), "RAM expert tier: %s", backing_->notes.c_str());
     if (ok)
         basalt::log::info(s_.area.c_str(), "RAM expert tier: its pinned pages taken beside the reads in %.1f s",
                           backing_->seconds);
@@ -716,6 +752,8 @@ bool ExpertTier::finish_backing(std::string& err) {
 
 bool ExpertTier::land_ram(std::string& err) {
     if (!finish_backing(err)) return false;
+    for (size_t l = 0; l < ram_.size() && l < ram_allocations_.size(); ++l)   // stand-in addresses (large pages) become real
+        if (ram_[l] != nullptr) ram_[l] = ram_allocations_[l].data();
     if (!ram_queued_) return true;
     uint64_t per_layer = 0;
     for (const ExpertTierSpec::Layer& e : s_.layers) per_layer += e.blob_bytes;
@@ -724,8 +762,19 @@ bool ExpertTier::land_ram(std::string& err) {
         for (const auto& a : ram_allocations_)
             if (a.allocation_pinned()) host_pinned += a.capacity();
         ram_pins_ = core::pin_ram_spans(ram_allocations_, /*mapped=*/false);
-        if (host_pinned)
-            basalt::log::info(s_.area.c_str(), "RAM expert tier: %.2f GiB CUDA-pinned through host VMM", host_pinned / 1073741824.0);
+        if (host_pinned) {
+            uint64_t by[3] = {0, 0, 0};   // host VMM, large pages, 4 KB registered
+            for (const auto& a : ram_allocations_) {
+                if (!a.allocation_pinned()) continue;
+                const std::string k = a.backing_name();
+                by[k == "large pages, registered" ? 1 : k == "4 KB pages, registered" ? 2 : 0] += a.capacity();
+            }
+            if (by[1] == 0 && by[2] == 0)
+                basalt::log::info(s_.area.c_str(), "RAM expert tier: %.2f GiB CUDA-pinned through host VMM", host_pinned / 1073741824.0);
+            else
+                basalt::log::info(s_.area.c_str(), "RAM expert tier: %.2f GiB in large pages, %.2f GiB in 4 KB pages, both registered",
+                                  by[1] / 1073741824.0, by[2] / 1073741824.0);
+        }
         int unpinned = 0;
         for (const core::RamPin& p : ram_pins_) unpinned += p.registered_bytes == 0;
         if (unpinned > 0)

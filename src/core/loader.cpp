@@ -687,7 +687,7 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
             } else if (it.host != nullptr) {
                 uint8_t* dst = it.host + out_off;
                 const FileHandle& f = *handles[(size_t) it.file];
-                if (plan.host_gate() && !plan.host_gate()(dst, out_len)) { fail("the RAM pages for the load could not be taken"); break; }
+                if (plan.host_gate() && (dst = plan.host_gate()(dst, out_len)) == nullptr) { fail("the RAM pages for the load could not be taken"); break; }
                 if (it.conv == Conv::Copy && pos % kAlign == 0 && (uintptr_t) dst % kAlign == 0 && t.len % kAlign == 0) {
                     if (!read_direct(f, dst, pos, t.len, m.buffered_bytes)) { fail("short read at file offset " + std::to_string(pos)); break; }
                 } else {

@@ -396,6 +396,8 @@ private:
         int done = 0;          ///< layers whose pages are taken
         bool failed = false;
         double seconds = 0;
+        bool large_ok = true;   ///< large pages not refused yet (a refusal moves the later layers to 4 KB pages)
+        std::string notes;
     };
     std::unique_ptr<Backing> backing_;
     bool finish_backing(std::string& err);

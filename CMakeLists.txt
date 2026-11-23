@@ -825,6 +825,12 @@ add_executable(pagefile_test tests/platform/pagefile_test.cpp)
 target_link_libraries(pagefile_test PRIVATE platform)
 basalt_cpu_test(NAME pagefile_test COMMAND pagefile_test)
 
+# large pages for the RAM tier: the choice on fake inputs; the live process without the privilege keeps its path; a
+# placeholder takes ordinary pages in place after a large-page refusal
+add_executable(large_pages_test tests/platform/large_pages_test.cpp)
+target_link_libraries(large_pages_test PRIVATE platform)
+basalt_cpu_test(NAME large_pages_test COMMAND large_pages_test)
+
 # platform::MappedFile, file_size and pread_all on a scratch file (CPU only).
 add_executable(mapped_file_test tests/platform/mapped_file_test.cpp)
 target_link_libraries(mapped_file_test PRIVATE platform)
