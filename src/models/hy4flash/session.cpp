@@ -15,6 +15,7 @@
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/core/ram_load.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -48,6 +49,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -279,6 +281,7 @@ public:
                 ea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 pea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 if (!ea_[(size_t) l]->open((uint64_t) ctx * sparse_row_bytes(), err) || !pea_[(size_t) l]->open((uint64_t) pools * pool_row_bytes(), err)) return false;
+                if (kv_stream()) ea_[(size_t) l]->set_piece(kStreamPiece);   // KV streaming moves the caches a piece at a time
                 cache_[(size_t) l] = ea_[(size_t) l]->data();
                 ipool_[(size_t) l] = (uint16_t*) pea_[(size_t) l]->data();
                 ival_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
@@ -294,6 +297,7 @@ public:
             bk_pools_.open();
         }
         if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
+        stream_report("start");
         use(sc_->dec);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err, i8()))
@@ -612,6 +616,7 @@ public:
         use(sc_->dec);
         ring_close();
         big_.release();
+        stream_out("the prompt's end");
         if (tier_) {
             std::string e;
             if (lent_ && !tier_->reclaim(e, /*restore=*/true)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
@@ -823,6 +828,7 @@ public:
                                                       std::to_string(ceiling) + " fit; --kv fp8 halves a position's bytes)"};
             }
         }
+        if (!big_.rows && kv_stream() && std::max(r.total_tokens, r.n_tokens) > stream_rows()) stream_in();
         if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
         if (tier_) { turn_h0_ = tier_->hits(); turn_l0_ = tier_->lookups(); }
         const int chunk = m_.diag_rows() > 0 ? std::min(rows_, m_.diag_rows()) : rows_;
@@ -914,6 +920,124 @@ public:
     // positions at start; more come out of the expert tier when a prompt or a generation needs them (ensure_positions), and a
     // later prompt that needs fewer gives them back (trim_positions), so a short conversation decodes with the larger tier.
     bool elastic() const { return m_.context() > core::kElasticKvBase; }
+
+    // ---- KV streaming (HY4_KV_STREAM=1, opt-in; one card, an elastic context): the sparse layers' rows outside a sink (the
+    // first piece) and the recent window (kStreamRecent positions) move from the card to CUDA-pinned host memory at the same
+    // addresses (ElasticArray::relocate), after a prompt and as a generation grows, and the expert tier takes the VRAM. Every
+    // kernel reads the same pointers, a row outside the card over the bus. A prompt of more than stream_rows() rows (HY4_KV_STREAM_ROWS,
+    // default 512) moves them back to the card first: its chunks read each row many times. The rows' bytes never change, so
+    // the output is the same as without streaming. HY4_KV_STREAM_CHECK=1 hashes every piece before and after its move.
+    static constexpr uint64_t kStreamPiece = 4ull << 20;
+    static constexpr int64_t kStreamRecent = 32768;
+    bool kv_stream() const {
+        static const bool on = [] {
+            const char* e = std::getenv("HY4_KV_STREAM");
+            return e && *e && *e != '0';
+        }();
+        int n = 0;
+        return on && elastic() && cudaGetDeviceCount(&n) == cudaSuccess && n == 1;
+    }
+    static int64_t stream_rows() {
+        static const int64_t v = [] { const char* e = std::getenv("HY4_KV_STREAM_ROWS"); return e ? std::atoll(e) : (int64_t) 512; }();
+        return v;
+    }
+    static bool stream_check() { static const bool on = std::getenv("HY4_KV_STREAM_CHECK") != nullptr; return on; }
+    uint64_t stream_host_bytes() const {
+        uint64_t n = 0;
+        for (int l = 0; l < g_.n_layers; ++l)
+            if (!g_.swa[(size_t) l] && ea_[(size_t) l]) n += ea_[(size_t) l]->host_bytes();
+        return n;
+    }
+    void stream_report(const char* when) {
+        if (!kv_stream()) return;
+        uint64_t allowance = 0;
+        std::string why;
+        const bool known = core::host_pin_budget(allowance, why);
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        basalt::log::info("basalt hy4flash", "KV streaming (%s): %.2f GiB of rows in RAM, %lld positions backed, host registration allowance left %s%s%s; "
+                          "expert tier %lld slots (%s arena), %.2f GiB VRAM free",
+                          when, stream_host_bytes() / 1073741824.0, (long long) backed_,
+                          known ? (std::to_string(allowance >> 20) + " MiB").c_str() : "unbounded", why.empty() ? "" : " - ", why.c_str(),
+                          tier_ ? (long long) tier_->slots() : 0LL, tier_ && tier_->partial_lend() ? "segmented VMM" : "unsegmented",
+                          free_b / 1073741824.0);
+    }
+    // The far pieces of every sparse layer to RAM; the tier takes the VRAM they leave.
+    void stream_out(const char* when) {
+        if (!kv_stream()) return;
+        const int64_t pos = (int64_t) hist_.size();
+        if (pos - kStreamRecent <= 0) return;
+        const uint64_t rb = (uint64_t) sparse_row_bytes(), to = (uint64_t) (pos - kStreamRecent) * rb / kStreamPiece * kStreamPiece;
+        if (to <= kStreamPiece) return;
+        uint64_t need = 0;
+        for (int l = 0; l < g_.n_layers; ++l)
+            if (!g_.swa[(size_t) l]) need += ea_[(size_t) l]->device_bytes_in(kStreamPiece, to);
+        if (need == 0) return;
+        uint64_t allowance = 0;
+        std::string why;
+        if (core::host_pin_budget(allowance, why) && need + (1ull << 30) > allowance) {
+            basalt::log::warn("basalt hy4flash", "KV streaming: %.2f GiB more rows would pass the host registration allowance (%lld MiB left%s%s); they stay on the card",
+                              need / 1073741824.0, (long long) (allowance >> 20), why.empty() ? "" : ": ", why.c_str());
+            return;
+        }
+        ring_join();
+        if (copy_) cudaStreamSynchronize(copy_);
+        cudaStreamSynchronize(stream_);
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t moved = 0;
+        std::string e;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            uint64_t m = 0;
+            const bool ok = ea_[(size_t) l]->relocate(kStreamPiece, to, true, m, e, stream_check());
+            moved += m;
+            if (!ok) {
+                basalt::log::warn("basalt hy4flash", "KV streaming: layer %d keeps rows on the card: %s", l, e.c_str());
+                break;
+            }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (tier_) {
+            std::string r;
+            tier_->reclaim(r, /*restore=*/true);
+            tier_->grow();
+        }
+        basalt::log::info("basalt hy4flash", "KV streaming: %.2f GiB of rows to RAM at %s (%lld positions) in %.0f ms", moved / 1073741824.0, when, (long long) pos, ms);
+        stream_report(when);
+    }
+    // Every piece in RAM back to the card, for a long prompt (the tier lends what the card lacks); what cannot move stays readable in RAM.
+    void stream_in() {
+        const uint64_t bytes = stream_host_bytes();
+        if (bytes == 0) return;
+        ring_join();
+        if (copy_) cudaStreamSynchronize(copy_);
+        cudaStreamSynchronize(stream_);
+        const auto t0 = std::chrono::steady_clock::now();
+        const int64_t slots0 = tier_ ? tier_->slots() : 0;
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const uint64_t floor = tier_ ? tier_->free_floor() : 256ull << 20;
+        if (tier_ && free_b < bytes + floor) {
+            tier_->shrink();
+            cudaMemGetInfo(&free_b, &total_b);
+            if (free_b < bytes + floor && !(tier_->partial_lend() && tier_->lend(bytes + floor - free_b))) tier_->lend_all();
+        }   // the prompt's end (stream_out) moves the rows out again and the tier takes its slots back
+        uint64_t moved = 0;
+        std::string e;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            uint64_t m = 0;
+            const bool ok = ea_[(size_t) l]->relocate(0, ea_[(size_t) l]->capacity(), false, m, e, stream_check());
+            moved += m;
+            if (!ok) {
+                basalt::log::warn("basalt hy4flash", "KV streaming: layer %d reads part of its rows from RAM in this prompt: %s", l, e.c_str());
+                break;
+            }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        basalt::log::info("basalt hy4flash", "KV streaming: %.2f GiB of rows back to the card for a prompt in %.0f ms; expert tier %lld -> %lld slots",
+                          moved / 1073741824.0, ms, (long long) slots0, tier_ ? (long long) tier_->slots() : 0LL);
+    }
     int64_t kv_base() const { return std::min<int64_t>(m_.context(), core::kElasticKvBase); }
     // device bytes a position takes in the sparse layers' caches (its row and a quarter of a pooled key)
     double cell_bytes() const {
@@ -3236,6 +3360,7 @@ private:
                     std::string r;
                     if (!tier_->reclaim(r)) basalt::log::warn("basalt hy4flash", "the latent caches took expert slots at %lld positions: %s", (long long) target, r.c_str());
                 }
+                if (!big_.rows) stream_out("a generation's growth");
                 return true;
             }
             if (!tier_ || attempt == 2) {
