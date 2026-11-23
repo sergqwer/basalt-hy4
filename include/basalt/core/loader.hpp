@@ -99,10 +99,16 @@ public:
     /// the plan writes is listed even when it counts nothing; the bytes sum to counted().
     std::vector<std::pair<std::string, uint64_t>> counted_by_target(int main_card) const;
 
+    /// A gate the readers pass before they write host memory: it returns once `[p, p + n)` may be written (its pages are
+    /// taken), false when they never will be.  None: host memory is ready when the plan runs.
+    void set_host_gate(std::function<bool(const uint8_t*, uint64_t)> gate) { host_gate_ = std::move(gate); }
+    const std::function<bool(const uint8_t*, uint64_t)>& host_gate() const { return host_gate_; }
+
 private:
     std::vector<File> files_;
     std::vector<LoadItem> items_;
     std::vector<std::function<bool(std::string&)>> steps_;
+    std::function<bool(const uint8_t*, uint64_t)> host_gate_;
 };
 
 class Loader {

@@ -18,6 +18,8 @@
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -40,6 +42,7 @@ ExpertTier::ExpertTier(ExpertTierSpec spec) : s_(std::move(spec)) {}
 ExpertTier::~ExpertTier() {
     std::string read_err;
     await_reads(read_err);   // the reads write into the RAM tier freed below
+    (void) finish_backing(read_err);
     report("final");
     if (copy_stream_) issue(-1, kAllPieces);
     if (!peer_moves_.empty()) {   // every card: an idle card's sync is cheap, a skipped one leaves a copy in flight
@@ -488,15 +491,62 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     ram_queued_ = true;
     // the layout: one span per layer, each with its swap spare
     ram_allocations_.resize((size_t) n_layers_);
+    // The pinned pages are what takes the time (28.9 s for 78 GiB on this PC, the reads 14 s): on one card they are taken
+    // on a thread of their own, a layer ahead of the readers (13 s beside them), so the start waits for the slower of the
+    // two instead of their sum.  With a second card the driver's pin limit can refuse pages late, so the start takes them
+    // first as before; BASALT_RAM_AHEAD=0 / 1 forces either way.
+    const char* ahead_env = std::getenv("BASALT_RAM_AHEAD");
+    bool ahead = cover_ > 0 && (ahead_env != nullptr && *ahead_env != '\0' ? *ahead_env != '0' : peers_.empty());
+    if (ahead) {   // the address ranges now, their pages on the backing thread
+        for (int l = 0; ahead && l < n_layers_; ++l) {
+            const uint64_t span = s_.layers[(size_t) l].blob_bytes * (uint64_t) (cover_ + 1);
+            ahead = ram_allocations_[(size_t) l].reserve_pinned(span);
+        }
+        if (!ahead)
+            for (auto& a : ram_allocations_) a.reset();
+    }
     for (int l = 0; l < n_layers_; ++l) {
         const ExpertTierSpec::Layer& el = s_.layers[(size_t) l];
         if (cover_ <= 0) continue;
         const uint64_t span = el.blob_bytes * (uint64_t) (cover_ + 1);
-        if (!ram_allocations_[(size_t) l].allocate(span)) {
+        if (!ahead && !ram_allocations_[(size_t) l].allocate(span)) {
             err = s_.name + ": cannot allocate the RAM expert tier";
             return false;
         }
         ram_[(size_t) l] = ram_allocations_[(size_t) l].data();
+    }
+    if (ahead) {
+        backing_ = std::make_unique<Backing>();
+        Backing* b = backing_.get();
+        b->thread = std::thread([this, b, main_device_ = [] { int d = 0; return cudaGetDevice(&d) == cudaSuccess ? d : 0; }()] {
+            (void) cudaSetDevice(main_device_);
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int l = 0; l < n_layers_; ++l) {
+                const bool ok = ram_allocations_[(size_t) l].back(main_device_);
+                std::lock_guard<std::mutex> lk(b->mu);
+                if (!ok) { b->failed = true; b->cv.notify_all(); return; }
+                b->done = l + 1;
+                b->cv.notify_all();
+            }
+            b->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        });
+        plan.set_host_gate([this, b](const uint8_t* p, uint64_t n) {
+            for (int l = 0; l < n_layers_; ++l) {
+                const uint8_t* base = ram_[(size_t) l];
+                if (base == nullptr || p < base || p + n > base + ram_allocations_[(size_t) l].capacity()) continue;
+                std::unique_lock<std::mutex> lk(b->mu);
+                b->cv.wait(lk, [&] { return b->done > l || b->failed; });
+                return b->done > l;
+            }
+            return true;
+        });
+    }
+    if (cover_ > 0) {
+        uint64_t got = 0;
+        for (const auto& a : ram_allocations_) got += a.capacity();
+        basalt::log::info(s_.area.c_str(), "RAM expert tier: %.2f GiB %s in %.1f s", got / 1073741824.0,
+                          backing_ ? "reserved (its pages follow beside the reads)" : "allocated",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - ram_t0_).count());
     }
     // every expert's blob: into its RAM place, and onto the card that is its home, in the start's pass (the file's
     // share is not read)
@@ -532,8 +582,54 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     return true;
 }
 
+// A test knob (BASALT_RAM_HASH=1): one hash of every RAM-tier expert's bytes, in (layer, expert) order whatever their places,
+// logged once the tier has landed, so two loaders can be compared byte for byte.
+static void log_ram_hash(const std::string& area, int n_layers, int n_expert, const std::vector<ExpertTierSpec::Layer>& layers,
+                         const std::vector<uint8_t*>& ram, const std::vector<int32_t>& ram_idx) {
+    const char* v = std::getenv("BASALT_RAM_HASH");
+    if (v == nullptr || *v == '\0' || *v == '0') return;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<uint64_t> per((size_t) n_layers, 0);
+    std::vector<int> counted((size_t) n_layers, 0);
+    std::atomic<int> next{0};
+    auto work = [&] {
+        for (int l; (l = next.fetch_add(1)) < n_layers;) {
+            uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t) l;
+            const uint64_t blob = layers[(size_t) l].blob_bytes;
+            for (int e = 0; e < n_expert; ++e) {
+                const int32_t place = ram_idx[(size_t) l * n_expert + e];
+                if (place < 0) continue;
+                const uint8_t* p = ram[(size_t) l] + (size_t) place * blob;
+                h = (h ^ (uint64_t) e) * 0x100000001b3ull;
+                uint64_t w;
+                size_t i = 0;
+                for (; i + 8 <= blob; i += 8) {
+                    std::memcpy(&w, p + i, 8);
+                    h = (h ^ w) * 0x9e3779b97f4a7c15ull;
+                    h ^= h >> 29;
+                }
+                for (; i < blob; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+                ++counted[(size_t) l];
+            }
+            per[(size_t) l] = h;
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int i = 0; i < 16; ++i) pool.emplace_back(work);
+    for (auto& t : pool) t.join();
+    uint64_t all = 0;
+    int n = 0;
+    for (int l = 0; l < n_layers; ++l) {
+        all = (all ^ per[(size_t) l]) * 0x100000001b3ull + (uint64_t) l;
+        n += counted[(size_t) l];
+    }
+    basalt::log::info(area.c_str(), "RAM tier hash %016llx over %d experts (%.1f s, BASALT_RAM_HASH)", (unsigned long long) all, n,
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
 bool ExpertTier::attach(std::string& err) {
     if (!land_ram(err)) return false;
+    if (cover_ > 0) log_ram_hash(s_.area, n_layers_, n_expert_, s_.layers, ram_, ram_idx_);
     if (homes_.main == 0) seed_copies(0, /*base_shares=*/true);
     promoted_ = 0;
     return plan_ext(err) && open_route(err);   // after the RAM tier is pinned: its registration takes VRAM too
@@ -605,7 +701,21 @@ kernels::ResidentTabs ExpertTier::held_tabs(int layer) const {
 }
 
 // The RAM tier's experts have landed (the pass's pinned staging is freed by then): its spans are pinned.
+bool ExpertTier::finish_backing(std::string& err) {
+    if (!backing_) return true;
+    if (backing_->thread.joinable()) backing_->thread.join();
+    const bool ok = !backing_->failed;
+    if (ok)
+        basalt::log::info(s_.area.c_str(), "RAM expert tier: its pinned pages taken beside the reads in %.1f s",
+                          backing_->seconds);
+    else
+        err = s_.name + ": cannot allocate the RAM expert tier (its pinned pages; BASALT_RAM_AHEAD=0 takes them before the reads)";
+    backing_.reset();
+    return ok;
+}
+
 bool ExpertTier::land_ram(std::string& err) {
+    if (!finish_backing(err)) return false;
     if (!ram_queued_) return true;
     uint64_t per_layer = 0;
     for (const ExpertTierSpec::Layer& e : s_.layers) per_layer += e.blob_bytes;

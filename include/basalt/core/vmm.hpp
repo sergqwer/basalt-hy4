@@ -20,6 +20,12 @@ uint64_t host_granularity();
 /// Returns the padded mapping size for free_host; no portable registration is involved.
 uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped);
 void free_host(uint8_t* ptr, uint64_t mapped);
+/// alloc_host in two steps: the address range (`reserved` bytes, cheap), then its pinned backing piece by piece (the slow
+/// part: the pages are taken and locked), which another thread may do while readers wait for the bytes they need.  `backed`
+/// is how far the backing got; free_host_range takes back that much and the range.  `device` -1: the current one.
+uint8_t* reserve_host(uint64_t bytes, uint64_t& reserved);
+bool back_host(uint8_t* ptr, uint64_t reserved, uint64_t& backed, int device = -1);
+void free_host_range(uint8_t* ptr, uint64_t backed, uint64_t reserved);
 /// Reserves `bytes` of address space (a multiple of the granularity); null on failure.
 uint8_t* reserve(uint64_t bytes);
 void release_range(uint8_t* va, uint64_t bytes);

@@ -228,6 +228,7 @@ RamAllocation& RamAllocation::operator=(RamAllocation&& other) noexcept {
     bytes_ = std::exchange(other.bytes_, 0);
     capacity_ = std::exchange(other.capacity_, 0);
     allocation_pinned_ = std::exchange(other.allocation_pinned_, false);
+    backed_ = std::exchange(other.backed_, 0);
     return *this;
 }
 
@@ -238,6 +239,7 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
     if constexpr (platform::kPreferHostVmm) {
         if (pin) data_ = vmm::alloc_host(bytes, capacity_);
         allocation_pinned_ = data_ != nullptr;
+        backed_ = capacity_;
     }
     if (!data_) {
         data_ = alloc_ram(bytes);
@@ -248,11 +250,31 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
     return true;
 }
 
+bool RamAllocation::reserve_pinned(uint64_t bytes) {
+    reset();
+    if (!bytes) return true;
+    if constexpr (platform::kPreferHostVmm) {
+        data_ = vmm::reserve_host(bytes, capacity_);
+        if (data_) {
+            allocation_pinned_ = true;
+            backed_ = 0;
+            bytes_ = bytes;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool RamAllocation::back(int device) {
+    if (!allocation_pinned_ || backed_ == capacity_) return data_ != nullptr || bytes_ == 0;
+    return vmm::back_host(data_, capacity_, backed_, device);
+}
+
 void RamAllocation::reset() {
-    if (allocation_pinned_) vmm::free_host(data_, capacity_);
+    if (allocation_pinned_) vmm::free_host_range(data_, backed_, capacity_);
     else platform::free_aligned(data_);
     data_ = nullptr;
-    bytes_ = capacity_ = 0;
+    bytes_ = capacity_ = backed_ = 0;
     allocation_pinned_ = false;
 }
 

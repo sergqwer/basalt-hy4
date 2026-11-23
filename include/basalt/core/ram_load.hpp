@@ -45,6 +45,10 @@ public:
     RamAllocation& operator=(const RamAllocation&) = delete;
     /// `pin` permits allocation-backed pinning; ordinary memory is registered separately after the read.
     bool allocate(uint64_t bytes, bool pin = true);
+    /// allocate's pinned form in two steps: the address range now (false without host VMM: allocate then), its pinned
+    /// pages by back(), from any thread, before anything touches them.
+    bool reserve_pinned(uint64_t bytes);
+    bool back(int device);
     void reset();
     uint8_t* data() const { return data_; }
     uint64_t bytes() const { return bytes_; }
@@ -53,6 +57,7 @@ public:
 private:
     uint8_t* data_ = nullptr;
     uint64_t bytes_ = 0, capacity_ = 0;
+    uint64_t backed_ = 0;   ///< a reserved range's pinned bytes so far (reserve_pinned); capacity_ once allocated whole
     bool allocation_pinned_ = false;
 };
 
