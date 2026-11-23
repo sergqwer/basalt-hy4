@@ -444,7 +444,7 @@ public:
         b.e = f((int64_t) R * E); b.cur = f((int64_t) R * E); b.xn = f((int64_t) R * E); b.attn = f((int64_t) R * E);
         b.attn_raw = f((int64_t) A * E); b.mlp = f((int64_t) R * E); b.mlp2 = f((int64_t) R * E);
         b.qa = f((int64_t) A * g_.q_lora); b.qan = f((int64_t) A * g_.q_lora); b.q = f((int64_t) A * max_heads_ * g_.qk_dim);
-        b.kvraw = f((int64_t) A * kRowWidth); b.qabs = f((int64_t) A * max_heads_ * g_.kv_lora);
+        b.kvraw = f((int64_t) A * kRowWidth); b.qabs = qdirect() ? nullptr : f((int64_t) A * max_heads_ * g_.kv_lora);
         b.qcur = f((int64_t) A * max_heads_ * kRowWidth); b.olat = f((int64_t) A * max_heads_ * g_.kv_lora);
         b.vout = f((int64_t) A * max_heads_ * g_.v_dim); b.gate = f((int64_t) A * max_heads_ * g_.v_dim);
         b.ik = f((int64_t) A * g_.idx_dim); b.ikn = f((int64_t) A * g_.idx_dim); b.ivt = f((int64_t) A * g_.idx_dim);
@@ -1146,6 +1146,9 @@ private:
     int max_cells(int l) const { return g_.swa[(size_t) l] ? g_.window : cells_stride_; }   // a row's cells in layer l
     bool fp8() const { return m_.cache_fp8(); }
     bool i8() const { return m_.cache_i8(); }
+    /// HY4_Q_DIRECT=1: a chunk's k_b product writes the query rows' latent part straight into qcur_ (no q_abs buffer, no copy);
+    /// with --kv int8 the chunk then reads the f32 query rows (attend_i8_kernel<false>) instead of packed ones.
+    static bool qdirect() { static const bool on = std::getenv("HY4_Q_DIRECT") != nullptr; return on; }
     bool f32() const { return m_.cache_f32(); }
     int elem() const { return f32() ? 4 : 2; }
     int sparse_row_bytes() const { return i8() ? kI8RowBytes : fp8() ? kFp8RowBytes : kRowWidth * elem(); }
@@ -1307,7 +1310,9 @@ private:
     }
     // The per-head products of the absorbed attention (k_b: 192 -> 512, v_b: 512 -> 256 per head): a chunk takes MMQ, a head at a time
     // over the rows of the step; a window keeps the kernel that rounds like the other single-row products.
-    void heads_product(const DevTensor* w, const float* x, int x_head_stride, int x_tok_stride, int H, int rows, int k, int R, float* y) {
+    void heads_product(const DevTensor* w, const float* x, int x_head_stride, int x_tok_stride, int H, int rows, int k, int R, float* y,
+                       int ld_y = 0) {   // ld_y: y's row stride (0: rows); only a chunk's MMQ honours it
+        if (ld_y == 0) ld_y = rows;
         namespace mmq = basalt::prefill::mmq;
         if (R > kMaxWindow && R <= arows_ && mmq::built() && mmq::fits(w->type, rows)) {
             if (loaded_.insert({w->type, rows}).second) mmq::load(w->type, rows);
@@ -1328,10 +1333,11 @@ private:
             p.total_rows = (int64_t) H * R;
             p.max_rows = R;
             p.dst = y;
-            p.ld_dst = rows;
+            p.ld_dst = ld_y;
             mmq_.run(p, stream_);
             return;
         }
+        if (ld_y != rows) throw std::runtime_error("heads_product: a row stride needs the MMQ path");
         q8_0_heads_gemv(w->ptr, x, x_head_stride, x_tok_stride, H, rows, k, R, y, stream_);
     }
     // A window's normed input xn_ quantized once for the products that read it (gemm quantizes per call): the same kernels and
@@ -1481,11 +1487,19 @@ private:
             });
         } else {
             uint8_t* cache = cache_[(size_t) l];
+            if (qdirect()) {   // the latent part lands in qcur_'s rows; prepare adds the rope part and the cache rows
+                heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qcur_, kRowWidth);
+                if (i8r) mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);
+                else if (f8) mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
+                else if (f32()) mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
+                else mla_prepare(q_, nullptr, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+            } else {
             heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
             if (i8r) mla_prepare_i8q(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (int8_t*) cache, stream_);   // qcur_: packed int8 rows
             else if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
             else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
             else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+            }
         }
         if (diag(l) && f32() && !swa) {   // the inputs of the attention, for the reference's tensors (fp32 caches only)
             const uint8_t* cache = cache_[(size_t) l];
@@ -1541,7 +1555,7 @@ private:
                 if (!swa && sg.s->bk_cells_.d)   // HY4_BOUNDS_CHECK: every cell in [0, backed)
                     core::bounds::check_cells(rs.firsts, const_cast<int32_t*>(rs.counts), const_cast<int32_t*>(rs.cells), rs.cells_stride, rs.fill,
                                               sg.rows, sg.s->bk_cells_.d, core::bounds::kAttendCells, l, stream_);
-                if (i8r && R > kMaxWindow) mla_attend_i8q(qcur_ + (size_t) sg.row0 * H * kI8QRowBytes / 4, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, ol, stream_);
+                if (i8r && R > kMaxWindow && !qdirect()) mla_attend_i8q(qcur_ + (size_t) sg.row0 * H * kI8QRowBytes / 4, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, ol, stream_);
                 else if (i8r) mla_attend(qc, (const int8_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
                 else if (f32()) mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);

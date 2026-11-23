@@ -283,16 +283,18 @@ __device__ __forceinline__ void cache_row(const float* __restrict__ kv_raw, cons
     store_cell(cache, (size_t) (ring ? pos % ring : pos), lat, rp, a, red);
 }
 
-// Block h < heads: the head's query row; block `heads`: the cache row. y = the token.
+// Block h < heads: the head's query row (q_abs null: only its rope part); block `heads`: the cache row. y = the token.
 template <typename C>
 __global__ void prepare_kernel(const float* __restrict__ q, const float* __restrict__ q_abs, const float* __restrict__ kv_raw,
                                const float* __restrict__ kv_norm, MlaArgs a, int pos0, int ring, float* __restrict__ qcur,
                                C* __restrict__ cache) {
     const int h = blockIdx.x, t = blockIdx.y, W = a.rank + a.rope, pos = pos0 + t;
     if (h < a.heads) {
-        const float* qa = q_abs + (size_t) t * a.heads * a.rank;
-        float* out = qcur + (size_t) t * a.heads * W;
-        for (int c = threadIdx.x; c < a.rank; c += blockDim.x) out[(size_t) h * W + c] = qa[(size_t) h * a.rank + c];
+        if (q_abs) {   // null: the k_b product wrote the latent part in place
+            const float* qa = q_abs + (size_t) t * a.heads * a.rank;
+            float* out = qcur + (size_t) t * a.heads * W;
+            for (int c = threadIdx.x; c < a.rank; c += blockDim.x) out[(size_t) h * W + c] = qa[(size_t) h * a.rank + c];
+        }
         query_rope(q, a, pos, t, h, qcur);
         return;
     }
