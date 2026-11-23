@@ -5,3 +5,5 @@ docs/community/benchmarks.json text eol=lf
 # Windows batch files break on LF line endings (cmd mis-parses carets and labels), so they always check out CRLF
 *.bat text eol=crlf
 *.cmd text eol=crlf
+# stored with CRLF in the repo itself too, so a raw download from GitHub runs
+tools/windows/*.bat -text
