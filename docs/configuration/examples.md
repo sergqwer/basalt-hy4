@@ -7,7 +7,7 @@ Start with `bin/basalt serve --config basalt_config.json`. Model paths are relat
 ```json
 {
   "version": 2,
-  "models": [{ "model": "Hy4-flash-NVFP4.basalt", "gpu": "0", "max-context": 262144, "vision": "dynamic" }],
+  "models": [{ "model": "Hy4-flash-NVFP4-GPTQ.basalt", "gpu": "0", "max-context": 262144, "vision": "dynamic" }],
   "engine": { "vram-reserve-mib": 700 },
   "server": { "host": "127.0.0.1", "port": 8080 }
 }

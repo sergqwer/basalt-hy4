@@ -8,7 +8,7 @@ and starts the next.
   "version": 2,
   "engine": { "conversation-cache-disk-mib": 32768, "idle-sleep": 300, "vram-reserve-mib": 500 },
   "models": [
-    { "alias": "Hy4-flash", "model": "Hy4-flash-NVFP4.basalt", "gpu": "auto", "max-context": 262144, "vision": "dynamic" },
+    { "alias": "Hy4-flash", "model": "Hy4-flash-NVFP4-GPTQ.basalt", "gpu": "auto", "max-context": 262144, "vision": "dynamic" },
     { "alias": "Hy4-flash-test", "model": "Hy4-flash-Q4_K_M-test.basalt", "gpu": "auto", "kv": "fp8", "max-context": 1048576 }
   ],
   "server": { "host": "127.0.0.1", "port": 8080 }
