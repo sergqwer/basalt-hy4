@@ -116,22 +116,26 @@ Report* device_report() {
 
 bool Limit::open() {
     if (h || !device_report()) return h != nullptr;
-    void* p = nullptr;
     void* dp = nullptr;
-    if (cudaHostAlloc(&p, sizeof(int64_t), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-        cudaHostGetDevicePointer(&dp, p, 0) != cudaSuccess) {
+    if (cudaMalloc(&dp, sizeof(int64_t)) != cudaSuccess) {
         cudaGetLastError();
-        if (p) cudaFreeHost(p);
         return false;
     }
-    h = (int64_t*) p;
-    *h = INT64_MAX;
+    h = new int64_t(INT64_MAX);
     d = (const int64_t*) dp;
+    set(INT64_MAX);
     return true;
 }
 
+void Limit::set(int64_t v) {
+    if (!h) return;
+    *h = v;
+    cudaMemcpy(const_cast<int64_t*>(d), &v, sizeof v, cudaMemcpyHostToDevice);
+}
+
 void Limit::close() {
-    if (h) cudaFreeHost(h);
+    if (d) cudaFree(const_cast<int64_t*>(d));
+    delete h;
     h = nullptr;
     d = nullptr;
 }

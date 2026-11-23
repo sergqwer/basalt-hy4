@@ -41,14 +41,15 @@ bool enabled();
 /// The report's device view (null while off, or when the mapped page cannot be allocated).
 Report* device_report();
 
-/// A mapped int64 the host keeps at a limit the device checks read (graph-safe: a captured launch reads the current
-/// value). Opens only while enabled(); `d` null otherwise.
+/// A limit the device checks read from device memory (graph-safe: a captured launch reads the current value; a mapped
+/// host word read by every block cost the prompt 8%), with its host copy. Opens only while enabled(); `d` null otherwise.
+/// set() copies synchronously: the launches after it read the new value.
 struct Limit {
     int64_t* h = nullptr;
     const int64_t* d = nullptr;
     bool open();
     void close();
-    void set(int64_t v) { if (h) *h = v; }
+    void set(int64_t v);
     int64_t get() const { return h ? *h : INT64_MAX; }
     ~Limit() { close(); }
 };
