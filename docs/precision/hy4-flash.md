@@ -175,3 +175,26 @@ of closeness here; KLD and top-1 are.
 
 With the Q8_0 head the same steps hold: off 24.0 ms a conv window (two runs, 22.5 and 25.6) and KLD 0.2060; R 15 23.1 ms and
 0.2091; R 12 20.6 ms and 0.2402; LAMBDA 0.01 21.5 ms and 0.2295. A KLD step under about 0.005 is placement noise.
+
+## Opt-in formats measured against BF16 (fork, 2026-11-23)
+
+One combined run on the GPTQ pack (wikitext base of the BF16 reference, 30 chunks, 7,650 rows, frozen tier, `--expert-cache 4800`;
+differences against the GPTQ pack with a 95% paired bootstrap over chunks):
+
+| Pack | NLL | KLD vs BF16 | Top-1 | KLD minus GPTQ pack | Top-1 minus GPTQ pack |
+|---|---|---|---|---|---|
+| GPTQ pack (default) | 2.7559 | 0.2231 | 86.48% | | |
+| + Engram rows as int8 + fp16 row scale (type 46) | 2.7642 | 0.2216 | 86.22% | -0.0015 [-0.025, +0.021] | -0.26 pp [-0.92, +0.42] |
+| + 392 GPTQ'd dense NVFP4 planes (type 45) | 2.7882 | 0.3764 | 81.86% | +0.153 [+0.126, +0.183] | -4.63 pp [-5.65, -3.61] |
+| Tier-shift noise (`--expert-cache 4000`) | 2.7613 | 0.2267 | 86.05% | +0.0036 [-0.016, +0.022] | -0.43 pp [-1.05, +0.18] |
+
+- **Engram int8.** The table's rms row error falls from 2.67% (E4M3 codes, no scale) to 0.63%, but the model's output against
+  BF16 does not move beyond the placement noise. The format is supported (`hy4_retrofit.py --engram-i8`); the published pack
+  keeps E4M3.
+- **Dense NVFP4 planes.** +10.8% on a 64K prompt and +19% on short struct decode (17 more VRAM experts per layer), but 9x the
+  tier-shift noise at 32K and 34x at 128K against the GPTQ pack, and the KLD against BF16 above. Not used by default.
+- **`BASALT_HY4_ROUTER_TC=1`** (BF16 hi+lo router logits on tensor cores): +3.5% on a 64K prompt; per-answer KLD against the
+  fp32 router 0.0062 at 32K (1.9x the noise arm) and 0.0100 at 128K (4.6x). Opt-in.
+- **`HY4_RESEED=1`** (after a lending prompt, the take-back refills the tier from the prompt's own top experts): 128K agent
+  decode with and without it reads 59.7% and 59.8% VRAM hits, verify 73.3 and 72.5 ms a window. Placement changes tokens at
+  the tier-noise level (CPU and GPU experts round differently), so it stays opt-in.

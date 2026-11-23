@@ -34,6 +34,10 @@ def members(root: Path, windows: bool) -> list[tuple[Path, str, bool]]:
         if not (root / rel).is_file():
             sys.exit(f"package_release: {root / rel} is missing; build first")
         out.append((root / rel, rel, True))
+    # the Rust server (basalt serve --server rust finds it beside basalt): packed when it has been built
+    serve_rs = root / "serve-rs" / "target" / "release" / f"basalt-serve{'.exe' if windows else ''}"
+    if serve_rs.is_file():
+        out.append((serve_rs, f"bin/{serve_rs.name}", True))
     for rel in FILES + TOOLS:
         if not (root / rel).is_file():
             sys.exit(f"package_release: {root / rel} is missing")
