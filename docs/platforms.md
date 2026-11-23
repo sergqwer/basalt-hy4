@@ -75,7 +75,11 @@ Hy4-flash reads no video, so the engine needs no FFmpeg. Upstream's video setup:
   Whole-expert slices retain their own device aliases; the unregistered tail is locked in the working set.
   The resident RAM expert tier uses CUDA host VMM when supported, with ordinary registration as the fallback.
   Allocation-backed pins stay in RAM across SLEEP/WAKE; the expert caches can still return their VRAM.
-- Large pages need "Lock pages in memory" (Administrators). Without it the engine uses 4 KiB pages and says so at start.
+- Large pages need the account to hold "Lock pages in memory" (SeLockMemoryPrivilege). Without it the engine uses
+  4 KiB pages and says so at start. `tools\windows\grant-lock-pages.bat`, run as administrator, grants it to the
+  account that started it (or to the account named as its argument). It applies after that account signs out and back
+  in. After that, the engine needs no elevation: the right sits in the normal token, disabled, and the engine enables it.
+  `whoami /priv` shows whether a token holds it.
 - No shared arena files and no cgroup limits.
 - `basalt serve` runs the Python server as a child.
 - A display-attached GPU can hit the driver's timeout (TDR). Raise `TdrDelay` under `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`.
