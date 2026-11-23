@@ -84,6 +84,9 @@ void mla_query(const void* w_kb, const float* q, const float* kv_raw, const floa
 /// ids[h * rows + t] = t * heads + h: the (token, head) rows of a [token][head][k] array in head-major order; bounds[h] = h * rows
 /// for h <= heads (each head an "expert" of an MMQ product).
 void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream);
+/// n int32 from device memory into mapped pinned host memory (`dst`: its device alias), fenced for the host: once the stream
+/// is synchronized the host reads them without a copy (the prompt path's routing read-back).
+void put_i32_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 
 /// x[i] *= sigmoid(g[i]).
 void mul_sigmoid(const float* g, float* x, int n, void* stream);

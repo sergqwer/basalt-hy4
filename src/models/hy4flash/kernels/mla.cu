@@ -741,6 +741,17 @@ void query_impl(const void* w_kb, const float* q, const float* kv_raw, const flo
 
 }  // namespace
 
+__global__ void put_i32_mapped_kernel(int32_t* __restrict__ dst, const int32_t* __restrict__ src, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) dst[i] = src[i];
+    __threadfence_system();
+}
+
+void put_i32_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const int blocks = (int) std::min<int64_t>((n + 255) / 256, 256);
+    put_i32_mapped_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, src, n);
+}
+
 void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream) {
     const int n = std::max(heads * rows, heads + 1);
     head_major_ids_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(ids, bounds, heads, rows);
