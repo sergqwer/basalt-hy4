@@ -11,6 +11,10 @@ tensors need no conversion at load.
                   least-squares scales), for testing the engine's dense NVFP4 path; a GPTQ pack rounds from BF16 instead
   --embd-bf16 DIR the token embedding as BF16 rows from the checkpoint DIR (model.embed_tokens.weight), copied as stored
                   (an option: +0.35 GB of host RAM against the Q8_0 rows; checked to round to the pack's Q8_0 bytes)
+  --engram-i8 DIR the Engram table (E4M3 codes, no scale) again from the checkpoint DIR's BF16 rows (each Engram layer's
+                  multi_head_embedding, in ple.layers order) as int8 values + an fp16 scale a row (absmax / 127): type 46,
+                  I8_ROW_F16, 98 bytes a row (+1.32 GB on disk; rms error 0.63% against 2.67%). Sampled rows are first
+                  checked to round to the pack's own E4M3 codes, so the rows are the pack's rows
 
 Every other section is copied byte for byte; the `gguf` section is laid out again (each tensor 4096-aligned, in the old
 order) when the head changes. The source pack is only read. For a pack made by swapping sections in place (the GPTQ pack):
@@ -69,6 +73,83 @@ def _planes_job(args):
 EMBD = "token_embd.weight"
 
 
+ENGRAM_I8 = 46               # int8 values then the row's fp16 scale (I8_ROW_F16)
+ENGRAM_SLICE = 1 << 18       # rows a job
+
+
+def _engram_i8_job(args):
+    """BF16 rows [n][w] at `off` of `path` as int8 + fp16 scale rows, and their squared error and energy."""
+    path, off, n, w = args
+    with open(path, "rb") as f:
+        f.seek(off)
+        u = np.frombuffer(f.read(n * w * 2), dtype="<u2")
+    if u.size != n * w:
+        die("short read in the Engram rows")
+    x = (u.astype(np.uint32) << 16).view(np.float32).reshape(n, w)
+    if not np.isfinite(x).all():
+        die("the Engram table holds a non-finite value")
+    s = (np.abs(x).max(axis=1, keepdims=True) / 127.0).astype(np.float16)
+    sf = s.astype(np.float32)
+    ok = sf > 0
+    q = np.where(ok, np.clip(np.rint(x / np.where(ok, sf, 1)), -127, 127), 0).astype(np.int8)
+    e = q.astype(np.float32) * sf - x
+    out = np.empty((n, w + 2), dtype=np.uint8)
+    out[:, :w] = q.view(np.uint8)
+    out[:, w:] = s.astype("<f2").view(np.uint8).reshape(n, 2)
+    return (out.tobytes(), float(np.square(e, dtype=np.float64).sum()), float(np.square(x, dtype=np.float64).sum()),
+            int(np.count_nonzero((x != 0) & (q == 0))), float(np.abs(e).max()), float(np.abs(x).max()))
+
+
+def engram_sources(ckpt: str, layers: list) -> list:
+    """(file, offset, rows, width) of each Engram layer's BF16 table in the checkpoint, in `layers` order."""
+    out = []
+    for l in layers:
+        f, o, nb, shape = checkpoint_tensor(ckpt, f"model.layers.{l}.engram_layer.multi_head_embedding.embedding.weight")
+        out.append((f, o, int(shape[0]), int(shape[1])))
+    return out
+
+
+def engram_check(src: str, eng_off: int, srcs: list, w: int, samples: int = 4096) -> None:
+    """Sampled rows of the checkpoint round (the converter's E4M3 rounding) to the pack's codes."""
+    from hy4flash_bf16 import engram_lut
+    lut = engram_lut()
+    rng = np.random.default_rng(1)
+    base = 0
+    bad = 0
+    with open(src, "rb") as p:
+        for f, o, rows, _ in srcs:
+            with open(f, "rb") as c:
+                for r in np.sort(rng.integers(0, rows, samples // len(srcs))):
+                    c.seek(o + int(r) * w * 2)
+                    u = np.frombuffer(c.read(w * 2), "<u2")
+                    p.seek(eng_off + (base + int(r)) * w)
+                    bad += int((lut[u] != np.frombuffer(p.read(w), np.uint8)).any())
+            base += rows
+    if bad:
+        die(f"{bad} of {samples} sampled checkpoint rows do not round to the pack's Engram codes")
+    print(f"  engram: {samples} sampled rows round to the pack's codes", flush=True)
+
+
+def engram_i8_chunks(srcs: list, w: int, workers: int, stats: dict):
+    """The int8 rows of every layer in order, at most 2 jobs a worker in flight (RAM)."""
+    jobs = [(f, o + r0 * w * 2, min(ENGRAM_SLICE, rows - r0), w) for f, o, rows, _ in srcs for r0 in range(0, rows, ENGRAM_SLICE)]
+    with multiprocessing.Pool(workers) as pool:
+        pend = []
+        i = 0
+        while i < len(jobs) or pend:
+            while i < len(jobs) and len(pend) < 2 * workers:
+                pend.append(pool.apply_async(_engram_i8_job, (jobs[i],)))
+                i += 1
+            b, se, sx, z, me, mx = pend.pop(0).get()
+            stats["se"] += se
+            stats["sx"] += sx
+            stats["zeros"] += z
+            stats["max_err"] = max(stats["max_err"], me)
+            stats["max_abs"] = max(stats["max_abs"], mx)
+            yield b
+    print(f"  engram: {len(jobs)} slices", flush=True)
+
+
 def checkpoint_tensor(ckpt: str, name: str) -> tuple[str, int, int, list]:
     """(file, data offset, bytes, shape) of a BF16 tensor of a safetensors checkpoint directory."""
     idx = json.loads((Path(ckpt) / "model.safetensors.index.json").read_text())
@@ -82,7 +163,8 @@ def checkpoint_tensor(ckpt: str, name: str) -> tuple[str, int, int, list]:
 
 
 def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = None, workers: int = 8,
-             embd_ckpt: str | None = None, only: set | None = None, dfly_from: str | None = None) -> None:
+             embd_ckpt: str | None = None, only: set | None = None, dfly_from: str | None = None,
+             engram_ckpt: str | None = None) -> None:
     """`only`: write just these sections (and meta) to `out`, for in_place(). `dfly_from`: the pack whose safetensors
     drafter to use (read only), when `src`'s is already in runtime formats."""
     m = ModelFile(src)
@@ -141,6 +223,16 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
                 if (mine != theirs).mean() > 0.01:
                     die(f"row {r} of the checkpoint's embedding does not round to the pack's Q8_0 row")
         embd = (f, o, nb)
+    eng = None   # the Engram layers' BF16 sources, for --engram-i8
+    if engram_ckpt:
+        e = meta.get("engram") or die(f"{src} has no Engram table")
+        if e.get("type_id") != 43 or int(e["row_bytes"]) != int(e["row_values"]):
+            die(f"the pack's Engram table is {e.get('type')}, not E4M3 codes")
+        w_e = int(e["row_values"])
+        eng = engram_sources(engram_ckpt, [int(l) for l in e["ple.layers"]])
+        if any(c != w_e for *_, c in eng) or sum(r for _, _, r, _ in eng) != int(e["rows"]):
+            die("the checkpoint's Engram tables do not match the pack's rows")
+        engram_check(src, m.section("engram")[0], eng, w_e)
     relayout = head == "q8" or bool(planes) or embd is not None
     w = ModelWriter(out)
     tmp = None
@@ -204,6 +296,23 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
                 meta["dfly2"] = rec
                 tmp = (tmpd, st, rt)
                 print(f"  dfly: {dfly} ({rt.stat().st_size} bytes)", flush=True)
+            elif name == "engram" and eng is not None:
+                st = {"se": 0.0, "sx": 0.0, "zeros": 0, "max_err": 0.0, "max_abs": 0.0}
+                rows, w_e = int(meta["engram"]["rows"]), int(meta["engram"]["row_values"])
+                n = w.add_chunks("engram", engram_i8_chunks(eng, w_e, workers, st))
+                if n != rows * (w_e + 2):
+                    die(f"the int8 Engram section is {n} bytes, expected {rows * (w_e + 2)}")
+                meta["engram"].update(type="I8_ROW_F16", type_id=ENGRAM_I8, row_bytes=w_e + 2, bytes=n)
+                t = tens.get(meta["engram"].get("tensor", "per_layer_token_embd.weight"))
+                if t is not None:
+                    t.update(type="I8_ROW_F16", type_id=ENGRAM_I8, bytes=n)
+                rms = (st["se"] / st["sx"]) ** 0.5 if st["sx"] > 0 else 0.0
+                meta.setdefault("quantized_from", {})["engram"] = {
+                    "format": "int8 values + an fp16 scale a row (absmax / 127, to nearest even), I8_ROW_F16 type 46",
+                    "source": f"the BF16 checkpoint's multi_head_embedding rows ({Path(engram_ckpt).name}, layers {meta['engram']['ple.layers']})",
+                    "values": rows * w_e, "rms_relative_error": rms, "max_abs_error": st["max_err"], "max_abs_value": st["max_abs"],
+                    "nonzero_rounded_to_zero": st["zeros"], "previous": meta.get("quantized_from", {}).get("engram")}
+                print(f"  engram: int8 + fp16 row scale, {n} bytes, rms relative error {rms * 100:.3f}%", flush=True)
             elif only is None or name in only:
                 w.add_file(name, src, off, size)
                 print(f"  {name}: copied", flush=True)
@@ -219,7 +328,7 @@ def retrofit(src: str, out: str, head: str, dfly: str, dense_re: str | None = No
     if only is not None:
         return
     n = ModelFile(out)
-    for s in ("gguf", "dfly", "meta"):
+    for s in ("gguf", "dfly", "meta") + (("engram",) if eng is not None else ()):
         if s in n.names() and not n.verify(s):
             die(f"{out}: section {s} does not read back as written")
     print(f"done: {out}, {Path(out).stat().st_size} bytes")
@@ -280,6 +389,7 @@ def main() -> None:
     ap.add_argument("--dfly", choices=("runtime", "nvfp4", "keep"), default="runtime")
     ap.add_argument("--dense-nvfp4", metavar="RE", help="Q8_0 dense matrices matching RE as NVFP4 planes (a test rounding)")
     ap.add_argument("--embd-bf16", metavar="DIR", help="the token embedding as BF16 from this safetensors checkpoint")
+    ap.add_argument("--engram-i8", metavar="DIR", help="the Engram table as int8 + fp16 row scale from this BF16 checkpoint")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--dfly-from", help="take the safetensors drafter from this pack (read only)")
     ap.add_argument("--in-place", action="store_true", help="rewrite --from itself (a copy made for it); --out is not used")
@@ -287,7 +397,7 @@ def main() -> None:
     if a.in_place:
         in_place(a.src, a.head, a.dfly, a.dense_nvfp4, a.workers, a.embd_bf16, a.dfly_from)
     else:
-        retrofit(a.src, a.out, a.head, a.dfly, a.dense_nvfp4, a.workers, a.embd_bf16, dfly_from=a.dfly_from)
+        retrofit(a.src, a.out, a.head, a.dfly, a.dense_nvfp4, a.workers, a.embd_bf16, dfly_from=a.dfly_from, engram_ckpt=a.engram_i8)
 
 
 if __name__ == "__main__":

@@ -48,8 +48,10 @@ struct EngramInfo {
     bool present = false;
     uint64_t file_offset = 0;      ///< absolute offset of row 0
     uint64_t rows = 0;
-    uint32_t row_bytes = 96;       ///< F8_E4M3 values, one byte each
+    uint32_t row_bytes = 96;       ///< F8_E4M3 values, one byte each; or (I8_ROW_F16) int8 values then the row's fp16 scale
     int row_values = 96;
+    int type = 43;                 ///< kEngramE4m3 or kEngramI8Row
+    bool scaled() const { return type == 46; }
     std::vector<int> layers;
     int n_gram = 3, n_head = 8, pad_token_id = 0;
     std::vector<uint64_t> mult, primes, offsets;

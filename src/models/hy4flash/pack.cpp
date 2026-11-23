@@ -183,11 +183,13 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     if (const Json* ej = meta.get("engram"); ej && ej->is_object()) {
         EngramInfo& e = p.engram;
         const core::ModelFile::Section* sec = p.file.find(ej->get("section") ? ej->get("section")->s : "engram");
-        if (!sec || num_or(ej->get("type_id"), 0) != 43) {
-            err = path + ": meta.engram has no section or is not F8_E4M3 rows";
+        const int ty = (int) num_or(ej->get("type_id"), 0);
+        if (!sec || (ty != 43 && ty != 46)) {   // 43 F8_E4M3 codes, no scale; 46 int8 values + an fp16 scale a row (I8_ROW_F16)
+            err = path + ": meta.engram has no section or is not F8_E4M3 or I8_ROW_F16 rows";
             return false;
         }
         e.present = true;
+        e.type = ty;
         e.file_offset = sec->offset;
         e.rows = ej->get("rows")->u64();
         e.row_bytes = (uint32_t) ej->get("row_bytes")->u64();
@@ -200,7 +202,7 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         e.primes = unsigneds(ej->get("ple.head_vocab_sizes"));
         e.offsets = unsigneds(ej->get("ple.head_offsets"));
         const size_t ne = e.layers.size();
-        if (e.row_bytes != (uint32_t) e.row_values || e.mult.size() != ne * (size_t) e.n_gram ||
+        if (e.row_bytes != (uint32_t) e.row_values + (e.scaled() ? 2u : 0u) || e.mult.size() != ne * (size_t) e.n_gram ||
             e.primes.size() != ne * (size_t) e.n_cols() || e.offsets.size() != e.primes.size()) {
             err = path + ": the Engram hash arrays do not match its layer count";
             return false;

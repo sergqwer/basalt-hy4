@@ -49,4 +49,18 @@ inline float e4m3_to_f32(uint8_t b) {
     return (b & 0x80) ? -v : v;
 }
 
+/// An I8_ROW_F16 row's scale: the IEEE half after its row_values int8 values (little-endian, any alignment).
+inline float engram_row_scale(const uint8_t* row, int w) {
+    const uint32_t h = (uint32_t) row[w] | ((uint32_t) row[w + 1] << 8);
+    const uint32_t s = (h & 0x8000u) << 16, e = (h >> 10) & 31, m = h & 1023;
+    float v;
+    if (e == 0) v = std::ldexp((float) m, -24);
+    else if (e == 31) v = m ? NAN : INFINITY;
+    else v = std::ldexp((float) (m | 1024), (int) e - 25);
+    return s ? -v : v;
+}
+
+/// The value of one stored byte: an E4M3 code, or (I8_ROW_F16) a signed int8 the row's scale multiplies.
+inline float engram_code_to_f32(uint8_t b, bool i8) { return i8 ? (float) (int8_t) b : e4m3_to_f32(b); }
+
 }  // namespace basalt::models::hy4flash

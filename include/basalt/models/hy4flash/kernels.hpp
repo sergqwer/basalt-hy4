@@ -240,9 +240,10 @@ struct EngramArgs {
 void engram_apply(const float* kv, const float* kv_b, const float* gate_w, const float* pre_gamma, const float* hc_scale,
                   const float* valid, int n_tok, const EngramArgs& a, float* x, void* stream);
 
-/// The Engram rows of n_tok tokens from their E4M3 codes (raw[t][c][w], one byte a value), as the host step computes them,
-/// bit for bit: v = lut[code], r = 1 / sqrt(sum v^2 / w + FLT_EPSILON) summed in order, out = v * r * norm[c][w] * valid[t].
+/// The Engram rows of n_tok tokens from their stored rows (raw[t][c], row_bytes each: w E4M3 codes, or with `scaled` w int8
+/// values then the row's fp16 scale), as the host step computes them, bit for bit: v = lut[byte] * scale (1 unscaled),
+/// r = 1 / sqrt(sum v^2 / w + FLT_EPSILON) summed in order, out = v * r * norm[c][w] * valid[t].
 void engram_rows(const uint8_t* raw, const float* lut, const float* norm, const float* valid, int n_tok, int n_cols, int w,
-                 float* out, void* stream);
+                 int row_bytes, bool scaled, float* out, void* stream);
 
 }  // namespace basalt::models::hy4flash
