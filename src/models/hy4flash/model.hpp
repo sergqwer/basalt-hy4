@@ -46,6 +46,11 @@ public:
     const DevTensor* tensor(int layer, const char* suffix) const { return tensor("blk." + std::to_string(layer) + "." + suffix); }
     /// One token-embedding row, dequantised into `out` (n_embd floats).
     bool embedding_row(int32_t token, float* out) const;
+    /// One token-embedding row as stored (embedding_type(): 8 = Q8_0, 30 = BF16), embedding_row_bytes() long; null for a
+    /// token outside the vocabulary.  The card dequantizes these (kernels/elementwise.hpp embed_rows_from_mapped).
+    const uint8_t* embedding_raw(int32_t token) const;
+    int embedding_type() const { return embd_bf16_ ? 30 : 8; }
+    uint64_t embedding_row_bytes() const;
     ngram::PleReader& engram_reader() const { return *engram_; }
     /// The tier's descriptor: the MoE layers only (the tier's layer 0 is the first of them), over the 1536-wide latent.
     core::ExpertTierSpec tier_spec() const;
@@ -100,6 +105,7 @@ private:
     std::unique_ptr<ngram::PleReader> engram_;
     int device_ = 0, fd_ = -1;
     bool fp8_ = false, f32_ = false;
+    bool embd_bf16_ = false;   // token_embd stored BF16 (else Q8_0)
     int diag_rows_ = 0;
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DflyWeights> dfly_;   // DFLY HOOK

@@ -646,6 +646,12 @@ target_link_libraries(window_gemm_two_gpu PRIVATE window_gemm kernels ${_gpu_run
 basalt_gpu_test(NAME window_gemm_two_gpu COMMAND window_gemm_two_gpu)
 set_tests_properties(window_gemm_two_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 # the FP8 and FP4 codes as bf16x2 (narrow_bf16.cuh): the direct cvt (CUDA 13.2+) and the f16 route, every input
+# the card's token-embedding rows (Q8_0 / BF16 from mapped host memory) bit for bit against the host's dequantization
+add_executable(embed_rows_parity tests/kernels/embed_rows_parity.cpp)
+target_include_directories(embed_rows_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(embed_rows_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME embed_rows_parity COMMAND embed_rows_parity)
+
 add_executable(narrow_bf16_parity tests/kernels/narrow_bf16_parity.cu)
 set_target_properties(narrow_bf16_parity PROPERTIES CUDA_ARCHITECTURES 120a-real)
 target_include_directories(narrow_bf16_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

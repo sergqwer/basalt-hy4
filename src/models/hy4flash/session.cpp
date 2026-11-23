@@ -1094,6 +1094,24 @@ private:
         stage_at_ += (n + 3) & ~(size_t) 3;
     }
     // n floats from pinned host memory the caller keeps until the stream has read it
+    // BASALT_HY4_EMBD_HOST=1: the host dequantizes the embedding rows as before (an A/B knob); BASALT_HY4_EMBD_CHECK=1: each
+    // window's card rows compared with the host's, bit for bit, one line per window that differs
+    static bool embd_host() { static const bool on = env_on("BASALT_HY4_EMBD_HOST"); return on; }
+    static bool embd_time() { static const bool on = env_on("BASALT_HY4_EMBD_TIME"); return on; }
+    static bool embd_check() { static const bool on = env_on("BASALT_HY4_EMBD_CHECK"); return on; }
+    static bool env_on(const char* name) { const char* e = std::getenv(name); return e != nullptr && *e != '0' && *e != '\0'; }
+    void check_embedding(const int32_t* tokens, int R) {
+        const int E = g_.n_embd;
+        std::vector<float> dev((size_t) R * E), host((size_t) R * E);
+        cudaStreamSynchronize(stream_);
+        cudaMemcpy(dev.data(), e_, dev.size() * 4, cudaMemcpyDeviceToHost);
+        for (int t = 0; t < R; ++t) (void) m_.embedding_row(tokens[t], host.data() + (size_t) t * E);
+        size_t bad = 0;
+        for (size_t i = 0; i < dev.size(); ++i) bad += std::memcmp(&dev[i], &host[i], 4) != 0;
+        if (bad) basalt::log::warn("basalt hy4flash", "embedding check: %zu of %zu values differ from the host's", bad, dev.size());
+        else basalt::log::info("basalt hy4flash", "embedding check: %d rows bit-identical", R);
+    }
+
     void put_f32(float* dst, const float* src, int64_t n) {
         if (rows_ <= kMaxWindow) {
             cudaMemcpyAsync(dst, src, (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
@@ -2761,14 +2779,30 @@ private:
         hc.rms_eps = g_.rms_eps;
         hc.hc_eps = g_.hc_eps;
         hc.magnitude = g_.hc_magnitude;
-        for (int t = 0; t < R; ++t)
-            if (emb_rows_) {   // [vision] an image row stands in for the token's embedding
-                std::memcpy(h_e_ + (size_t) t * E, emb_rows_ + (size_t) t * E, (size_t) E * 4);
-            } else if (!m_.embedding_row(tokens[t], h_e_ + (size_t) t * E)) {
-                err = "no embedding row";
-                return false;
+        const double t_embd = now_ms();
+        if (emb_rows_ || embd_host()) {
+            for (int t = 0; t < R; ++t)
+                if (emb_rows_) {   // [vision] an image row stands in for the token's embedding
+                    std::memcpy(h_e_ + (size_t) t * E, emb_rows_ + (size_t) t * E, (size_t) E * 4);
+                } else if (!m_.embedding_row(tokens[t], h_e_ + (size_t) t * E)) {
+                    err = "no embedding row";
+                    return false;
+                }
+            put_f32(e_, h_e_, (int64_t) R * E);
+        } else {   // the stored rows (Q8_0: 1.06 B a value, not 4) into the mapped staging; the card dequantizes them
+            const uint64_t rb = m_.embedding_row_bytes();
+            uint8_t* q = (uint8_t*) h_e_;
+            for (int t = 0; t < R; ++t) {
+                const uint8_t* raw = m_.embedding_raw(tokens[t]);
+                if (raw == nullptr) { err = "no embedding row"; return false; }
+                std::memcpy(q + (size_t) t * rb, raw, (size_t) rb);
             }
-        put_f32(e_, h_e_, (int64_t) R * E);
+            bk::embed_rows_from_mapped(e_, q, R, E, m_.embedding_type(), stream_);
+            if (embd_check()) check_embedding(tokens, R);
+        }
+        if (embd_time() && R >= 1024)
+            basalt::log::info("basalt hy4flash", "embedding: %d rows in %.2f ms on the host (%s)", R, now_ms() - t_embd,
+                              emb_rows_ || embd_host() ? "host dequant + f32 copy" : "stored rows, card dequant");
         if (graphs_) {   // the window's first position, for the graphs' row spans (sliding-window layers)
             *pos_h_ = (int32_t) pos0;
             cudaMemcpyAsync(pos_d_, pos_h_, 4, cudaMemcpyHostToDevice, stream_);
