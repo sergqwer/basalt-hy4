@@ -939,6 +939,12 @@ public:
         static const int64_t v = [] { const char* e = std::getenv("HY4_KV_STREAM_ROWS"); return e ? std::atoll(e) : (int64_t) 512; }();
         return v;
     }
+    // the context a conversation reaches before its rows stream (HY4_KV_STREAM_FROM, default 262,144 positions)
+    static int64_t stream_from() {
+        static const int64_t v = [] { const char* e = std::getenv("HY4_KV_STREAM_FROM"); return e ? std::atoll(e) : (int64_t) 262144; }();
+        return v;
+    }
+    bool stream_engaged_ = false;
     static bool stream_check() { static const bool on = std::getenv("HY4_KV_STREAM_CHECK") != nullptr; return on; }
     uint64_t stream_host_bytes() const {
         uint64_t n = 0;
@@ -964,7 +970,11 @@ public:
     void stream_out(const char* when) {
         if (!kv_stream()) return;
         const int64_t pos = (int64_t) hist_.size();
-        if (pos - kStreamRecent <= 0) return;
+        if (pos - kStreamRecent <= 0 || pos < stream_from()) return;
+        if (!stream_engaged_) {
+            stream_engaged_ = true;
+            basalt::log::info("basalt hy4flash", "KV streaming engages at %lld positions (HY4_KV_STREAM_FROM %lld)", (long long) pos, (long long) stream_from());
+        }
         const uint64_t rb = (uint64_t) sparse_row_bytes(), to = (uint64_t) (pos - kStreamRecent) * rb / kStreamPiece * kStreamPiece;
         if (to <= kStreamPiece) return;
         uint64_t need = 0;
